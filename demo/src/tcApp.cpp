@@ -7,9 +7,21 @@ void tcApp::setup() {
     mcp::statusGraph("visitors",   [this] { return visitors; });
     mcp::statusGraph("load",       [this] { return load; });
     mcp::statusImage("entranceCam", [this] { return makeCamFrame(); });
+
+    // App-specific tool (unprefixed by convention — tc_/tcx_ belong to the
+    // framework). Hangs the main loop so supervisor hang-detection can be
+    // tested against a real freeze.
+    mcp::tool("freeze", "Hang the main loop forever (supervisor hang-detection test)")
+        .bind(std::function<Json()>([this]() -> Json {
+            frozen = true;
+            return Json{{"status", "ok"}, {"message", "freezing after this reply"}};
+        }));
 }
 
 void tcApp::update() {
+    if (frozen) {
+        while (true) this_thread::sleep_for(chrono::hours(1));  // simulate a hang
+    }
     double t = getElapsedTime();
     // Deterministic fake metrics that still look alive on a graph.
     visitors = 50.0 + 30.0 * sin(t * 0.11) + 10.0 * sin(t * 0.47);

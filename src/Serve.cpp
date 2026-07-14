@@ -392,7 +392,8 @@ async function renderDetail() {
   const h = app.health || {};
   const extra = [];
   if (h.version) extra.push(h.version);
-  if (h.memoryBytes) extra.push((h.memoryBytes / 1048576).toFixed(1) + ' MB');
+  const mem = h.rssBytes ?? h.memoryBytes;
+  if (mem) extra.push((mem / 1048576).toFixed(0) + ' MB');
   document.getElementById('dStats').textContent =
     [statsLine(app), ...extra].filter(Boolean).join(' · ');
 
@@ -427,10 +428,18 @@ async function renderDetail() {
   } catch { return; }
   if (detailId !== app.id) return;   // closed/switched while fetching
 
+  // Memory graphs: process RSS (the leak-hunting number) and machine-wide
+  // available (the OOM-exoneration number). Sokol-tracked bytes stay in the
+  // JSONL for deep dives but aren't graphed.
   const graphs = [
-    { label: 'fps',       color: '#58a6ff', get: e => e.health && e.health.fps },
-    { label: 'memory MB', color: '#d29922', get: e => e.health && e.health.memoryBytes / 1048576 },
+    { label: 'fps',        color: '#58a6ff', get: e => e.health && e.health.fps },
+    { label: 'process MB', color: '#d29922',
+      get: e => e.health ? (e.health.rssBytes ?? e.health.memoryBytes) / 1048576 : null },
   ];
+  if (h.machine && h.machine.memAvailBytes) {
+    graphs.push({ label: 'machine free MB', color: '#8b949e',
+      get: e => e.health && e.health.machine ? e.health.machine.memAvailBytes / 1048576 : null });
+  }
   const palette = ['#3fb950', '#f778ba', '#a371f7', '#ff7b72', '#79c0ff'];
   custom.filter(v => v.mode === 'graph').forEach((v, i) => {
     graphs.push({

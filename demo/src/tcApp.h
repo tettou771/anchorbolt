@@ -20,4 +20,5 @@ private:
     string sceneName = "intro";
     double visitors = 20.0;   // random-walk fake visitor count
     double load = 0.0;        // smooth fake load metric
+    bool frozen = false;      // set by the 'freeze' MCP tool (hang-test)
 };

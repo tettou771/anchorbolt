@@ -16,7 +16,9 @@
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <optional>
 #include <thread>
@@ -24,6 +26,10 @@
 #ifndef _WIN32
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <sys/sysctl.h>
 #endif
 
 using namespace std;
@@ -114,6 +120,59 @@ vector<unsigned char> fromBase64(const string& s) {
         }
     }
     return out;
+}
+
+// Machine-wide memory, the OS's view. Rides every heartbeat and gets
+// snapshotted into the event log on failures — so an operator can tell
+// "our app leaked" from "something else ate the machine" (OOM exoneration).
+struct MachineMem {
+    int64_t totalBytes = 0;
+    int64_t availBytes = 0;
+};
+
+MachineMem machineMem() {
+    MachineMem m;
+#if defined(__APPLE__)
+    int64_t total = 0;
+    size_t len = sizeof(total);
+    if (sysctlbyname("hw.memsize", &total, &len, nullptr, 0) == 0) m.totalBytes = total;
+    vm_size_t pageSize = 0;
+    host_page_size(mach_host_self(), &pageSize);
+    vm_statistics64_data_t vm{};
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
+                          (host_info64_t)&vm, &count) == KERN_SUCCESS) {
+        m.availBytes = (int64_t)(vm.free_count + vm.inactive_count) * (int64_t)pageSize;
+    }
+#elif !defined(_WIN32)
+    ifstream in("/proc/meminfo");
+    string line;
+    while (getline(in, line)) {
+        long kb = 0;
+        if (sscanf(line.c_str(), "MemTotal: %ld", &kb) == 1) m.totalBytes = (int64_t)kb * 1024;
+        else if (sscanf(line.c_str(), "MemAvailable: %ld", &kb) == 1) m.availBytes = (int64_t)kb * 1024;
+    }
+#endif
+    return m;
+}
+
+string fmtMB(int64_t bytes) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%.0fMB", bytes / 1048576.0);
+    return buf;
+}
+
+// Supervisor event log: one line per lifecycle event, daily files next to the
+// app logs. This is what you read the morning after — when/why restarts
+// happened, with the machine's memory state at each failure.
+void eventLog(const fs::path& logDir, const string& msg) {
+    ofstream out(logDir / ("anchorbolt-" + getTimestampString("%Y-%m-%d") + ".log"), ios::app);
+    out << "[" << getTimestampString("%H:%M:%S") << "] " << msg << "\n";
+}
+
+string machineMemNote() {
+    MachineMem m = machineMem();
+    return "machine mem avail " + fmtMB(m.availBytes) + " / " + fmtMB(m.totalBytes);
 }
 
 // Best-effort push to the fleet server. Failures never affect supervision;
@@ -269,6 +328,7 @@ int cmdStart(const vector<string>& args) {
 
     logNotice("anchorbolt") << "kiosk mode: " << opt.runPath
                        << " (mcp port " << opt.port << ", logs " << logDir.string() << ")";
+    eventLog(logDir, "kiosk mode started: " + opt.runPath + " (" + machineMemNote() + ")");
 
     int restarts = 0;
     while (!g_stop) {
@@ -279,10 +339,12 @@ int cmdStart(const vector<string>& args) {
         pid_t pid = spawnApp(opt, logFile);
         if (pid < 0) {
             logError("anchorbolt") << "fork failed; retrying in 5s";
+            eventLog(logDir, "fork failed; retrying in 5s");
             sleepChecked(5);
             continue;
         }
         logNotice("anchorbolt") << "app launched (pid " << pid << ")";
+        eventLog(logDir, "app launched (pid " + to_string(pid) + ")");
 
         httplib::Client cli("localhost", opt.port);
         cli.set_connection_timeout(2, 0);
@@ -291,6 +353,7 @@ int cmdStart(const vector<string>& args) {
         auto bootAt = chrono::steady_clock::now();
         bool healthy = false;    // first successful poll seen
         bool childAlive = true;
+        bool pidWarned = false;  // one-shot port-collision warning
         int  misses = 0;
         chrono::steady_clock::time_point lastThumb{};  // epoch -> push right away
         bool statusChecked = false;   // tools/list probed for tc_get_status
@@ -306,11 +369,14 @@ int cmdStart(const vector<string>& args) {
                     int code = WEXITSTATUS(st);
                     if (code == 127) {
                         logError("anchorbolt") << "app failed to exec (bad path?); giving up";
+                        eventLog(logDir, "app failed to exec; giving up");
                         return 1;
                     }
                     logWarning("anchorbolt") << "app exited (code " << code << ")";
+                    eventLog(logDir, "app exited (code " + to_string(code) + ", " + machineMemNote() + ")");
                 } else if (WIFSIGNALED(st)) {
                     logWarning("anchorbolt") << "app killed by signal " << WTERMSIG(st);
+                    eventLog(logDir, "app killed by signal " + to_string(WTERMSIG(st)) + " (" + machineMemNote() + ")");
                 }
                 break;
             }
@@ -319,13 +385,30 @@ int cmdStart(const vector<string>& args) {
             if (g_stop) break;
 
             // Hang detection via tc_get_health.
-            if (auto h = callTool(cli, "tc_get_health")) {
+            auto h = callTool(cli, "tc_get_health");
+            if (h) {
+                // Confirm the reply is from OUR child — on a shared port a
+                // stale or foreign app could answer and mask a dead child.
+                int64_t hpid = h->value("pid", (int64_t)0);
+                if (hpid != 0 && hpid != (int64_t)pid) {
+                    if (!pidWarned) {
+                        pidWarned = true;
+                        logError("anchorbolt") << "health answered by pid " << hpid
+                                               << ", expected " << pid << " (port collision?)";
+                        eventLog(logDir, "health answered by pid " + to_string(hpid) +
+                                         ", expected " + to_string(pid) + " (port collision?)");
+                    }
+                    h.reset();  // our app is unobservable -> counts as a miss
+                }
+            }
+            if (h) {
                 misses = 0;
                 if (!healthy) {
                     healthy = true;
                     logNotice("anchorbolt") << "app healthy (fps "
                                        << (*h).value("fps", 0.0f) << ", "
                                        << (*h).value("width", 0) << "x" << (*h).value("height", 0) << ")";
+                    eventLog(logDir, "app healthy");
                 }
                 if (push) {
                     // Custom ops status (the anchorbolt convention): probe
@@ -342,6 +425,9 @@ int cmdStart(const vector<string>& args) {
                         }
                     }
                     Json hb = *h;
+                    MachineMem mm = machineMem();
+                    hb["machine"] = {{"memTotalBytes", mm.totalBytes},
+                                     {"memAvailBytes", mm.availBytes}};
                     if (hasStatus) {
                         if (auto s = callTool(cli, "tc_get_status")) {
                             imageNames.clear();
@@ -381,6 +467,8 @@ int cmdStart(const vector<string>& args) {
                     logWarning("anchorbolt") << "health poll miss (" << misses << "/" << opt.maxMisses << ")";
                     if (misses >= opt.maxMisses) {
                         logError("anchorbolt") << "app unresponsive; restarting";
+                        eventLog(logDir, "app unresponsive after " + to_string(misses) +
+                                         " misses; terminating (" + machineMemNote() + ")");
                         terminateApp(pid);
                         childAlive = false;
                         break;
@@ -396,10 +484,12 @@ int cmdStart(const vector<string>& args) {
 
         ++restarts;
         logNotice("anchorbolt") << "restarting app (#" << restarts << ") in 2s";
+        eventLog(logDir, "restarting app (#" + to_string(restarts) + ")");
         sleepChecked(2);
     }
 
     logNotice("anchorbolt") << "anchorbolt stopped (restarts: " << restarts << ")";
+    eventLog(logDir, "anchorbolt stopped (restarts: " + to_string(restarts) + ")");
     return 0;
 #endif
 }
