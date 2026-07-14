@@ -7,6 +7,7 @@
 
 #include <TrussC.h>
 #include "Start.h"
+#include "Serve.h"
 
 #include <iostream>
 #include <string>
@@ -20,7 +21,7 @@ static void printHelp() {
         "\n"
         "USAGE\n"
         "  anchorbolt start <app-binary> [options]   kiosk mode: supervise an app on this machine\n"
-        "  anchorbolt serve                          fleet server (not implemented yet)\n"
+        "  anchorbolt serve [options]                fleet server: dashboard + heartbeat/thumbnail ingest\n"
         "  anchorbolt reset-admin                    recover the server admin password (not implemented yet)\n"
         "\n"
         "START OPTIONS\n"
@@ -30,7 +31,15 @@ static void printHelp() {
         "  --grace <sec>      boot grace period before health misses count (default 15)\n"
         "  --misses <n>       consecutive failed polls that trigger a restart (default 3)\n"
         "  --log-dir <dir>    app log destination, injected as TRUSSC_LOG_FILE\n"
-        "                     (default ./anchorbolt-logs)\n";
+        "                     (default ./anchorbolt-logs)\n"
+        "  --server <url>     fleet server to push to (e.g. http://192.168.1.10:8787)\n"
+        "  --id <name>        app id on the fleet server (default: binary name)\n"
+        "  --thumb-interval <sec>  thumbnail push interval (default 30)\n"
+        "\n"
+        "SERVE OPTIONS\n"
+        "  -p, --port <n>     HTTP port (default 8787)\n"
+        "  --data <dir>       storage directory for heartbeats/thumbnails\n"
+        "                     (default ./anchorbolt-data)\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -53,8 +62,7 @@ int main(int argc, char* argv[]) {
         return cmdStart(vector<string>(args.begin() + 1, args.end()));
     }
     if (cmd == "serve") {
-        cerr << "anchorbolt serve: not implemented yet (Phase 0 in progress)" << endl;
-        return 1;
+        return cmdServe(vector<string>(args.begin() + 1, args.end()));
     }
     if (cmd == "reset-admin") {
         cerr << "anchorbolt reset-admin: not implemented yet" << endl;

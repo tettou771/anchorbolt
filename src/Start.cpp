@@ -40,6 +40,9 @@ struct StartOptions {
     int    intervalSec = 3;      // health poll interval
     int    graceSec    = 15;     // boot grace before misses count
     int    maxMisses   = 3;      // consecutive misses -> restart
+    string serverUrl;            // fleet server base URL (empty = no push)
+    string appId;                // id on the fleet server (default: binary name)
+    int    thumbIntervalSec = 30;
 };
 
 atomic<bool> g_stop{false};
@@ -55,11 +58,12 @@ void sleepChecked(double sec) {
 
 // JSON-RPC tools/call against the app's local MCP endpoint.
 // nullopt = transport failure or malformed reply (both count as a miss).
-optional<Json> callTool(httplib::Client& cli, const string& name) {
+optional<Json> callTool(httplib::Client& cli, const string& name,
+                        const Json& arguments = Json::object()) {
     Json req = {{"jsonrpc", "2.0"},
                 {"id", 1},
                 {"method", "tools/call"},
-                {"params", {{"name", name}, {"arguments", Json::object()}}}};
+                {"params", {{"name", name}, {"arguments", arguments}}}};
     auto res = cli.Post("/mcp", req.dump(), "application/json");
     if (!res || res->status != 200) return nullopt;
     try {
@@ -69,6 +73,71 @@ optional<Json> callTool(httplib::Client& cli, const string& name) {
         return nullopt;
     }
 }
+
+// Decode standard base64 (get_thumbnail ships its JPEG this way; core has
+// toBase64 but no decoder yet). Skips padding and whitespace.
+vector<unsigned char> fromBase64(const string& s) {
+    auto val = [](char c) -> int {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        return -1;
+    };
+    vector<unsigned char> out;
+    out.reserve(s.size() * 3 / 4);
+    int buf = 0, bits = 0;
+    for (char c : s) {
+        int v = val(c);
+        if (v < 0) continue;
+        buf = (buf << 6) | v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back((unsigned char)((buf >> bits) & 0xFF));
+        }
+    }
+    return out;
+}
+
+// Best-effort push to the fleet server. Failures never affect supervision;
+// reachability changes are logged once, not per attempt.
+class ServerPush {
+public:
+    ServerPush(const string& url, const string& appId)
+        : cli_(url), appId_(appId) {
+        cli_.set_connection_timeout(2, 0);
+        cli_.set_read_timeout(2, 0);
+    }
+
+    void heartbeat(Json health) {
+        health["app"] = appId_;
+        auto res = cli_.Post("/api/heartbeat", health.dump(), "application/json");
+        report(res && res->status == 200, "heartbeat");
+    }
+
+    void thumbnail(const vector<unsigned char>& jpg) {
+        auto res = cli_.Post("/api/thumb/" + appId_,
+                             string((const char*)jpg.data(), jpg.size()), "image/jpeg");
+        report(res && res->status == 200, "thumbnail");
+    }
+
+private:
+    void report(bool success, const char* what) {
+        if (success && !reachable_) {
+            reachable_ = true;
+            logNotice("anchorbolt") << "fleet server reachable again";
+        } else if (!success && reachable_) {
+            reachable_ = false;
+            logWarning("anchorbolt") << "fleet server unreachable (" << what << " failed)";
+        }
+    }
+
+    httplib::Client cli_;
+    string appId_;
+    bool reachable_ = true;  // assume up so the first failure logs
+};
 
 bool parseArgs(const vector<string>& args, StartOptions& opt) {
     for (size_t i = 0; i < args.size(); ++i) {
@@ -86,6 +155,9 @@ bool parseArgs(const vector<string>& args, StartOptions& opt) {
         else if (a == "--interval") { auto v = next("--interval"); if (!v) return false; opt.intervalSec = stoi(*v); }
         else if (a == "--grace")    { auto v = next("--grace");    if (!v) return false; opt.graceSec = stoi(*v); }
         else if (a == "--misses")   { auto v = next("--misses");   if (!v) return false; opt.maxMisses = stoi(*v); }
+        else if (a == "--server")   { auto v = next("--server");   if (!v) return false; opt.serverUrl = *v; }
+        else if (a == "--id")       { auto v = next("--id");       if (!v) return false; opt.appId = *v; }
+        else if (a == "--thumb-interval") { auto v = next("--thumb-interval"); if (!v) return false; opt.thumbIntervalSec = stoi(*v); }
         else if (!a.empty() && a[0] != '-') {
             if (!opt.runPath.empty()) {
                 cerr << "anchorbolt start: unexpected extra argument '" << a << "'" << endl;
@@ -159,6 +231,18 @@ int cmdStart(const vector<string>& args) {
     fs::path logDir = fs::absolute(opt.logDir);
     fs::create_directories(logDir);
 
+    // Fleet server push is optional and never affects supervision.
+    if (opt.appId.empty()) opt.appId = runPath.stem().string();
+    for (char& c : opt.appId) {
+        if (!isalnum((unsigned char)c) && c != '-' && c != '_' && c != '.') c = '-';
+    }
+    optional<ServerPush> push;
+    if (!opt.serverUrl.empty()) {
+        push.emplace(opt.serverUrl, opt.appId);
+        logNotice("anchorbolt") << "pushing to fleet server " << opt.serverUrl
+                                << " as '" << opt.appId << "'";
+    }
+
     signal(SIGINT, onSignal);
     signal(SIGTERM, onSignal);
 
@@ -187,6 +271,7 @@ int cmdStart(const vector<string>& args) {
         bool healthy = false;    // first successful poll seen
         bool childAlive = true;
         int  misses = 0;
+        chrono::steady_clock::time_point lastThumb{};  // epoch -> push right away
 
         while (!g_stop) {
             // Process exit?
@@ -217,6 +302,19 @@ int cmdStart(const vector<string>& args) {
                     logNotice("anchorbolt") << "app healthy (fps "
                                        << (*h).value("fps", 0.0f) << ", "
                                        << (*h).value("width", 0) << "x" << (*h).value("height", 0) << ")";
+                }
+                if (push) {
+                    push->heartbeat(*h);
+                    auto now = chrono::steady_clock::now();
+                    if (now - lastThumb >= chrono::seconds(opt.thumbIntervalSec)) {
+                        lastThumb = now;
+                        if (auto t = callTool(cli, "get_thumbnail")) {
+                            if (t->contains("data") && (*t)["data"].is_string()) {
+                                auto jpg = fromBase64((*t)["data"].get<string>());
+                                if (!jpg.empty()) push->thumbnail(jpg);
+                            }
+                        }
+                    }
                 }
             } else {
                 bool inGrace = !healthy &&
