@@ -1,12 +1,12 @@
 // =============================================================================
 // anchorbolt — TrussC installation ops tool
-//   agent: venue-side supervisor (spawn app, watchdog, thumbnails, sinks)
+//   start: kiosk mode — venue-side supervisor (spawn app, watchdog, thumbnails, sinks)
 //   serve: fleet server (dashboard, storage, WS hub)
 // One binary, both ends of the protocol. Uses TrussC as a library (no window).
 // =============================================================================
 
 #include <TrussC.h>
-#include "Agent.h"
+#include "Start.h"
 
 #include <iostream>
 #include <string>
@@ -19,12 +19,11 @@ static void printHelp() {
         "anchorbolt - TrussC installation ops tool\n"
         "\n"
         "USAGE\n"
-        "  anchorbolt agent --run <app-binary> [options]   supervise an app on this machine\n"
-        "  anchorbolt serve                                fleet server (not implemented yet)\n"
-        "  anchorbolt reset-admin                          recover the server admin password (not implemented yet)\n"
+        "  anchorbolt start <app-binary> [options]   kiosk mode: supervise an app on this machine\n"
+        "  anchorbolt serve                          fleet server (not implemented yet)\n"
+        "  anchorbolt reset-admin                    recover the server admin password (not implemented yet)\n"
         "\n"
-        "AGENT OPTIONS\n"
-        "  --run <path>       app binary to launch and supervise (required)\n"
+        "START OPTIONS\n"
         "  --cwd <dir>        working directory for the app (default: the binary's directory)\n"
         "  --port <n>         MCP port injected as TRUSSC_MCP_PORT (default 47777)\n"
         "  --interval <sec>   get_health poll interval (default 3)\n"
@@ -50,8 +49,8 @@ int main(int argc, char* argv[]) {
         cout << "anchorbolt 0.0.1 (TrussC " << tc::getVersion() << ")" << endl;
         return 0;
     }
-    if (cmd == "agent") {
-        return runAgent(vector<string>(args.begin() + 1, args.end()));
+    if (cmd == "start") {
+        return cmdStart(vector<string>(args.begin() + 1, args.end()));
     }
     if (cmd == "serve") {
         cerr << "anchorbolt serve: not implemented yet (Phase 0 in progress)" << endl;

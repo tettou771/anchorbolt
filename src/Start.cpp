@@ -1,5 +1,5 @@
 // =============================================================================
-// anchorbolt agent — venue-side supervisor
+// anchorbolt start — kiosk mode: the venue-side supervisor
 //
 // Spawns the app as a child process with the ops environment injected
 // (TRUSSC_MCP / TRUSSC_MCP_PORT / TRUSSC_LOG_FILE), then watches it two ways:
@@ -8,7 +8,7 @@
 // The app needs zero code changes; everything rides the standard MCP tools.
 // =============================================================================
 
-#include "Agent.h"
+#include "Start.h"
 
 #include <TrussC.h>
 #include <impl/httplib.h>
@@ -32,8 +32,8 @@ namespace fs = std::filesystem;
 
 namespace {
 
-struct AgentOptions {
-    string runPath;              // app binary (required)
+struct StartOptions {
+    string runPath;              // app binary (positional, required)
     string cwd;                  // working dir (default: binary's directory)
     string logDir = "anchorbolt-logs";
     int    port        = 47777;  // TRUSSC_MCP_PORT
@@ -70,7 +70,7 @@ optional<Json> callTool(httplib::Client& cli, const string& name) {
     }
 }
 
-bool parseArgs(const vector<string>& args, AgentOptions& opt) {
+bool parseArgs(const vector<string>& args, StartOptions& opt) {
     for (size_t i = 0; i < args.size(); ++i) {
         const string& a = args[i];
         auto next = [&](const char* flag) -> optional<string> {
@@ -80,20 +80,27 @@ bool parseArgs(const vector<string>& args, AgentOptions& opt) {
             }
             return args[++i];
         };
-        if      (a == "--run")      { auto v = next("--run");      if (!v) return false; opt.runPath = *v; }
-        else if (a == "--cwd")      { auto v = next("--cwd");      if (!v) return false; opt.cwd = *v; }
+        if      (a == "--cwd")      { auto v = next("--cwd");      if (!v) return false; opt.cwd = *v; }
         else if (a == "--log-dir")  { auto v = next("--log-dir");  if (!v) return false; opt.logDir = *v; }
         else if (a == "--port")     { auto v = next("--port");     if (!v) return false; opt.port = stoi(*v); }
         else if (a == "--interval") { auto v = next("--interval"); if (!v) return false; opt.intervalSec = stoi(*v); }
         else if (a == "--grace")    { auto v = next("--grace");    if (!v) return false; opt.graceSec = stoi(*v); }
         else if (a == "--misses")   { auto v = next("--misses");   if (!v) return false; opt.maxMisses = stoi(*v); }
+        else if (!a.empty() && a[0] != '-') {
+            if (!opt.runPath.empty()) {
+                cerr << "anchorbolt start: unexpected extra argument '" << a << "'" << endl;
+                return false;
+            }
+            opt.runPath = a;  // positional: the app binary
+        }
         else {
-            cerr << "anchorbolt agent: unknown option '" << a << "'" << endl;
+            cerr << "anchorbolt start: unknown option '" << a << "'" << endl;
             return false;
         }
     }
     if (opt.runPath.empty()) {
-        cerr << "anchorbolt agent: --run <app-binary> is required" << endl;
+        cerr << "anchorbolt start: an app binary is required "
+             << "(anchorbolt start <app-binary> [options])" << endl;
         return false;
     }
     return true;
@@ -101,7 +108,7 @@ bool parseArgs(const vector<string>& args, AgentOptions& opt) {
 
 #ifndef _WIN32
 
-pid_t spawnApp(const AgentOptions& opt, const string& logFile) {
+pid_t spawnApp(const StartOptions& opt, const string& logFile) {
     pid_t pid = fork();
     if (pid == 0) {
         if (!opt.cwd.empty() && chdir(opt.cwd.c_str()) != 0) _exit(126);
@@ -122,7 +129,7 @@ void terminateApp(pid_t pid) {
         if (waitpid(pid, &st, WNOHANG) == pid) return;
         this_thread::sleep_for(chrono::milliseconds(100));
     }
-    logWarning("agent") << "app ignored SIGTERM for 5s; sending SIGKILL";
+    logWarning("anchorbolt") << "app ignored SIGTERM for 5s; sending SIGKILL";
     kill(pid, SIGKILL);
     int st = 0;
     waitpid(pid, &st, 0);
@@ -132,19 +139,19 @@ void terminateApp(pid_t pid) {
 
 } // namespace
 
-int runAgent(const vector<string>& args) {
+int cmdStart(const vector<string>& args) {
 #ifdef _WIN32
-    cerr << "anchorbolt agent: Windows support is not implemented yet" << endl;
+    cerr << "anchorbolt start: Windows support is not implemented yet" << endl;
     return 1;
 #else
-    AgentOptions opt;
+    StartOptions opt;
     if (!parseArgs(args, opt)) return 1;
 
     // Resolve paths up front so restarts don't depend on our cwd.
     error_code ec;
     fs::path runPath = fs::absolute(opt.runPath, ec);
     if (ec || !fs::exists(runPath)) {
-        cerr << "anchorbolt agent: app binary not found: " << opt.runPath << endl;
+        cerr << "anchorbolt start: app binary not found: " << opt.runPath << endl;
         return 1;
     }
     opt.runPath = runPath.string();
@@ -155,7 +162,7 @@ int runAgent(const vector<string>& args) {
     signal(SIGINT, onSignal);
     signal(SIGTERM, onSignal);
 
-    logNotice("agent") << "anchorbolt agent starting: " << opt.runPath
+    logNotice("anchorbolt") << "kiosk mode: " << opt.runPath
                        << " (mcp port " << opt.port << ", logs " << logDir.string() << ")";
 
     int restarts = 0;
@@ -166,11 +173,11 @@ int runAgent(const vector<string>& args) {
 
         pid_t pid = spawnApp(opt, logFile);
         if (pid < 0) {
-            logError("agent") << "fork failed; retrying in 5s";
+            logError("anchorbolt") << "fork failed; retrying in 5s";
             sleepChecked(5);
             continue;
         }
-        logNotice("agent") << "app launched (pid " << pid << ")";
+        logNotice("anchorbolt") << "app launched (pid " << pid << ")";
 
         httplib::Client cli("localhost", opt.port);
         cli.set_connection_timeout(2, 0);
@@ -189,12 +196,12 @@ int runAgent(const vector<string>& args) {
                 if (WIFEXITED(st)) {
                     int code = WEXITSTATUS(st);
                     if (code == 127) {
-                        logError("agent") << "app failed to exec (bad path?); giving up";
+                        logError("anchorbolt") << "app failed to exec (bad path?); giving up";
                         return 1;
                     }
-                    logWarning("agent") << "app exited (code " << code << ")";
+                    logWarning("anchorbolt") << "app exited (code " << code << ")";
                 } else if (WIFSIGNALED(st)) {
-                    logWarning("agent") << "app killed by signal " << WTERMSIG(st);
+                    logWarning("anchorbolt") << "app killed by signal " << WTERMSIG(st);
                 }
                 break;
             }
@@ -207,7 +214,7 @@ int runAgent(const vector<string>& args) {
                 misses = 0;
                 if (!healthy) {
                     healthy = true;
-                    logNotice("agent") << "app healthy (fps "
+                    logNotice("anchorbolt") << "app healthy (fps "
                                        << (*h).value("fps", 0.0f) << ", "
                                        << (*h).value("width", 0) << "x" << (*h).value("height", 0) << ")";
                 }
@@ -216,9 +223,9 @@ int runAgent(const vector<string>& args) {
                     chrono::steady_clock::now() - bootAt < chrono::seconds(opt.graceSec);
                 if (!inGrace) {
                     ++misses;
-                    logWarning("agent") << "health poll miss (" << misses << "/" << opt.maxMisses << ")";
+                    logWarning("anchorbolt") << "health poll miss (" << misses << "/" << opt.maxMisses << ")";
                     if (misses >= opt.maxMisses) {
-                        logError("agent") << "app unresponsive; restarting";
+                        logError("anchorbolt") << "app unresponsive; restarting";
                         terminateApp(pid);
                         childAlive = false;
                         break;
@@ -233,11 +240,11 @@ int runAgent(const vector<string>& args) {
         }
 
         ++restarts;
-        logNotice("agent") << "restarting app (#" << restarts << ") in 2s";
+        logNotice("anchorbolt") << "restarting app (#" << restarts << ") in 2s";
         sleepChecked(2);
     }
 
-    logNotice("agent") << "anchorbolt agent stopped (restarts: " << restarts << ")";
+    logNotice("anchorbolt") << "anchorbolt stopped (restarts: " << restarts << ")";
     return 0;
 #endif
 }
