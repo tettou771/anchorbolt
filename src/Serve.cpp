@@ -161,7 +161,7 @@ const char* kDashboardHtml = R"HTML(<!DOCTYPE html>
   .graph .glabel { display: flex; justify-content: space-between;
                    font-size: 12px; color: #9aa3b2; margin-bottom: 4px; }
   .graph .gval { color: #d4d7dd; font-weight: 600; }
-  .graph canvas { width: 100%; height: 72px; display: block; }
+  .graph canvas { width: 100%; height: 88px; display: block; }
   #dGraphs { display: flex; flex-direction: column; gap: 10px; }
   #dImages { display: grid; gap: 12px;
              grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); }
@@ -257,30 +257,128 @@ document.getElementById('detail').addEventListener('click', e => {
 });
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDetail(); });
 
-function drawGraph(canvas, pts, color) {
+function fmtVal(v) {
+  if (Math.abs(v - Math.round(v)) < 1e-9) return String(Math.round(v));
+  const a = Math.abs(v);
+  return a >= 100 ? v.toFixed(0) : a >= 1 ? v.toFixed(1) : v.toFixed(2);
+}
+
+// Nice round step covering range/target (Heckbert-style: 1, 2, 2.5, 5 x 10^n)
+function niceStep(range, target) {
+  const raw = range / target;
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  for (const m of [1, 2, 2.5, 5]) if (raw <= m * mag) return m * mag;
+  return 10 * mag;
+}
+
+function niceTimeStepSec(spanSec, target) {
+  for (const s of [5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200])
+    if (spanSec / target <= s) return s;
+  return 14400;
+}
+
+// Line graph with nice-number bounds, subtle grid (values + time), and a
+// hover crosshair showing the value/time under the cursor.
+function makeGraph(canvas, pts, times, color) {
   const dpr = window.devicePixelRatio || 1;
   const w = canvas.clientWidth, h = canvas.clientHeight;
   canvas.width = w * dpr; canvas.height = h * dpr;
   const ctx = canvas.getContext('2d');
   ctx.scale(dpr, dpr);
   const valid = pts.filter(p => p != null && isFinite(p));
-  if (!valid.length) return {};
-  let min = Math.min(...valid), max = Math.max(...valid);
-  if (max - min < 1e-9) { max += 1; min -= 1; }
-  const pad = (max - min) * 0.12; min -= pad; max += pad;
-  ctx.strokeStyle = color; ctx.lineWidth = 1.5;
-  ctx.beginPath();
-  let started = false;
+  if (!valid.length) return;
+
+  let lo = Math.min(...valid), hi = Math.max(...valid);
+  if (hi - lo < 1e-9) { const pad = Math.max(Math.abs(hi) * 0.1, 1); lo -= pad; hi += pad; }
+  const step = niceStep(hi - lo, 3);
+  const min = Math.floor(lo / step) * step;
+  const max = Math.ceil(hi / step) * step;
+
+  const PADB = 13;                  // room for time labels
+  const PADT = 12;                  // room for the topmost value label
+  const plotH = h - PADB;
   const n = Math.max(pts.length - 1, 1);
-  pts.forEach((p, i) => {
-    if (p == null || !isFinite(p)) { started = false; return; }
-    const x = i / n * w;
-    const y = h - 3 - (p - min) / (max - min) * (h - 6);
-    started ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
-    started = true;
-  });
-  ctx.stroke();
-  return { min, max };
+  const X = i => i / n * w;
+  const Y = v => plotH - 3 - (v - min) / (max - min) * (plotH - 3 - PADT);
+
+  const hasTime = times.length > 1 && isFinite(times[0]) && times[times.length - 1] > times[0];
+  const t0 = hasTime ? times[0] : 0, t1 = hasTime ? times[times.length - 1] : 1;
+
+  function render(hoverI) {
+    ctx.clearRect(0, 0, w, h);
+    ctx.font = '9px -apple-system, "Segoe UI", sans-serif';
+
+    // horizontal grid + value labels (on nice-number ticks)
+    for (let v = min; v <= max + step * 1e-6; v += step) {
+      const y = Y(v);
+      ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+      ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+      ctx.fillStyle = '#565c66';
+      ctx.fillText(fmtVal(v), 4, y - 3);
+    }
+
+    // vertical grid + time labels (on nice time steps)
+    if (hasTime) {
+      const ts = niceTimeStepSec((t1 - t0) / 1000, 4) * 1000;
+      for (let t = Math.ceil(t0 / ts) * ts; t <= t1; t += ts) {
+        const x = (t - t0) / (t1 - t0) * w;
+        ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+        ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, plotH); ctx.stroke();
+        const d = new Date(t);
+        const hh = String(d.getHours()).padStart(2, '0');
+        const mm = String(d.getMinutes()).padStart(2, '0');
+        const lbl = ts < 60000 ? hh + ':' + mm + ':' + String(d.getSeconds()).padStart(2, '0')
+                               : hh + ':' + mm;
+        ctx.fillStyle = '#565c66';
+        ctx.fillText(lbl, Math.min(x + 3, w - 40), h - 3);
+      }
+    }
+
+    // the series
+    ctx.strokeStyle = color; ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    let started = false;
+    pts.forEach((p, i) => {
+      if (p == null || !isFinite(p)) { started = false; return; }
+      started ? ctx.lineTo(X(i), Y(p)) : ctx.moveTo(X(i), Y(p));
+      started = true;
+    });
+    ctx.stroke();
+
+    // hover crosshair + readout
+    if (hoverI >= 0 && hoverI < pts.length && pts[hoverI] != null && isFinite(pts[hoverI])) {
+      const x = X(hoverI), y = Y(pts[hoverI]);
+      ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, plotH); ctx.stroke();
+      ctx.fillStyle = color;
+      ctx.beginPath(); ctx.arc(x, y, 3, 0, 2 * Math.PI); ctx.fill();
+
+      let lbl = fmtVal(pts[hoverI]);
+      if (hasTime && isFinite(times[hoverI])) {
+        const d = new Date(times[hoverI]);
+        lbl += '  ' + String(d.getHours()).padStart(2, '0') + ':'
+             + String(d.getMinutes()).padStart(2, '0') + ':'
+             + String(d.getSeconds()).padStart(2, '0');
+      }
+      ctx.font = '11px -apple-system, "Segoe UI", sans-serif';
+      const tw = ctx.measureText(lbl).width;
+      const lx = (x + 10 + tw + 6 > w) ? x - tw - 14 : x + 10;
+      ctx.fillStyle = 'rgba(14,16,20,0.92)';
+      ctx.fillRect(lx - 5, 4, tw + 10, 17);
+      ctx.strokeStyle = 'rgba(255,255,255,0.18)';
+      ctx.strokeRect(lx - 5, 4, tw + 10, 17);
+      ctx.fillStyle = '#e6e9ee';
+      ctx.fillText(lbl, lx, 16);
+    }
+  }
+
+  render(-1);
+  canvas.onmousemove = e => {
+    const r = canvas.getBoundingClientRect();
+    render(Math.round((e.clientX - r.left) / r.width * n));
+  };
+  canvas.onmouseleave = () => render(-1);
 }
 
 async function renderDetail() {
@@ -347,22 +445,24 @@ async function renderDetail() {
     });
   });
 
-  const span = hist.length >= 2
-    ? hist[0].at.slice(11, 16) + ' - ' + hist[hist.length - 1].at.slice(11, 16) : '';
+  const times = hist.map(e => Date.parse(e.at));
   const cont = document.getElementById('dGraphs');
+  // Don't rebuild while the pointer is inspecting a graph — a rebuild would
+  // wipe the hover crosshair mid-read. Data resumes once the mouse leaves.
+  if (cont.matches(':hover')) return;
   cont.replaceChildren(...graphs.map(g => {
     const el = document.createElement('div');
     el.className = 'graph';
     el.innerHTML = `<div class="glabel"><span></span><span class="gval"></span></div><canvas></canvas>`;
-    el.querySelector('.glabel span').textContent = g.label + (span ? '  (' + span + ')' : '');
+    el.querySelector('.glabel span').textContent = g.label;
     return el;
   }));
   graphs.forEach((g, i) => {
     const el = cont.children[i];
     const pts = hist.map(g.get);
-    drawGraph(el.querySelector('canvas'), pts, g.color);
+    makeGraph(el.querySelector('canvas'), pts, times, g.color);
     const last = [...pts].reverse().find(p => p != null && isFinite(p));
-    el.querySelector('.gval').textContent = last != null ? (+last).toFixed(1) : '-';
+    el.querySelector('.gval').textContent = last != null ? fmtVal(+last) : '-';
   });
 }
 
