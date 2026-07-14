@@ -68,8 +68,8 @@ supervisor discovers it via MCP `tools/list`, no anchorbolt configuration:
 
 ```cpp
 void tcApp::setup() {
-    mcp::status("scene",   [&] { return sceneName; });     // shown as-is
-    mcp::graph("visitors", [&] { return visitorCount; });  // plotted over time
+    mcp::status("scene",         [&] { return sceneName; });     // shown as-is
+    mcp::statusGraph("visitors", [&] { return visitorCount; });  // plotted over time
     mcp::statusImage("entranceCam", [&] { return camPixels; });  // e.g. a webcam
 }
 ```
