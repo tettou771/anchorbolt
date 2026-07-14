@@ -48,13 +48,36 @@ Options: `--port` (MCP port, default 47777) `--interval` (poll sec, 3)
 
 - live thumbnail wall at `/` — green/red per app, fps / size / uptime,
   stale marking after 10s of silence
-- ingest: `POST /api/heartbeat` (JSON), `POST /api/thumb/<id>` (raw JPEG)
-- read: `GET /api/apps`, `GET /api/thumb/<id>`
+- click a card for the detail view: big live thumbnail, app-published
+  status values, time-series graphs (fps / memory / custom metrics),
+  custom image streams
+- ingest: `POST /api/heartbeat` (JSON), `POST /api/thumb/<id>` and
+  `POST /api/image/<id>/<name>` (raw JPEG)
+- read: `GET /api/apps`, `GET /api/thumb/<id>`, `GET /api/image/<id>/<name>`,
+  `GET /api/history/<id>`
 - DB-free storage under `--data` (default `./anchorbolt-data`): daily
   heartbeat JSONL + timestamp-named JPEGs per app
 - no auth yet — run it on a trusted network / behind a tunnel
 
 Options: `-p/--port` (HTTP port, default 8787) `--data <dir>`.
+
+## Custom app status
+
+Apps can publish their own monitoring data with one line per value — the
+supervisor discovers it via MCP `tools/list`, no anchorbolt configuration:
+
+```cpp
+void tcApp::setup() {
+    mcp::status("scene",   [&] { return sceneName; });     // shown as-is
+    mcp::graph("visitors", [&] { return visitorCount; });  // plotted over time
+    mcp::statusImage("entranceCam", [&] { return camPixels; });  // e.g. a webcam
+}
+```
+
+Values ride every heartbeat; images are fetched on the thumbnail interval
+(cheap for the app — same two-stage encode as `get_thumbnail`). See
+`demo/` for a complete example and TrussC's `docs/AI_AUTOMATION.md`
+("Publishing Custom Ops Status") for the convention.
 
 Next: Windows support, auth (agent/operator tokens), retention, sinks
 (webhook notifications), WS live view, MCP passthrough.

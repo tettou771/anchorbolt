@@ -56,6 +56,21 @@ void sleepChecked(double sec) {
     }
 }
 
+// Raw JSON-RPC call, returns the "result" object (used for tools/list).
+optional<Json> callRpc(httplib::Client& cli, const string& method) {
+    Json req = {{"jsonrpc", "2.0"},
+                {"id", 1},
+                {"method", method},
+                {"params", Json::object()}};
+    auto res = cli.Post("/mcp", req.dump(), "application/json");
+    if (!res || res->status != 200) return nullopt;
+    try {
+        return Json::parse(res->body).at("result");
+    } catch (...) {
+        return nullopt;
+    }
+}
+
 // JSON-RPC tools/call against the app's local MCP endpoint.
 // nullopt = transport failure or malformed reply (both count as a miss).
 optional<Json> callTool(httplib::Client& cli, const string& name,
@@ -121,6 +136,12 @@ public:
         auto res = cli_.Post("/api/thumb/" + appId_,
                              string((const char*)jpg.data(), jpg.size()), "image/jpeg");
         report(res && res->status == 200, "thumbnail");
+    }
+
+    void image(const string& name, const vector<unsigned char>& jpg) {
+        auto res = cli_.Post("/api/image/" + appId_ + "/" + name,
+                             string((const char*)jpg.data(), jpg.size()), "image/jpeg");
+        report(res && res->status == 200, "image");
     }
 
 private:
@@ -272,6 +293,9 @@ int cmdStart(const vector<string>& args) {
         bool childAlive = true;
         int  misses = 0;
         chrono::steady_clock::time_point lastThumb{};  // epoch -> push right away
+        bool statusChecked = false;   // tools/list probed for anchorbolt_status
+        bool hasStatus = false;
+        vector<string> imageNames;    // statusImage names from the last status
 
         while (!g_stop) {
             // Process exit?
@@ -304,7 +328,31 @@ int cmdStart(const vector<string>& args) {
                                        << (*h).value("width", 0) << "x" << (*h).value("height", 0) << ")";
                 }
                 if (push) {
-                    push->heartbeat(*h);
+                    // Custom ops status (the anchorbolt convention): probe
+                    // tools/list once per app run, then ride every heartbeat.
+                    if (!statusChecked) {
+                        statusChecked = true;
+                        if (auto r = callRpc(cli, "tools/list")) {
+                            for (auto& t : r->value("tools", Json::array())) {
+                                if (t.value("name", "") == "anchorbolt_status") {
+                                    hasStatus = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Json hb = *h;
+                    if (hasStatus) {
+                        if (auto s = callTool(cli, "anchorbolt_status")) {
+                            imageNames.clear();
+                            for (auto& n : s->value("images", Json::array()))
+                                imageNames.push_back(n.get<string>());
+                            if (!s->value("values", Json::array()).empty() || !imageNames.empty())
+                                hb["custom"] = *s;
+                        }
+                    }
+                    push->heartbeat(hb);
+
                     auto now = chrono::steady_clock::now();
                     if (now - lastThumb >= chrono::seconds(opt.thumbIntervalSec)) {
                         lastThumb = now;
@@ -312,6 +360,14 @@ int cmdStart(const vector<string>& args) {
                             if (t->contains("data") && (*t)["data"].is_string()) {
                                 auto jpg = fromBase64((*t)["data"].get<string>());
                                 if (!jpg.empty()) push->thumbnail(jpg);
+                            }
+                        }
+                        for (const auto& n : imageNames) {
+                            if (auto t = callTool(cli, "anchorbolt_image", {{"name", n}})) {
+                                if (t->contains("data") && (*t)["data"].is_string()) {
+                                    auto jpg = fromBase64((*t)["data"].get<string>());
+                                    if (!jpg.empty()) push->image(n, jpg);
+                                }
                             }
                         }
                     }
