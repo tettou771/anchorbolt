@@ -89,7 +89,7 @@ optional<Json> callTool(httplib::Client& cli, const string& name,
     }
 }
 
-// Decode standard base64 (tc_get_thumbnail ships its JPEG this way; core has
+// Decode standard base64 (tc_get_screenshot ships its images this way; core has
 // toBase64 but no decoder yet). Skips padding and whitespace.
 vector<unsigned char> fromBase64(const string& s) {
     auto val = [](char c) -> int {
@@ -356,7 +356,8 @@ int cmdStart(const vector<string>& args) {
                     auto now = chrono::steady_clock::now();
                     if (now - lastThumb >= chrono::seconds(opt.thumbIntervalSec)) {
                         lastThumb = now;
-                        if (auto t = callTool(cli, "tc_get_thumbnail")) {
+                        if (auto t = callTool(cli, "tc_get_screenshot",
+                                              {{"format", "jpg"}, {"width", 512}})) {
                             if (t->contains("data") && (*t)["data"].is_string()) {
                                 auto jpg = fromBase64((*t)["data"].get<string>());
                                 if (!jpg.empty()) push->thumbnail(jpg);

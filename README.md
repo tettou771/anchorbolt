@@ -36,8 +36,7 @@ anchorbolt serve
 - `tc_get_health` polling → hang detection → SIGTERM/SIGKILL → restart
 - process-exit detection → restart
 - SIGINT/SIGTERM to anchorbolt shuts the app down cleanly too
-- with `--server`: pushes a heartbeat per health poll and a `tc_get_thumbnail`
-  JPEG every 30s (raw bytes, cheap for the app — no frame stutter)
+- with `--server`: pushes a heartbeat per health poll and a downscaled  JPEG every 30s (raw bytes, cheap for the app — no frame stutter)
 
 Options: `--port` (MCP port, default 47777) `--interval` (poll sec, 3)
 `--grace` (boot grace sec, 15) `--misses` (restart threshold, 3)
@@ -75,7 +74,7 @@ void tcApp::setup() {
 ```
 
 Values ride every heartbeat; images are fetched on the thumbnail interval
-(cheap for the app — same two-stage encode as `tc_get_thumbnail`). See
+(cheap for the app — same two-stage encode as `tc_get_screenshot`). See
 `demo/` for a complete example and TrussC's `docs/AI_AUTOMATION.md`
 ("Publishing Custom Ops Status") for the convention.
 
@@ -85,7 +84,7 @@ Next: Windows support, auth (agent/operator tokens), retention, sinks
 ## Build
 
 A standard TrussC project. Requires a TrussC core with `tc_get_health` /
-`tc_get_thumbnail` / `TRUSSC_LOG_FILE` (v0.7.0+, currently the `feat/kiosk`
+`tc_get_screenshot(width)` / `TRUSSC_LOG_FILE` (v0.7.0+, currently the `feat/kiosk`
 branch).
 
 ```bash
