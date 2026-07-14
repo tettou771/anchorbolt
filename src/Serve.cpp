@@ -13,9 +13,13 @@
 // =============================================================================
 
 #include "Serve.h"
+#include "Token.h"
+#include "WsHub.h"
 
 #include <TrussC.h>
 #include <impl/httplib.h>
+
+#include <future>
 
 #include <atomic>
 #include <chrono>
@@ -36,6 +40,7 @@ namespace {
 
 struct ServeOptions {
     int    port    = 8787;
+    int    wsPort  = 0;      // 0 = port + 1
     string dataDir = "anchorbolt-data";
 };
 
@@ -71,6 +76,57 @@ mutex g_appsMutex;
 atomic<bool> g_stop{false};
 void onSignal(int) { g_stop = true; }
 
+// --- agent command channel (WebSocket) ---------------------------------------
+// Agents keep one outbound WS to the hub; the dashboard's HTTP requests are
+// bridged to WS commands and block on the agent's reply.
+
+struct AgentChannel {
+    WsHub hub;
+    map<string, int> byApp;          // appId -> ws clientId
+    map<int, string> byClient;       // ws clientId -> appId
+    map<uint64_t, shared_ptr<promise<Json>>> pending;
+    uint64_t nextCmdId = 1;
+    mutex mutex_;
+
+    bool live(const string& appId) {
+        lock_guard<mutex> lock(mutex_);
+        return byApp.count(appId) > 0;
+    }
+
+    // Send a command to the app's agent and wait for its reply.
+    Json command(const string& appId, Json cmd, int timeoutSec = 15) {
+        int clientId = -1;
+        uint64_t id = 0;
+        auto prom = make_shared<promise<Json>>();
+        {
+            lock_guard<mutex> lock(mutex_);
+            auto it = byApp.find(appId);
+            if (it == byApp.end()) {
+                return Json{{"ok", false}, {"error", "agent not connected"}};
+            }
+            clientId = it->second;
+            id = nextCmdId++;
+            pending[id] = prom;
+        }
+        cmd["type"] = "cmd";
+        cmd["id"] = id;
+        if (!hub.sendText(clientId, cmd.dump())) {
+            lock_guard<mutex> lock(mutex_);
+            pending.erase(id);
+            return Json{{"ok", false}, {"error", "agent send failed"}};
+        }
+        auto fut = prom->get_future();
+        if (fut.wait_for(chrono::seconds(timeoutSec)) != future_status::ready) {
+            lock_guard<mutex> lock(mutex_);
+            pending.erase(id);
+            return Json{{"ok", false}, {"error", "agent reply timed out"}};
+        }
+        return fut.get();
+    }
+};
+
+AgentChannel g_agents;
+
 // App ids become directory names — restrict to a safe charset.
 bool validAppId(const string& id) {
     if (id.empty() || id.size() > 64) return false;
@@ -91,6 +147,7 @@ bool parseArgs(const vector<string>& args, ServeOptions& opt) {
             return args[++i];
         };
         if      (a == "-p" || a == "--port") { auto v = next("--port"); if (!v) return false; opt.port = stoi(*v); }
+        else if (a == "--ws-port")           { auto v = next("--ws-port"); if (!v) return false; opt.wsPort = stoi(*v); }
         else if (a == "--data")              { auto v = next("--data"); if (!v) return false; opt.dataDir = *v; }
         else {
             cerr << "anchorbolt serve: unknown option '" << a << "'" << endl;
@@ -202,6 +259,30 @@ const char* kDashboardHtml = R"HTML(<!DOCTYPE html>
   #dLog .ll.sup  { color: #7ea6d9; }
   #dLog .ll .lt  { color: #565c66; margin-right: 8px; }
   #dLog .empty   { color: #4a4f59; padding: 12px; }
+  .liveChip { font-size: 11px; border-radius: 4px; padding: 1px 7px; flex: none;
+              background: #1a2f22; color: #4ecb71; border: 1px solid #2b4a35; }
+  .liveChip.off { background: #2a2224; color: #8d6a6e; border-color: #443338; }
+  #dRestart { background: #33251a; color: #e0a06a; border: 1px solid #55402c;
+              border-radius: 6px; font-size: 12px; padding: 4px 12px;
+              cursor: pointer; flex: none; }
+  #dRestart:hover { background: #40301f; }
+  #dRestart:disabled { opacity: .45; cursor: default; }
+  #dConsole { background: #101216; border: 1px solid #262b34; border-radius: 8px;
+              padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
+  #dConsole .row { display: flex; gap: 8px; }
+  #dTool { background: #191c22; border: 1px solid #2a2e36; border-radius: 5px;
+           color: #d4d7dd; font-size: 12px; padding: 4px 8px; flex: 1; min-width: 0; }
+  #dArgs { background: #191c22; border: 1px solid #2a2e36; border-radius: 5px;
+           color: #d4d7dd; padding: 4px 8px; flex: 2; min-width: 0;
+           font: 11px ui-monospace, Menlo, monospace; }
+  #dRun { background: #1c2a3a; color: #79b8ff; border: 1px solid #2c405a;
+          border-radius: 5px; font-size: 12px; padding: 4px 14px; cursor: pointer; }
+  #dRun:hover { background: #223449; }
+  #dResult { margin: 0; max-height: 180px; overflow: auto; color: #aeb4bf;
+             font: 11px/1.5 ui-monospace, Menlo, monospace; white-space: pre-wrap;
+             word-break: break-all; }
+  #dResult:empty { display: none; }
+  #dResult.err { color: #ff8a80; }
 </style>
 </head>
 <body>
@@ -219,6 +300,8 @@ const char* kDashboardHtml = R"HTML(<!DOCTYPE html>
       <span class="dot" id="dDot"></span>
       <h2 id="dTitle"></h2>
       <span class="stats" id="dStats"></span>
+      <span class="liveChip off" id="dLive">offline</span>
+      <button id="dRestart" disabled>Restart</button>
       <button id="dClose" title="close">&times;</button>
     </div>
     <div class="dbody">
@@ -232,6 +315,14 @@ const char* kDashboardHtml = R"HTML(<!DOCTYPE html>
           <input id="dLogFilter" type="text" placeholder="filter (e.g. ERROR)">
         </div>
         <div id="dLog"><div class="empty">no log lines yet</div></div>
+      </div>
+      <div id="dConsole">
+        <div class="row">
+          <select id="dTool"><option value="">loading tools...</option></select>
+          <input id="dArgs" type="text" placeholder='args JSON, e.g. {"width": 256}'>
+          <button id="dRun">Run</button>
+        </div>
+        <pre id="dResult"></pre>
       </div>
     </div>
   </div>
@@ -283,7 +374,9 @@ function openDetail(id) {
   document.getElementById('dImages').replaceChildren();
   document.getElementById('dLog').replaceChildren(
     Object.assign(document.createElement('div'), {className: 'empty', textContent: 'no log lines yet'}));
+  document.getElementById('dResult').textContent = '';
   document.getElementById('detail').hidden = false;
+  loadTools(id);
   renderDetail();
 }
 
@@ -429,6 +522,10 @@ async function renderDetail() {
   const stale = app.ageSec > STALE_SEC;
   document.getElementById('dDot').classList.toggle('bad', stale);
   document.getElementById('dTitle').textContent = app.id;
+  const live = document.getElementById('dLive');
+  live.textContent = app.live ? 'live' : 'offline';
+  live.classList.toggle('off', !app.live);
+  document.getElementById('dRestart').disabled = !app.live;
   const h = app.health || {};
   const extra = [];
   if (h.version) extra.push(h.version);
@@ -516,6 +613,76 @@ async function renderDetail() {
     el.querySelector('.gval').textContent = last != null ? fmtVal(+last) : '-';
   });
 }
+
+// ---- remote control (restart + tool console) ----
+
+async function sendCommand(id, body) {
+  try {
+    return await (await fetch('/api/command/' + encodeURIComponent(id), {
+      method: 'POST', body: JSON.stringify(body),
+    })).json();
+  } catch {
+    return { ok: false, error: 'server unreachable' };
+  }
+}
+
+document.getElementById('dRestart').addEventListener('click', async () => {
+  if (!detailId || !confirm('Restart "' + detailId + '"?')) return;
+  const btn = document.getElementById('dRestart');
+  btn.disabled = true;
+  const r = await sendCommand(detailId, { action: 'restart' });
+  showResult(r);
+  setTimeout(() => { btn.disabled = false; }, 3000);
+});
+
+async function loadTools(id) {
+  const sel = document.getElementById('dTool');
+  sel.replaceChildren(new Option('loading tools...', ''));
+  const r = await sendCommand(id, { action: 'list_tools' });
+  if (detailId !== id) return;
+  const tools = (r.ok && r.result && r.result.tools) ? r.result.tools : [];
+  sel.replaceChildren(...(tools.length
+    ? tools.map(t => {
+        const o = new Option(t.name, t.name);
+        o.title = t.description || '';
+        return o;
+      })
+    : [new Option(r.error || 'no tools (agent offline?)', '')]));
+}
+
+function showResult(r) {
+  const pre = document.getElementById('dResult');
+  pre.classList.toggle('err', !r.ok);
+  let payload = r.ok ? (r.result ?? {}) : (r.error || 'failed');
+  // Images come back as base64 — show them, don't dump the string.
+  if (r.ok && payload && typeof payload === 'object' && payload.data && payload.mimeType) {
+    pre.classList.remove('err');
+    pre.replaceChildren(Object.assign(new Image(), {
+      src: 'data:' + payload.mimeType + ';base64,' + payload.data,
+      style: 'max-width:100%;',
+    }));
+    return;
+  }
+  pre.textContent = typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2);
+}
+
+document.getElementById('dRun').addEventListener('click', async () => {
+  if (!detailId) return;
+  const tool = document.getElementById('dTool').value;
+  if (!tool) return;
+  let args = {};
+  const raw = document.getElementById('dArgs').value.trim();
+  if (raw) {
+    try {
+      args = JSON.parse(raw);
+    } catch {
+      showResult({ ok: false, error: 'args is not valid JSON' });
+      return;
+    }
+  }
+  showResult({ ok: true, result: '...' });
+  showResult(await sendCommand(detailId, { action: 'call', tool, args }));
+});
 
 // ---- log panel ----
 
@@ -643,6 +810,7 @@ setInterval(refresh, 3000);
 int cmdServe(const vector<string>& args) {
     ServeOptions opt;
     if (!parseArgs(args, opt)) return 1;
+    if (opt.wsPort == 0) opt.wsPort = opt.port + 1;
 
     fs::path dataDir = fs::absolute(opt.dataDir);
     error_code ec;
@@ -652,14 +820,107 @@ int cmdServe(const vector<string>& args) {
         return 1;
     }
 
+    // Agent authentication: with at least one token registered, every ingest
+    // request and WS hello must present a valid token for its app id.
+    // No tokens = open mode (the zero-config path on trusted networks).
+    auto authOk = [dataDir](const httplib::Request& req, const string& appId) {
+        string d = dataDir.string();
+        if (!token::enforcementEnabled(d)) return true;
+        string h = req.get_header_value("Authorization");
+        const string prefix = "Bearer ";
+        if (h.rfind(prefix, 0) != 0) return false;
+        return token::verify(d, appId, h.substr(prefix.size()));
+    };
+
+    // WS hub: agents say hello {type, app, token}; replies to commands come
+    // back as {type:"result", id, ...}. Callbacks run on socket threads.
+    g_agents.hub.onMessage = [dataDir](int clientId, const string& text) {
+        Json m;
+        try {
+            m = Json::parse(text);
+        } catch (...) {
+            return;
+        }
+        string type = m.value("type", "");
+        if (type == "hello") {
+            string app = m.value("app", "");
+            string tok = m.value("token", "");
+            string d = dataDir.string();
+            if (!validAppId(app) ||
+                (token::enforcementEnabled(d) && !token::verify(d, app, tok))) {
+                g_agents.hub.sendText(clientId, Json({{"type", "error"},
+                                                      {"error", "auth failed"}}).dump());
+                g_agents.hub.closeClient(clientId);
+                logWarning("anchorbolt") << "agent hello rejected (app '" << app << "')";
+                return;
+            }
+            lock_guard<mutex> lock(g_agents.mutex_);
+            // A reconnect replaces any stale mapping.
+            if (auto old = g_agents.byApp.find(app); old != g_agents.byApp.end()) {
+                g_agents.byClient.erase(old->second);
+            }
+            g_agents.byApp[app] = clientId;
+            g_agents.byClient[clientId] = app;
+            logNotice("anchorbolt") << "agent connected: " << app;
+        } else if (type == "result") {
+            uint64_t id = m.value("id", (uint64_t)0);
+            shared_ptr<promise<Json>> prom;
+            {
+                lock_guard<mutex> lock(g_agents.mutex_);
+                auto it = g_agents.pending.find(id);
+                if (it == g_agents.pending.end()) return;
+                prom = it->second;
+                g_agents.pending.erase(it);
+            }
+            m.erase("type");
+            m.erase("id");
+            prom->set_value(m);
+        }
+    };
+    g_agents.hub.onClosed = [](int clientId) {
+        lock_guard<mutex> lock(g_agents.mutex_);
+        auto it = g_agents.byClient.find(clientId);
+        if (it == g_agents.byClient.end()) return;
+        logNotice("anchorbolt") << "agent disconnected: " << it->second;
+        g_agents.byApp.erase(it->second);
+        g_agents.byClient.erase(it);
+    };
+    if (!g_agents.hub.start(opt.wsPort)) {
+        cerr << "anchorbolt serve: failed to listen on ws port " << opt.wsPort << endl;
+        return 1;
+    }
+
     httplib::Server svr;
+
+    // Dashboard -> agent command bridge. Blocks until the agent replies (or
+    // 15s). Restart is handled by the supervisor itself; 'call' relays an MCP
+    // tool call to the app (agent-side allowlist applies).
+    svr.Post(R"(/api/command/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
+        string id = req.matches[1];
+        Json body;
+        try {
+            body = Json::parse(req.body);
+        } catch (...) {
+            res.status = 400;
+            res.set_content("invalid JSON", "text/plain");
+            return;
+        }
+        string action = body.value("action", "");
+        if (action != "restart" && action != "call" && action != "list_tools") {
+            res.status = 400;
+            res.set_content("unknown action", "text/plain");
+            return;
+        }
+        Json reply = g_agents.command(id, body);
+        res.set_content(reply.dump(), "application/json");
+    });
 
     svr.Get("/", [](const httplib::Request&, httplib::Response& res) {
         res.set_content(kDashboardHtml, "text/html");
     });
 
     // Agent push: health JSON. Body = get_health result + {"app": "<id>"}.
-    svr.Post("/api/heartbeat", [dataDir](const httplib::Request& req, httplib::Response& res) {
+    svr.Post("/api/heartbeat", [dataDir, authOk](const httplib::Request& req, httplib::Response& res) {
         Json body;
         try {
             body = Json::parse(req.body);
@@ -674,6 +935,7 @@ int cmdServe(const vector<string>& args) {
             res.set_content("missing or invalid 'app' id", "text/plain");
             return;
         }
+        if (!authOk(req, id)) { res.status = 401; res.set_content("unauthorized", "text/plain"); return; }
         body.erase("app");
         {
             lock_guard<mutex> lock(g_appsMutex);
@@ -692,13 +954,14 @@ int cmdServe(const vector<string>& args) {
     });
 
     // Agent push: latest thumbnail as raw JPEG bytes (no base64 on the wire).
-    svr.Post(R"(/api/thumb/([^/]+))", [dataDir](const httplib::Request& req, httplib::Response& res) {
+    svr.Post(R"(/api/thumb/([^/]+))", [dataDir, authOk](const httplib::Request& req, httplib::Response& res) {
         string id = req.matches[1];
         if (!validAppId(id)) {
             res.status = 400;
             res.set_content("invalid app id", "text/plain");
             return;
         }
+        if (!authOk(req, id)) { res.status = 401; res.set_content("unauthorized", "text/plain"); return; }
         if (req.body.empty()) {
             res.status = 400;
             res.set_content("empty body", "text/plain");
@@ -720,7 +983,7 @@ int cmdServe(const vector<string>& args) {
 
     // Agent push: custom statusImage as raw JPEG (same shape as thumbnails,
     // but keyed by app + image name).
-    svr.Post(R"(/api/image/([^/]+)/([^/]+))", [dataDir](const httplib::Request& req, httplib::Response& res) {
+    svr.Post(R"(/api/image/([^/]+)/([^/]+))", [dataDir, authOk](const httplib::Request& req, httplib::Response& res) {
         string id = req.matches[1];
         string name = req.matches[2];
         if (!validAppId(id) || !validAppId(name)) {
@@ -728,6 +991,7 @@ int cmdServe(const vector<string>& args) {
             res.set_content("invalid app or image id", "text/plain");
             return;
         }
+        if (!authOk(req, id)) { res.status = 401; res.set_content("unauthorized", "text/plain"); return; }
         if (req.body.empty()) {
             res.status = 400;
             res.set_content("empty body", "text/plain");
@@ -760,9 +1024,10 @@ int cmdServe(const vector<string>& args) {
 
     // Agent push: forwarded log lines (app log + supervisor events). Arrives
     // even while the app itself is down — the supervisor keeps reporting.
-    svr.Post(R"(/api/log/([^/]+))", [dataDir](const httplib::Request& req, httplib::Response& res) {
+    svr.Post(R"(/api/log/([^/]+))", [dataDir, authOk](const httplib::Request& req, httplib::Response& res) {
         string id = req.matches[1];
         if (!validAppId(id)) { res.status = 400; return; }
+        if (!authOk(req, id)) { res.status = 401; res.set_content("unauthorized", "text/plain"); return; }
         Json body;
         try {
             body = Json::parse(req.body);
@@ -843,6 +1108,7 @@ int cmdServe(const vector<string>& args) {
                             {"ageSec", age},
                             {"thumbSeq", st.thumbSeq},
                             {"images", images},
+                            {"live", g_agents.live(id)},
                             {"health", st.health}});
         }
         res.set_content(list.dump(), "application/json");
@@ -870,11 +1136,14 @@ int cmdServe(const vector<string>& args) {
     });
 
     logNotice("anchorbolt") << "fleet server on http://localhost:" << opt.port
-                            << " (data " << dataDir.string() << ")";
+                            << " (ws " << opt.wsPort << ", data " << dataDir.string()
+                            << (token::enforcementEnabled(dataDir.string())
+                                ? ", agent tokens ENFORCED)" : ", open mode)");
     bool ok = svr.listen("0.0.0.0", opt.port);
     bool stoppedBySignal = g_stop.load();
     g_stop = true;
     stopWatcher.join();
+    g_agents.hub.stop();
 
     if (!ok && !stoppedBySignal) {
         cerr << "anchorbolt serve: failed to listen on port " << opt.port << endl;

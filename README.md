@@ -45,7 +45,8 @@ anchorbolt serve
 Options: `--port` (MCP port, default 47777) `--interval` (poll sec, 3)
 `--grace` (boot grace sec, 15) `--misses` (restart threshold, 3)
 `--log-dir` (app log destination) `--cwd` `--server <url>` `--id <name>`
-(default: binary name) `--thumb-interval <sec>` (30).
+(default: binary name) `--token <tok>` `--ws-port <n>` `--allow-control`
+`--thumb-interval <sec>` (30).
 
 `serve` (fleet server):
 
@@ -61,9 +62,34 @@ Options: `--port` (MCP port, default 47777) `--interval` (poll sec, 3)
   `GET /api/history/<id>`, `GET /api/log/<id>?after=<seq>`
 - DB-free storage under `--data` (default `./anchorbolt-data`): daily
   heartbeat JSONL + timestamp-named JPEGs per app
-- no auth yet — run it on a trusted network / behind a tunnel
+- **remote control** (agent keeps one outbound WebSocket, NAT-friendly):
+  the detail view shows a live/offline chip, a Restart button, and a tool
+  console that relays MCP tool calls to the app. Read-only tools
+  (`tc_get_*`) relay freely; anything mutating requires the venue operator
+  to have started the agent with `--allow-control`
 
-Options: `-p/--port` (HTTP port, default 8787) `--data <dir>`.
+Options: `-p/--port` (HTTP port, default 8787) `--ws-port <n>` (command
+channel, default port+1) `--data <dir>`.
+
+## Agent tokens
+
+Tokens are minted on the **server** side and only their SHA-256 hashes are
+stored; the venue machine carries the token:
+
+```bash
+# on the server
+anchorbolt token new osaka-entrance --data ./anchorbolt-data
+# -> prints tc-... once. From then on EVERY agent must authenticate.
+
+# on the venue machine
+anchorbolt start ./bin/myApp --server https://ops.example.com \
+    --id osaka-entrance --token tc-...       # or ANCHORBOLT_TOKEN env
+```
+
+`token list` / `token revoke <app-id>` manage them. No tokens registered =
+open mode (today's zero-config behavior on trusted networks). Dashboard
+viewers are not authenticated yet — put the HTTP port behind a reverse
+proxy (Caddy basic-auth, Cloudflare Tunnel) when exposing it.
 
 ## Custom app status
 
@@ -83,8 +109,8 @@ Values ride every heartbeat; images are fetched on the thumbnail interval
 `demo/` for a complete example and TrussC's `docs/AI_AUTOMATION.md`
 ("Publishing Custom Ops Status") for the convention.
 
-Next: Windows support, auth (agent/operator tokens), retention, sinks
-(webhook notifications), WS live view, MCP passthrough.
+Next: Windows support, retention/pruning, sinks (webhook notifications),
+approval queue for AI-driven mutating calls, live view, operator auth.
 
 ## Build
 

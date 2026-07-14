@@ -8,6 +8,7 @@
 #include <TrussC.h>
 #include "Start.h"
 #include "Serve.h"
+#include "Token.h"
 
 #include <iostream>
 #include <string>
@@ -21,8 +22,9 @@ static void printHelp() {
         "\n"
         "USAGE\n"
         "  anchorbolt start <app-binary> [options]   kiosk mode: supervise an app on this machine\n"
-        "  anchorbolt serve [options]                fleet server: dashboard + heartbeat/thumbnail ingest\n"
-        "  anchorbolt reset-admin                    recover the server admin password (not implemented yet)\n"
+        "  anchorbolt serve [options]                fleet server: dashboard + ingest + command channel\n"
+        "  anchorbolt token <new|list|revoke> [app-id] [--data <dir>]\n"
+        "                                            manage agent tokens (server side)\n"
         "\n"
         "START OPTIONS\n"
         "  --cwd <dir>        working directory for the app (default: the binary's directory)\n"
@@ -34,10 +36,15 @@ static void printHelp() {
         "                     (default ./anchorbolt-logs)\n"
         "  --server <url>     fleet server to push to (e.g. http://192.168.1.10:8787)\n"
         "  --id <name>        app id on the fleet server (default: binary name)\n"
+        "  --token <tok>      agent token minted by the server (or ANCHORBOLT_TOKEN)\n"
+        "  --ws-port <n>      server command-channel port (default: server port + 1)\n"
+        "  --allow-control    let the server relay MUTATING tools to the app\n"
+        "                     (input injection, node writes, custom tools; default: read-only)\n"
         "  --thumb-interval <sec>  thumbnail push interval (default 30)\n"
         "\n"
         "SERVE OPTIONS\n"
         "  -p, --port <n>     HTTP port (default 8787)\n"
+        "  --ws-port <n>      agent command-channel port (default: port + 1)\n"
         "  --data <dir>       storage directory for heartbeats/thumbnails\n"
         "                     (default ./anchorbolt-data)\n";
 }
@@ -64,9 +71,8 @@ int main(int argc, char* argv[]) {
     if (cmd == "serve") {
         return cmdServe(vector<string>(args.begin() + 1, args.end()));
     }
-    if (cmd == "reset-admin") {
-        cerr << "anchorbolt reset-admin: not implemented yet" << endl;
-        return 1;
+    if (cmd == "token") {
+        return cmdToken(vector<string>(args.begin() + 1, args.end()));
     }
 
     cerr << "anchorbolt: unknown command '" << cmd << "'\n" << endl;

@@ -12,6 +12,7 @@
 
 #include <TrussC.h>
 #include <impl/httplib.h>
+#include <tcWebSocketClient.h>
 
 #include <atomic>
 #include <chrono>
@@ -48,10 +49,14 @@ struct StartOptions {
     int    maxMisses   = 3;      // consecutive misses -> restart
     string serverUrl;            // fleet server base URL (empty = no push)
     string appId;                // id on the fleet server (default: binary name)
+    string token;                // agent token (--token / ANCHORBOLT_TOKEN)
     int    thumbIntervalSec = 30;
+    int    wsPort = 0;           // command channel port (0 = server port + 1)
+    bool   allowControl = false; // let the server relay MUTATING tools
 };
 
 atomic<bool> g_stop{false};
+atomic<bool> g_restartRequested{false};  // set by the remote restart command
 void onSignal(int) { g_stop = true; }
 
 // Sleep in small slices so SIGINT stays responsive.
@@ -231,10 +236,13 @@ private:
 // reachability changes are logged once, not per attempt.
 class ServerPush {
 public:
-    ServerPush(const string& url, const string& appId)
+    ServerPush(const string& url, const string& appId, const string& token)
         : cli_(url), appId_(appId) {
         cli_.set_connection_timeout(2, 0);
         cli_.set_read_timeout(2, 0);
+        if (!token.empty()) {
+            cli_.set_default_headers({{"Authorization", "Bearer " + token}});
+        }
     }
 
     void heartbeat(Json health) {
@@ -281,6 +289,119 @@ private:
     bool reachable_ = true;  // assume up so the first failure logs
 };
 
+// The agent's end of the command channel: one outbound WebSocket to the
+// server (NAT-friendly). Commands arrive on the socket thread; restart is
+// handed to the supervision loop via g_restartRequested, tool calls are
+// relayed to the app's MCP endpoint directly from here.
+class CommandChannel {
+public:
+    CommandChannel(const StartOptions& opt) : opt_(opt) {
+        // ws://host:wsPort/ derived from the HTTP server URL.
+        string url = opt.serverUrl;
+        bool tls = url.rfind("https://", 0) == 0;
+        if (tls) url = url.substr(8);
+        else if (url.rfind("http://", 0) == 0) url = url.substr(7);
+        size_t slash = url.find('/');
+        if (slash != string::npos) url = url.substr(0, slash);
+        size_t colon = url.find(':');
+        string host = (colon == string::npos) ? url : url.substr(0, colon);
+        int wsPort = opt.wsPort;
+        if (wsPort == 0) {
+            int httpPort = tls ? 443 : 80;
+            if (colon != string::npos) httpPort = stoi(url.substr(colon + 1));
+            wsPort = httpPort + 1;
+        }
+        url_ = (tls ? "wss://" : "ws://") + host + ":" + to_string(wsPort) + "/";
+
+        openL_ = ws_.onOpen.listen([this]() {
+            ws_.send(Json({{"type", "hello"},
+                           {"app", opt_.appId},
+                           {"token", opt_.token}}).dump());
+            logNotice("anchorbolt") << "command channel connected (" << url_ << ")";
+        });
+        msgL_ = ws_.onMessage.listen([this](tcx::websocket::WebSocketEventArgs& e) {
+            handleMessage(e.message);
+        });
+        closeL_ = ws_.onClose.listen([this]() {
+            logWarning("anchorbolt") << "command channel disconnected";
+        });
+    }
+
+    // Called each poll cycle: (re)connect when down. connect() is async.
+    void maintain() {
+        if (ws_.getState() == tcx::websocket::WebSocketClient::State::Disconnected) {
+            ws_.connect(url_);
+        }
+    }
+
+    void shutdown() { ws_.disconnect(); }
+
+private:
+    void handleMessage(const string& text) {
+        Json m;
+        try {
+            m = Json::parse(text);
+        } catch (...) {
+            return;
+        }
+        if (m.value("type", "") == "error") {
+            logError("anchorbolt") << "server rejected command channel: " << m.value("error", "");
+            return;
+        }
+        if (m.value("type", "") != "cmd") return;
+        uint64_t id = m.value("id", (uint64_t)0);
+        string action = m.value("action", "");
+        Json reply = {{"type", "result"}, {"id", id}};
+
+        if (action == "restart") {
+            g_restartRequested = true;
+            reply["ok"] = true;
+            reply["result"] = {{"message", "restart initiated"}};
+        } else if (action == "list_tools" || action == "call") {
+            // Fresh client per command: this runs on the WS thread, never
+            // share the supervision loop's connection.
+            httplib::Client cli("localhost", opt_.port);
+            cli.set_connection_timeout(2, 0);
+            cli.set_read_timeout(10, 0);
+            if (action == "list_tools") {
+                if (auto r = callRpc(cli, "tools/list")) {
+                    reply["ok"] = true;
+                    reply["result"] = *r;
+                } else {
+                    reply["ok"] = false;
+                    reply["error"] = "app did not answer tools/list";
+                }
+            } else {
+                string tool = m.value("tool", "");
+                // Read-only tools relay freely; anything that can mutate the
+                // app (input injection, node writes, custom tools, tc_quit)
+                // requires the venue operator's explicit --allow-control.
+                bool readOnly = tool.rfind("tc_get_", 0) == 0;
+                if (!readOnly && !opt_.allowControl) {
+                    reply["ok"] = false;
+                    reply["error"] = "blocked by supervisor: '" + tool +
+                                     "' is not read-only (start with --allow-control to permit)";
+                } else if (auto r = callTool(cli, tool, m.value("args", Json::object()))) {
+                    reply["ok"] = true;
+                    reply["result"] = *r;
+                } else {
+                    reply["ok"] = false;
+                    reply["error"] = "tool call failed or app unresponsive";
+                }
+            }
+        } else {
+            reply["ok"] = false;
+            reply["error"] = "unknown action";
+        }
+        ws_.send(reply.dump());
+    }
+
+    StartOptions opt_;
+    string url_;
+    tcx::websocket::WebSocketClient ws_;
+    EventListener openL_, msgL_, closeL_;
+};
+
 bool parseArgs(const vector<string>& args, StartOptions& opt) {
     for (size_t i = 0; i < args.size(); ++i) {
         const string& a = args[i];
@@ -299,6 +420,9 @@ bool parseArgs(const vector<string>& args, StartOptions& opt) {
         else if (a == "--misses")   { auto v = next("--misses");   if (!v) return false; opt.maxMisses = stoi(*v); }
         else if (a == "--server")   { auto v = next("--server");   if (!v) return false; opt.serverUrl = *v; }
         else if (a == "--id")       { auto v = next("--id");       if (!v) return false; opt.appId = *v; }
+        else if (a == "--token")    { auto v = next("--token");    if (!v) return false; opt.token = *v; }
+        else if (a == "--ws-port")  { auto v = next("--ws-port");  if (!v) return false; opt.wsPort = stoi(*v); }
+        else if (a == "--allow-control") { opt.allowControl = true; }
         else if (a == "--thumb-interval") { auto v = next("--thumb-interval"); if (!v) return false; opt.thumbIntervalSec = stoi(*v); }
         else if (!a.empty() && a[0] != '-') {
             if (!opt.runPath.empty()) {
@@ -378,11 +502,17 @@ int cmdStart(const vector<string>& args) {
     for (char& c : opt.appId) {
         if (!isalnum((unsigned char)c) && c != '-' && c != '_' && c != '.') c = '-';
     }
+    if (opt.token.empty()) {
+        if (const char* envTok = getenv("ANCHORBOLT_TOKEN")) opt.token = envTok;
+    }
     optional<ServerPush> push;
+    optional<CommandChannel> channel;
     if (!opt.serverUrl.empty()) {
-        push.emplace(opt.serverUrl, opt.appId);
+        push.emplace(opt.serverUrl, opt.appId, opt.token);
+        channel.emplace(opt);
         logNotice("anchorbolt") << "pushing to fleet server " << opt.serverUrl
-                                << " as '" << opt.appId << "'";
+                                << " as '" << opt.appId << "'"
+                                << (opt.allowControl ? " (REMOTE CONTROL ENABLED)" : "");
     }
     // Log forwarding: app log + supervisor events. Pushed every poll cycle
     // INDEPENDENT of app health — while the app hangs, the supervisor's
@@ -464,6 +594,17 @@ int cmdStart(const vector<string>& args) {
             if (g_stop) break;
 
             pushLogs(logFile);
+            if (channel) channel->maintain();
+
+            // Remote restart (dashboard button relayed over the command
+            // channel): same path as hang recovery, but by request.
+            if (g_restartRequested.exchange(false)) {
+                logNotice("anchorbolt") << "remote restart requested";
+                eventLog(logDir, "remote restart requested; terminating app");
+                terminateApp(pid);
+                childAlive = false;
+                break;
+            }
 
             // Hang detection via tc_get_health.
             auto h = callTool(cli, "tc_get_health");
@@ -573,6 +714,7 @@ int cmdStart(const vector<string>& args) {
     eventLog(logDir, "anchorbolt stopped (restarts: " + to_string(restarts) + ")");
     // Final flush so the shutdown events reach the server too.
     pushLogs((logDir / ("app-" + getTimestampString("%Y-%m-%d") + ".log")).string());
+    if (channel) channel->shutdown();
     return 0;
 #endif
 }
