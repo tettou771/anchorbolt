@@ -36,7 +36,11 @@ anchorbolt serve
 - `tc_get_health` polling → hang detection → SIGTERM/SIGKILL → restart
 - process-exit detection → restart
 - SIGINT/SIGTERM to anchorbolt shuts the app down cleanly too
-- with `--server`: pushes a heartbeat per health poll and a downscaled  JPEG every 30s (raw bytes, cheap for the app — no frame stutter)
+- with `--server`: pushes a heartbeat per health poll, a downscaled JPEG
+  every 30s (raw bytes, cheap for the app — no frame stutter), and every new
+  app-log / supervisor-event line. Log push is independent of app health, so
+  while an app hangs the server still sees "unresponsive / restarting" —
+  remotely distinguishable from a machine that went dark
 
 Options: `--port` (MCP port, default 47777) `--interval` (poll sec, 3)
 `--grace` (boot grace sec, 15) `--misses` (restart threshold, 3)
@@ -48,12 +52,13 @@ Options: `--port` (MCP port, default 47777) `--interval` (poll sec, 3)
 - live thumbnail wall at `/` — green/red per app, fps / size / uptime,
   stale marking after 10s of silence
 - click a card for the detail view: big live thumbnail, app-published
-  status values, time-series graphs (fps / memory / custom metrics),
-  custom image streams
+  status values, time-series graphs (fps / process memory / machine free /
+  custom metrics), custom image streams, and a live log panel (app log +
+  supervisor events, severity-colored, filterable)
 - ingest: `POST /api/heartbeat` (JSON), `POST /api/thumb/<id>` and
-  `POST /api/image/<id>/<name>` (raw JPEG)
+  `POST /api/image/<id>/<name>` (raw JPEG), `POST /api/log/<id>` (JSON lines)
 - read: `GET /api/apps`, `GET /api/thumb/<id>`, `GET /api/image/<id>/<name>`,
-  `GET /api/history/<id>`
+  `GET /api/history/<id>`, `GET /api/log/<id>?after=<seq>`
 - DB-free storage under `--data` (default `./anchorbolt-data`): daily
   heartbeat JSONL + timestamp-named JPEGs per app
 - no auth yet — run it on a trusted network / behind a tunnel

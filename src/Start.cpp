@@ -175,6 +175,58 @@ string machineMemNote() {
     return "machine mem avail " + fmtMB(m.availBytes) + " / " + fmtMB(m.totalBytes);
 }
 
+// Incremental reader for a log file that other code appends to. First poll
+// starts at the current end (history is not re-uploaded); day rollover hands
+// in a new path, which resets to the top of the (fresh) file.
+class LogTailer {
+public:
+    // Anchor at the current end of `path`: everything already in the file is
+    // history and won't be uploaded; everything appended after this call will.
+    // Call once at startup, BEFORE the session's own first lines are written.
+    void baseline(const fs::path& path) {
+        path_ = path;
+        error_code ec;
+        offset_ = (streamoff)fs::file_size(path, ec);
+        if (ec) offset_ = 0;
+        firstPoll_ = false;
+    }
+
+    // Returns complete new lines appended since the last poll.
+    vector<string> poll(const fs::path& path) {
+        if (path != path_) {
+            path_ = path;
+            error_code ec;
+            offset_ = firstPoll_ ? (streamoff)fs::file_size(path, ec) : 0;
+            if (ec) offset_ = 0;
+            firstPoll_ = false;
+        }
+        vector<string> lines;
+        ifstream in(path_, ios::binary);
+        if (!in) return lines;
+        in.seekg(0, ios::end);
+        streamoff size = in.tellg();
+        if (size <= offset_) { if (size < offset_) offset_ = 0; return lines; }
+        in.seekg(offset_);
+        string chunk(size_t(size - offset_), '\0');
+        in.read(chunk.data(), (streamsize)chunk.size());
+        size_t consumed = 0, pos = 0;
+        while (true) {
+            size_t nl = chunk.find('\n', pos);
+            if (nl == string::npos) break;  // partial last line stays for next poll
+            if (nl > pos) lines.emplace_back(chunk, pos, nl - pos);
+            pos = nl + 1;
+            consumed = pos;
+        }
+        offset_ += (streamoff)consumed;
+        return lines;
+    }
+
+private:
+    fs::path path_;
+    streamoff offset_ = 0;
+    bool firstPoll_ = true;
+};
+
 // Best-effort push to the fleet server. Failures never affect supervision;
 // reachability changes are logged once, not per attempt.
 class ServerPush {
@@ -201,6 +253,16 @@ public:
         auto res = cli_.Post("/api/image/" + appId_ + "/" + name,
                              string((const char*)jpg.data(), jpg.size()), "image/jpeg");
         report(res && res->status == 200, "image");
+    }
+
+    // src is "app" (the app's TRUSSC_LOG_FILE) or "sup" (supervisor events).
+    void logs(const string& src, const vector<string>& lines) {
+        if (lines.empty()) return;
+        Json arr = Json::array();
+        for (const auto& l : lines) arr.push_back({{"src", src}, {"text", l}});
+        auto res = cli_.Post("/api/log/" + appId_,
+                             Json({{"lines", arr}}).dump(), "application/json");
+        report(res && res->status == 200, "log");
     }
 
 private:
@@ -322,6 +384,23 @@ int cmdStart(const vector<string>& args) {
         logNotice("anchorbolt") << "pushing to fleet server " << opt.serverUrl
                                 << " as '" << opt.appId << "'";
     }
+    // Log forwarding: app log + supervisor events. Pushed every poll cycle
+    // INDEPENDENT of app health — while the app hangs, the supervisor's
+    // "unresponsive / restarting" lines still reach the server, which is what
+    // distinguishes "app down, being handled" from "machine gone" remotely.
+    LogTailer appTail, supTail;
+    auto supLogPath = [&logDir]() {
+        return logDir / ("anchorbolt-" + getTimestampString("%Y-%m-%d") + ".log");
+    };
+    auto pushLogs = [&](const string& appLogFile) {
+        if (!push) return;
+        push->logs("app", appTail.poll(appLogFile));
+        push->logs("sup", supTail.poll(supLogPath()));
+    };
+    // Anchor both tails now, before this session writes anything — the app's
+    // own startup lines (written between spawn and the first poll) must flow.
+    appTail.baseline(logDir / ("app-" + getTimestampString("%Y-%m-%d") + ".log"));
+    supTail.baseline(supLogPath());
 
     signal(SIGINT, onSignal);
     signal(SIGTERM, onSignal);
@@ -383,6 +462,8 @@ int cmdStart(const vector<string>& args) {
 
             sleepChecked(opt.intervalSec);
             if (g_stop) break;
+
+            pushLogs(logFile);
 
             // Hang detection via tc_get_health.
             auto h = callTool(cli, "tc_get_health");
@@ -490,6 +571,8 @@ int cmdStart(const vector<string>& args) {
 
     logNotice("anchorbolt") << "anchorbolt stopped (restarts: " << restarts << ")";
     eventLog(logDir, "anchorbolt stopped (restarts: " + to_string(restarts) + ")");
+    // Final flush so the shutdown events reach the server too.
+    pushLogs((logDir / ("app-" + getTimestampString("%Y-%m-%d") + ".log")).string());
     return 0;
 #endif
 }

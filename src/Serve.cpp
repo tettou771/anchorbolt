@@ -44,13 +44,26 @@ struct ImageSlot {
     uint64_t seq = 0;
 };
 
+// Recent log lines held in memory for the UI (full history lives on disk).
+// seq is a per-app cursor so the browser can fetch only what's new.
+struct LogLine {
+    uint64_t seq;
+    string   at;    // server receive time HH:MM:SS
+    string   src;   // "app" | "sup"
+    string   text;
+};
+
 struct AppState {
     Json     health;                                // last heartbeat payload
     chrono::steady_clock::time_point lastSeen{};
     vector<unsigned char> thumb;                    // latest JPEG
     uint64_t thumbSeq = 0;                          // bumped per upload (cache busting)
     map<string, ImageSlot> images;                  // custom statusImage uploads
+    deque<LogLine> logs;                            // ring buffer, newest last
+    uint64_t nextLogSeq = 1;
 };
+
+constexpr size_t kLogRingSize = 500;
 
 map<string, AppState> g_apps;
 mutex g_appsMutex;
@@ -172,6 +185,23 @@ const char* kDashboardHtml = R"HTML(<!DOCTYPE html>
   #dImages figcaption { padding: 6px 10px; font-size: 12px; color: #9aa3b2; }
   .sectionTitle { font-size: 12px; color: #6b727e; text-transform: uppercase;
                   letter-spacing: .08em; margin: 0 0 -8px; }
+  #dLogWrap { background: #101216; border: 1px solid #262b34; border-radius: 8px; }
+  #dLogHead { display: flex; align-items: center; gap: 10px; padding: 8px 12px;
+              border-bottom: 1px solid #21252d; }
+  #dLogHead .glabel { font-size: 12px; color: #9aa3b2; flex: none; }
+  #dLogFilter { flex: 1; background: #191c22; border: 1px solid #2a2e36;
+                border-radius: 5px; color: #d4d7dd; font-size: 12px;
+                padding: 3px 8px; outline: none; min-width: 60px; }
+  #dLogFilter:focus { border-color: #3d4450; }
+  #dLog { height: 260px; overflow-y: auto; padding: 6px 0;
+          font: 11px/1.55 ui-monospace, "SF Mono", Menlo, monospace; }
+  #dLog .ll { padding: 0 12px; white-space: pre-wrap; word-break: break-all;
+              color: #aeb4bf; }
+  #dLog .ll.err  { color: #ff8a80; }
+  #dLog .ll.warn { color: #e3b341; }
+  #dLog .ll.sup  { color: #7ea6d9; }
+  #dLog .ll .lt  { color: #565c66; margin-right: 8px; }
+  #dLog .empty   { color: #4a4f59; padding: 12px; }
 </style>
 </head>
 <body>
@@ -196,6 +226,13 @@ const char* kDashboardHtml = R"HTML(<!DOCTYPE html>
       <div id="dValues"></div>
       <div id="dGraphs"></div>
       <div id="dImages"></div>
+      <div id="dLogWrap">
+        <div id="dLogHead">
+          <span class="glabel">log</span>
+          <input id="dLogFilter" type="text" placeholder="filter (e.g. ERROR)">
+        </div>
+        <div id="dLog"><div class="empty">no log lines yet</div></div>
+      </div>
     </div>
   </div>
 </div>
@@ -242,7 +279,10 @@ function card(app) {
 function openDetail(id) {
   detailId = id;
   dThumbSeq = -1;
+  logCursor = 0;
   document.getElementById('dImages').replaceChildren();
+  document.getElementById('dLog').replaceChildren(
+    Object.assign(document.createElement('div'), {className: 'empty', textContent: 'no log lines yet'}));
   document.getElementById('detail').hidden = false;
   renderDetail();
 }
@@ -421,6 +461,8 @@ async function renderDetail() {
   // Custom images (statusImage streams)
   syncImages(app);
 
+  await pollLog(app.id);
+
   // Graphs: fps + memory + every mode=graph custom value
   let hist = [];
   try {
@@ -474,6 +516,56 @@ async function renderDetail() {
     el.querySelector('.gval').textContent = last != null ? fmtVal(+last) : '-';
   });
 }
+
+// ---- log panel ----
+
+let logCursor = 0;
+
+function lineClass(l) {
+  if (/\[ERROR\]|\[FATAL\]/.test(l.text)) return 'll err';
+  if (/\[WARNING\]/.test(l.text)) return 'll warn';
+  if (l.src === 'sup') return 'll sup';
+  return 'll';
+}
+
+function appendLogLines(lines) {
+  const box = document.getElementById('dLog');
+  const empty = box.querySelector('.empty');
+  if (empty && lines.length) empty.remove();
+  const follow = box.scrollTop + box.clientHeight >= box.scrollHeight - 8;
+  const filter = document.getElementById('dLogFilter').value.toLowerCase();
+  for (const l of lines) {
+    const el = document.createElement('div');
+    el.className = lineClass(l);
+    const t = document.createElement('span');
+    t.className = 'lt';
+    t.textContent = l.src === 'sup' ? l.at + ' ⚑' : l.at;
+    el.appendChild(t);
+    el.appendChild(document.createTextNode(l.text));
+    el.dataset.text = (l.at + ' ' + l.text).toLowerCase();
+    if (filter && !el.dataset.text.includes(filter)) el.style.display = 'none';
+    box.appendChild(el);
+  }
+  while (box.children.length > 600) box.firstChild.remove();
+  if (follow && lines.length) box.scrollTop = box.scrollHeight;
+}
+
+async function pollLog(id) {
+  let r;
+  try {
+    r = await (await fetch('/api/log/' + encodeURIComponent(id) + '?after=' + logCursor)).json();
+  } catch { return; }
+  if (detailId !== id) return;
+  logCursor = r.next;
+  appendLogLines(r.lines);
+}
+
+document.getElementById('dLogFilter').addEventListener('input', e => {
+  const filter = e.target.value.toLowerCase();
+  for (const el of document.querySelectorAll('#dLog .ll')) {
+    el.style.display = !filter || el.dataset.text.includes(filter) ? '' : 'none';
+  }
+});
 
 function syncImages(app) {
   const cont = document.getElementById('dImages');
@@ -664,6 +756,56 @@ int cmdServe(const vector<string>& args) {
         auto img = it->second.images.find(name);
         if (img == it->second.images.end() || img->second.jpeg.empty()) { res.status = 404; return; }
         res.set_content((const char*)img->second.jpeg.data(), img->second.jpeg.size(), "image/jpeg");
+    });
+
+    // Agent push: forwarded log lines (app log + supervisor events). Arrives
+    // even while the app itself is down — the supervisor keeps reporting.
+    svr.Post(R"(/api/log/([^/]+))", [dataDir](const httplib::Request& req, httplib::Response& res) {
+        string id = req.matches[1];
+        if (!validAppId(id)) { res.status = 400; return; }
+        Json body;
+        try {
+            body = Json::parse(req.body);
+        } catch (...) {
+            res.status = 400;
+            return;
+        }
+        string now = getTimestampString("%H:%M:%S");
+        fs::path dir = dataDir / id;
+        error_code ec;
+        fs::create_directories(dir, ec);
+        ofstream out(dir / ("log-" + getTimestampString("%Y-%m-%d") + ".jsonl"), ios::app);
+        lock_guard<mutex> lock(g_appsMutex);
+        auto& st = g_apps[id];
+        for (auto& l : body.value("lines", Json::array())) {
+            LogLine line{st.nextLogSeq++, now,
+                         l.value("src", "app"), l.value("text", "")};
+            out << Json({{"at", line.at}, {"src", line.src}, {"text", line.text}}).dump() << "\n";
+            st.logs.push_back(std::move(line));
+            if (st.logs.size() > kLogRingSize) st.logs.pop_front();
+        }
+        res.set_content("ok", "text/plain");
+    });
+
+    // Log lines newer than ?after=<seq> (0 = everything buffered).
+    svr.Get(R"(/api/log/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
+        string id = req.matches[1];
+        uint64_t after = 0;
+        if (req.has_param("after")) {
+            try { after = stoull(req.get_param_value("after")); } catch (...) {}
+        }
+        Json lines = Json::array();
+        uint64_t next = after;
+        lock_guard<mutex> lock(g_appsMutex);
+        auto it = g_apps.find(id);
+        if (it != g_apps.end()) {
+            for (const auto& l : it->second.logs) {
+                if (l.seq <= after) continue;
+                lines.push_back({{"seq", l.seq}, {"at", l.at}, {"src", l.src}, {"text", l.text}});
+                next = l.seq;
+            }
+        }
+        res.set_content(Json({{"next", next}, {"lines", lines}}).dump(), "application/json");
     });
 
     // Recent heartbeat history for the detail-view graphs: tail of today's
