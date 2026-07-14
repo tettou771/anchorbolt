@@ -4,7 +4,7 @@
 // Spawns the app as a child process with the ops environment injected
 // (TRUSSC_MCP / TRUSSC_MCP_PORT / TRUSSC_LOG_FILE), then watches it two ways:
 //   - process exit  (waitpid)            -> restart
-//   - hang          (get_health silence) -> SIGTERM/SIGKILL -> restart
+//   - hang          (tc_get_health silence) -> SIGTERM/SIGKILL -> restart
 // The app needs zero code changes; everything rides the standard MCP tools.
 // =============================================================================
 
@@ -89,7 +89,7 @@ optional<Json> callTool(httplib::Client& cli, const string& name,
     }
 }
 
-// Decode standard base64 (get_thumbnail ships its JPEG this way; core has
+// Decode standard base64 (tc_get_thumbnail ships its JPEG this way; core has
 // toBase64 but no decoder yet). Skips padding and whitespace.
 vector<unsigned char> fromBase64(const string& s) {
     auto val = [](char c) -> int {
@@ -293,7 +293,7 @@ int cmdStart(const vector<string>& args) {
         bool childAlive = true;
         int  misses = 0;
         chrono::steady_clock::time_point lastThumb{};  // epoch -> push right away
-        bool statusChecked = false;   // tools/list probed for anchorbolt_status
+        bool statusChecked = false;   // tools/list probed for tc_get_status
         bool hasStatus = false;
         vector<string> imageNames;    // statusImage names from the last status
 
@@ -318,8 +318,8 @@ int cmdStart(const vector<string>& args) {
             sleepChecked(opt.intervalSec);
             if (g_stop) break;
 
-            // Hang detection via get_health.
-            if (auto h = callTool(cli, "get_health")) {
+            // Hang detection via tc_get_health.
+            if (auto h = callTool(cli, "tc_get_health")) {
                 misses = 0;
                 if (!healthy) {
                     healthy = true;
@@ -334,7 +334,7 @@ int cmdStart(const vector<string>& args) {
                         statusChecked = true;
                         if (auto r = callRpc(cli, "tools/list")) {
                             for (auto& t : r->value("tools", Json::array())) {
-                                if (t.value("name", "") == "anchorbolt_status") {
+                                if (t.value("name", "") == "tc_get_status") {
                                     hasStatus = true;
                                     break;
                                 }
@@ -343,7 +343,7 @@ int cmdStart(const vector<string>& args) {
                     }
                     Json hb = *h;
                     if (hasStatus) {
-                        if (auto s = callTool(cli, "anchorbolt_status")) {
+                        if (auto s = callTool(cli, "tc_get_status")) {
                             imageNames.clear();
                             for (auto& n : s->value("images", Json::array()))
                                 imageNames.push_back(n.get<string>());
@@ -356,14 +356,14 @@ int cmdStart(const vector<string>& args) {
                     auto now = chrono::steady_clock::now();
                     if (now - lastThumb >= chrono::seconds(opt.thumbIntervalSec)) {
                         lastThumb = now;
-                        if (auto t = callTool(cli, "get_thumbnail")) {
+                        if (auto t = callTool(cli, "tc_get_thumbnail")) {
                             if (t->contains("data") && (*t)["data"].is_string()) {
                                 auto jpg = fromBase64((*t)["data"].get<string>());
                                 if (!jpg.empty()) push->thumbnail(jpg);
                             }
                         }
                         for (const auto& n : imageNames) {
-                            if (auto t = callTool(cli, "anchorbolt_image", {{"name", n}})) {
+                            if (auto t = callTool(cli, "tc_get_status_image", {{"name", n}})) {
                                 if (t->contains("data") && (*t)["data"].is_string()) {
                                     auto jpg = fromBase64((*t)["data"].get<string>());
                                     if (!jpg.empty()) push->image(n, jpg);

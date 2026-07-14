@@ -8,7 +8,7 @@ can never drift apart):
 - **`anchorbolt start`** — kiosk mode: the venue-side supervisor. Launches your TrussC app
   with the ops environment injected (`TRUSSC_MCP`, `TRUSSC_LOG_FILE`), then
   watches it two ways — process exit and hang (silence on the standard
-  `get_health` MCP tool) — and restarts it. The app needs **zero code
+  `tc_get_health` MCP tool) — and restarts it. The app needs **zero code
   changes**.
 - **`anchorbolt serve`** — fleet server: live thumbnail wall, log storage,
   webhook notifications, MCP endpoint for AI-driven operations.
@@ -33,10 +33,10 @@ anchorbolt serve
 `start` (kiosk mode):
 
 - spawn with env injection, boot grace period
-- `get_health` polling → hang detection → SIGTERM/SIGKILL → restart
+- `tc_get_health` polling → hang detection → SIGTERM/SIGKILL → restart
 - process-exit detection → restart
 - SIGINT/SIGTERM to anchorbolt shuts the app down cleanly too
-- with `--server`: pushes a heartbeat per health poll and a `get_thumbnail`
+- with `--server`: pushes a heartbeat per health poll and a `tc_get_thumbnail`
   JPEG every 30s (raw bytes, cheap for the app — no frame stutter)
 
 Options: `--port` (MCP port, default 47777) `--interval` (poll sec, 3)
@@ -75,7 +75,7 @@ void tcApp::setup() {
 ```
 
 Values ride every heartbeat; images are fetched on the thumbnail interval
-(cheap for the app — same two-stage encode as `get_thumbnail`). See
+(cheap for the app — same two-stage encode as `tc_get_thumbnail`). See
 `demo/` for a complete example and TrussC's `docs/AI_AUTOMATION.md`
 ("Publishing Custom Ops Status") for the convention.
 
@@ -84,8 +84,8 @@ Next: Windows support, auth (agent/operator tokens), retention, sinks
 
 ## Build
 
-A standard TrussC project. Requires a TrussC core with `get_health` /
-`get_thumbnail` / `TRUSSC_LOG_FILE` (v0.7.0+, currently the `feat/kiosk`
+A standard TrussC project. Requires a TrussC core with `tc_get_health` /
+`tc_get_thumbnail` / `TRUSSC_LOG_FILE` (v0.7.0+, currently the `feat/kiosk`
 branch).
 
 ```bash

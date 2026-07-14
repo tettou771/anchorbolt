@@ -2,7 +2,7 @@
 
 void tcApp::setup() {
     // The whole anchorbolt integration is these four lines — the supervisor
-    // discovers anchorbolt_status via tools/list, no config anywhere else.
+    // discovers tc_get_status via tools/list, no config anywhere else.
     mcp::status("scene",           [this] { return sceneName; });
     mcp::statusGraph("visitors",   [this] { return visitors; });
     mcp::statusGraph("load",       [this] { return load; });
