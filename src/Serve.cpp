@@ -366,6 +366,10 @@ const char* kDashboardHtml = R"HTML(<!DOCTYPE html>
                 border-radius: 5px; color: #d4d7dd; font-size: 12px;
                 padding: 3px 8px; outline: none; min-width: 60px; }
   #dLogFilter:focus { border-color: #3d4450; }
+  #dLogErr { background: #191c22; color: #7d838e; border: 1px solid #2a2e36;
+             border-radius: 5px; font-size: 12px; padding: 3px 10px;
+             cursor: pointer; flex: none; }
+  #dLogErr.on { background: #4a1d1d; color: #ff8a80; border-color: #7a3030; }
   #dLog { height: 260px; overflow-y: auto; padding: 6px 0;
           font: 11px/1.55 ui-monospace, "SF Mono", Menlo, monospace; }
   #dLog .ll { padding: 0 12px; white-space: pre-wrap; word-break: break-all;
@@ -447,7 +451,8 @@ const char* kDashboardHtml = R"HTML(<!DOCTYPE html>
       <div id="dLogWrap">
         <div id="dLogHead">
           <span class="glabel">log</span>
-          <input id="dLogFilter" type="text" placeholder="filter (e.g. ERROR)">
+          <input id="dLogFilter" type="text" placeholder="filter...">
+          <button id="dLogErr" title="show only ERROR / FATAL lines">errors</button>
         </div>
         <div id="dLog"><div class="empty">no log lines yet</div></div>
       </div>
@@ -508,6 +513,8 @@ function openDetail(id) {
   dThumbSeq = -1;
   logCursor = 0;
   evCursor = 0;
+  logErrOnly = false;
+  document.getElementById('dLogErr').classList.remove('on');
   document.getElementById('dEvWrap').hidden = true;
   document.getElementById('dEvents').replaceChildren();
   document.getElementById('dImages').replaceChildren();
@@ -895,12 +902,25 @@ function lineClass(l) {
   return 'll';
 }
 
+let logErrOnly = false;
+
+function logLineVisible(el) {
+  if (logErrOnly && !el.classList.contains('err')) return false;
+  const filter = document.getElementById('dLogFilter').value.toLowerCase();
+  return !filter || el.dataset.text.includes(filter);
+}
+
+function applyLogFilter() {
+  for (const el of document.querySelectorAll('#dLog .ll')) {
+    el.style.display = logLineVisible(el) ? '' : 'none';
+  }
+}
+
 function appendLogLines(lines) {
   const box = document.getElementById('dLog');
   const empty = box.querySelector('.empty');
   if (empty && lines.length) empty.remove();
   const follow = box.scrollTop + box.clientHeight >= box.scrollHeight - 8;
-  const filter = document.getElementById('dLogFilter').value.toLowerCase();
   for (const l of lines) {
     const el = document.createElement('div');
     el.className = lineClass(l);
@@ -910,12 +930,18 @@ function appendLogLines(lines) {
     el.appendChild(t);
     el.appendChild(document.createTextNode(l.text));
     el.dataset.text = (l.at + ' ' + l.text).toLowerCase();
-    if (filter && !el.dataset.text.includes(filter)) el.style.display = 'none';
+    if (!logLineVisible(el)) el.style.display = 'none';
     box.appendChild(el);
   }
   while (box.children.length > 600) box.firstChild.remove();
   if (follow && lines.length) box.scrollTop = box.scrollHeight;
 }
+
+document.getElementById('dLogErr').addEventListener('click', () => {
+  logErrOnly = !logErrOnly;
+  document.getElementById('dLogErr').classList.toggle('on', logErrOnly);
+  applyLogFilter();
+});
 
 async function pollLog(id) {
   let r;
@@ -927,12 +953,7 @@ async function pollLog(id) {
   appendLogLines(r.lines);
 }
 
-document.getElementById('dLogFilter').addEventListener('input', e => {
-  const filter = e.target.value.toLowerCase();
-  for (const el of document.querySelectorAll('#dLog .ll')) {
-    el.style.display = !filter || el.dataset.text.includes(filter) ? '' : 'none';
-  }
-});
+document.getElementById('dLogFilter').addEventListener('input', applyLogFilter);
 
 function syncImages(app) {
   const cont = document.getElementById('dImages');
