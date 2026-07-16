@@ -60,6 +60,18 @@ anchorbolt serve
   venue-network outage, an anchorbolt restart, even a machine reboot — the
   backlog ships on reconnect. At-least-once semantics: the server dedups
   retries, and files not yet delivered are protected from local pruning
+- **remote update** (opt-in via `--allow-update` — it is remote code
+  execution by definition): the dashboard's Update button runs a pipeline
+  on the venue machine (default `git pull --ff-only` → `trusscli update` →
+  `trusscli build`; override with the config `update` array — prepend
+  `"trusscli upgrade"` to also pull TrussC itself) **while the old binary
+  keeps running**, so a failed build never takes the installation down.
+  Build output streams live into the dashboard log panel. On success the
+  app restarts onto the new binary; the previous one is kept as
+  `<binary>.prev`, and if the new binary doesn't become healthy on its
+  first run it is rolled back automatically. A Roll back button restores
+  `.prev` manually. The agent also reports the project's git commit on
+  every heartbeat, so the wall shows which venue runs which version
 
 Flags: see `anchorbolt --help`. Precedence: flags > `ANCHORBOLT_TOKEN` env >
 config file > defaults.
@@ -107,10 +119,11 @@ to by `tokenFile`, or in the `ANCHORBOLT_TOKEN` env var.
   images older than the cutoff are pruned hourly; thumbnails older than
   24h are additionally thinned to one per hour
 - **remote control** (agent keeps one outbound WebSocket, NAT-friendly):
-  the detail view shows a live/offline chip, a Restart button, and a tool
-  console that relays MCP tool calls to the app. Read-only tools
-  (`tc_get_*`) relay freely; anything mutating requires the venue operator
-  to have started the agent with `--allow-control`
+  the detail view shows a live/offline chip, Update / Roll back / Restart
+  buttons, and a tool console that relays MCP tool calls to the app.
+  Read-only tools (`tc_get_*`) relay freely; anything mutating requires
+  the venue operator to have started the agent with `--allow-control`
+  (updates: `--allow-update`)
 
 Options: `--port` (HTTP port, default 54722 — "truss" typed on the QWERTY number row; ws = port+1) `--ws-port <n>` (command
 channel, default port+1) `--data <dir>`.

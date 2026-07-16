@@ -359,6 +359,16 @@ const char* kDashboardHtml = R"HTML(<!DOCTYPE html>
               cursor: pointer; flex: none; }
   #dRestart:hover { background: #40301f; }
   #dRestart:disabled { opacity: .45; cursor: default; }
+  #dUpdate { background: #1a2f22; color: #4ecb71; border: 1px solid #2b4a35;
+             border-radius: 6px; font-size: 12px; padding: 4px 12px;
+             cursor: pointer; flex: none; }
+  #dUpdate:hover { background: #223c2b; }
+  #dUpdate:disabled { opacity: .45; cursor: default; }
+  #dRollback { background: none; color: #7d838e; border: 1px solid #323844;
+               border-radius: 6px; font-size: 12px; padding: 4px 10px;
+               cursor: pointer; flex: none; }
+  #dRollback:hover { color: #d4d7dd; }
+  #dRollback:disabled { opacity: .45; cursor: default; }
   #dConsole { background: #101216; border: 1px solid #262b34; border-radius: 8px;
               padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
   #dConsole .row { display: flex; gap: 8px; }
@@ -393,6 +403,8 @@ const char* kDashboardHtml = R"HTML(<!DOCTYPE html>
       <h2 id="dTitle"></h2>
       <span class="stats" id="dStats"></span>
       <span class="liveChip off" id="dLive">offline</span>
+      <button id="dUpdate" disabled title="git pull + build + restart on the venue machine">Update</button>
+      <button id="dRollback" disabled title="restore the previous binary">Roll back</button>
       <button id="dRestart" disabled>Restart</button>
       <button id="dClose" title="close">&times;</button>
     </div>
@@ -618,8 +630,11 @@ async function renderDetail() {
   live.textContent = app.live ? 'live' : 'offline';
   live.classList.toggle('off', !app.live);
   document.getElementById('dRestart').disabled = !app.live;
+  document.getElementById('dUpdate').disabled = !app.live;
+  document.getElementById('dRollback').disabled = !app.live;
   const h = app.health || {};
   const extra = [];
+  if (h.git) extra.push('@' + h.git);
   if (h.version) extra.push(h.version);
   const mem = h.rssBytes ?? h.memoryBytes;
   if (mem) extra.push((mem / 1048576).toFixed(0) + ' MB');
@@ -724,6 +739,24 @@ document.getElementById('dRestart').addEventListener('click', async () => {
   btn.disabled = true;
   const r = await sendCommand(detailId, { action: 'restart' });
   showResult(r);
+  setTimeout(() => { btn.disabled = false; }, 3000);
+});
+
+document.getElementById('dUpdate').addEventListener('click', async () => {
+  if (!detailId || !confirm('Update "' + detailId + '"?\n\nRuns the update pipeline on the venue machine ' +
+      '(default: git pull → trusscli update → trusscli build) while the app keeps running, ' +
+      'then restarts only if the build succeeds. Progress streams into the log below.')) return;
+  const btn = document.getElementById('dUpdate');
+  btn.disabled = true;
+  showResult(await sendCommand(detailId, { action: 'update' }));
+  setTimeout(() => { btn.disabled = false; }, 3000);
+});
+
+document.getElementById('dRollback').addEventListener('click', async () => {
+  if (!detailId || !confirm('Roll back "' + detailId + '" to the previous binary and restart?')) return;
+  const btn = document.getElementById('dRollback');
+  btn.disabled = true;
+  showResult(await sendCommand(detailId, { action: 'rollback' }));
   setTimeout(() => { btn.disabled = false; }, 3000);
 });
 
@@ -998,7 +1031,8 @@ int cmdServe(const vector<string>& args) {
             return;
         }
         string action = body.value("action", "");
-        if (action != "restart" && action != "call" && action != "list_tools") {
+        if (action != "restart" && action != "call" && action != "list_tools" &&
+            action != "update" && action != "rollback") {
             res.status = 400;
             res.set_content("unknown action", "text/plain");
             return;

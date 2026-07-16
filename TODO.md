@@ -2,7 +2,9 @@
 
 Full settled design lives in TrussC `docs/ROADMAP.md` (kiosk / fleet entries).
 This file tracks what's left, roughly in priority order.
-(Done: delivery cursor / offline spool; serve-side retention `--keep-days`.)
+(Done: delivery cursor / offline spool; serve-side retention `--keep-days`;
+remote update — `--allow-update` + pipeline + auto-rollback + git hash on
+the wall.)
 
 ## 1. Windows support for `start`
 
@@ -29,23 +31,7 @@ Plain HTTP MCP server on serve: `search_logs`, `tail_logs`,
 `app_call(app_id, tool, args)` passthrough. Mutating calls go through a
 server-side approval queue (block + TTL + approve/deny page).
 
-## 5. Remote update (deploy from the dashboard)
-
-Update button → agent runs a configurable pipeline (config `update` array;
-default `git pull --ff-only` → `trusscli update` → `trusscli build`) while
-the OLD binary keeps running; restart only on build success — a failed
-build never takes the installation down. Async job over the command
-channel (immediate "started", build output streams through the existing
-log push, outcome rides the heartbeat). Keep `bin/<name>.prev` for a
-rollback button; auto-rollback when the new binary isn't healthy within
-the boot grace (the watchdog already knows). Gated venue-side by an
-explicit `--allow-update` (this is remote code execution by definition);
-dashboard-side auth stays the reverse proxy's job until #3. Cheap add-on:
-agent puts `git rev-parse` of the project in the heartbeat so the wall
-shows which venue runs which commit. Out of scope for v1: TrussC core
-upgrade, anchorbolt self-update.
-
-## 6. Remote live view (v2)
+## 5. Remote live view (v2)
 
 JPEG frames over the existing WS into `<img>`; remote ImGui panel as an
 HTML mirror (`tcx_imgui_get_widgets` → native HTML controls →

@@ -47,6 +47,7 @@ struct StartOptions {
     string runPath;              // app binary (positional, required)
     vector<string> appArgs;      // passed to the app verbatim (after --)
     string cwd;                  // working dir (default: the binary's directory)
+    string projectDir;           // derived: TrussC project root (git/trusscli home)
     string logDir;               // empty = platform default (~/Library/Logs/anchorbolt/<id> etc.)
     int    logKeepDays = 30;     // prune logs older than this (0 = keep forever)
     int    port        = 47777;  // TRUSSC_MCP_PORT
@@ -61,6 +62,11 @@ struct StartOptions {
     int    thumbQuality = 75;
     int    wsPort = 0;           // command channel port (0 = server port + 1)
     bool   allowControl = false; // let the server relay MUTATING tools
+    bool   allowUpdate = false;  // let the server trigger the update pipeline
+    vector<string> updateCmds = {// remote-update pipeline, run in projectDir;
+        "git pull --ff-only",    // override with the config "update" array
+        "trusscli update",       // (e.g. prepend "trusscli upgrade" to also
+        "trusscli build"};       //  pull TrussC itself, or fetch a release)
 
     // Derived: health poll cadence — a third of the watchdog window, clamped.
     // The watchdog itself is wall-clock (time since the last healthy reply),
@@ -73,6 +79,8 @@ struct StartOptions {
 
 atomic<bool> g_stop{false};
 atomic<bool> g_restartRequested{false};  // set by the remote restart command
+atomic<bool> g_updateRunning{false};     // one update pipeline at a time
+atomic<bool> g_updateVerify{false};      // next app run must prove the update
 void onSignal(int) { g_stop = true; }
 
 // Sleep in small slices so SIGINT stays responsive.
@@ -217,6 +225,110 @@ void eventLog(const fs::path& logDir, const string& msg) {
 string machineMemNote() {
     MachineMem m = machineMem();
     return "machine mem avail " + fmtMB(m.availBytes) + " / " + fmtMB(m.totalBytes);
+}
+
+// --- remote update -------------------------------------------------------------
+// Dashboard-triggered deploy: run a pipeline (default git pull -> trusscli
+// update -> trusscli build) in the project directory WHILE the old binary
+// keeps running, and restart onto the new binary only if every step succeeds
+// — a failed build never takes the installation down. The previous binary is
+// kept as <binary>.prev; if the new one doesn't prove itself on its first
+// run, the supervision loop rolls back automatically.
+
+#ifdef _WIN32
+#define popen _popen
+#define pclose _pclose
+#endif
+
+string shellQuote(const string& s) {
+    string out = "'";
+    for (char c : s) {
+        if (c == '\'') out += "'\\''";
+        else out += c;
+    }
+    out += "'";
+    return out;
+}
+
+// Current commit of the project (short hash), for the fleet dashboard —
+// "which venue runs which version" at a glance. Empty if not a git checkout.
+string gitHash(const string& projectDir) {
+    if (projectDir.empty()) return "";
+    string cmd = "git -C " + shellQuote(projectDir) + " rev-parse --short HEAD 2>/dev/null";
+    FILE* f = popen(cmd.c_str(), "r");
+    if (!f) return "";
+    char buf[64] = {};
+    string out;
+    if (fgets(buf, sizeof(buf), f)) out = buf;
+    pclose(f);
+    while (!out.empty() && isspace((unsigned char)out.back())) out.pop_back();
+    return out;
+}
+
+// The directory git/trusscli operate in: the ancestor above bin/ (trusscli
+// project layout), falling back to the app's working directory.
+string deriveProjectDir(const fs::path& runPath, const string& cwd) {
+    for (fs::path p = runPath.parent_path(); !p.empty() && p != p.root_path();
+         p = p.parent_path()) {
+        if (p.filename() == "bin") return p.parent_path().string();
+    }
+    return cwd;
+}
+
+// Runs detached: pipeline output streams into the supervisor event log line
+// by line (prefixed "[update]"), which the log push forwards live — the
+// dashboard's log panel doubles as the build console.
+void startUpdateJob(const StartOptions& opt, const fs::path& logDir) {
+    if (g_updateRunning.exchange(true)) return;
+    thread([opt, logDir]() {
+#ifndef _WIN32
+        setenv("GIT_TERMINAL_PROMPT", "0", 1);  // never hang on a credential prompt
+#endif
+        eventLog(logDir, "[update] started (" + to_string(opt.updateCmds.size()) +
+                         " steps in " + opt.projectDir + ")");
+        // Keep the running binary for rollback BEFORE the build replaces it.
+        error_code ec;
+        fs::copy_file(opt.runPath, opt.runPath + ".prev",
+                      fs::copy_options::overwrite_existing, ec);
+        if (ec) eventLog(logDir, "[update] warning: binary backup failed: " + ec.message());
+
+        bool ok = true;
+        for (const auto& cmd : opt.updateCmds) {
+            eventLog(logDir, "[update] $ " + cmd);
+            string full = "cd " + shellQuote(opt.projectDir) + " && (" + cmd + ") 2>&1";
+            FILE* f = popen(full.c_str(), "r");
+            if (!f) {
+                eventLog(logDir, "[update] FAILED to launch: " + cmd);
+                ok = false;
+                break;
+            }
+            char buf[4096];
+            while (fgets(buf, sizeof(buf), f)) {
+                string line(buf);
+                while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
+                    line.pop_back();
+                if (!line.empty()) eventLog(logDir, "[update] " + line);
+            }
+            int st = pclose(f);
+#ifdef _WIN32
+            int code = st;
+#else
+            int code = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+#endif
+            if (code != 0) {
+                eventLog(logDir, "[update] FAILED (exit " + to_string(code) + "): " + cmd +
+                                 " — app keeps running on the old binary");
+                ok = false;
+                break;
+            }
+        }
+        if (ok) {
+            eventLog(logDir, "[update] pipeline succeeded; restarting onto the new binary");
+            g_updateVerify = true;
+            g_restartRequested = true;
+        }
+        g_updateRunning = false;
+    }).detach();
 }
 
 // --- log shipping (delivery cursor) ------------------------------------------
@@ -436,7 +548,8 @@ private:
 // relayed to the app's MCP endpoint directly from here.
 class CommandChannel {
 public:
-    CommandChannel(const StartOptions& opt) : opt_(opt) {
+    CommandChannel(const StartOptions& opt, fs::path logDir)
+        : opt_(opt), logDir_(std::move(logDir)) {
         // ws://host:wsPort/ derived from the HTTP server URL.
         string url = opt.serverUrl;
         bool tls = url.rfind("https://", 0) == 0;
@@ -498,6 +611,45 @@ private:
             g_restartRequested = true;
             reply["ok"] = true;
             reply["result"] = {{"message", "restart initiated"}};
+        } else if (action == "update") {
+            // Remote code execution by definition — the venue operator's
+            // explicit --allow-update is the gate, like --allow-control.
+            if (!opt_.allowUpdate) {
+                reply["ok"] = false;
+                reply["error"] = "blocked by supervisor: start with --allow-update to permit remote updates";
+            } else if (g_updateRunning) {
+                reply["ok"] = false;
+                reply["error"] = "an update is already running";
+            } else {
+                startUpdateJob(opt_, logDir_);
+                reply["ok"] = true;
+                reply["result"] = {{"message",
+                    "update started — progress streams into the log; the app restarts only if the build succeeds"}};
+            }
+        } else if (action == "rollback") {
+            fs::path prev = opt_.runPath + ".prev";
+            error_code ec;
+            if (!opt_.allowUpdate) {
+                reply["ok"] = false;
+                reply["error"] = "blocked by supervisor: start with --allow-update to permit rollback";
+            } else if (g_updateRunning) {
+                reply["ok"] = false;
+                reply["error"] = "an update is running; wait for it to finish";
+            } else if (!fs::exists(prev, ec)) {
+                reply["ok"] = false;
+                reply["error"] = "no previous binary kept (no update has run here)";
+            } else {
+                fs::copy_file(prev, opt_.runPath, fs::copy_options::overwrite_existing, ec);
+                if (ec) {
+                    reply["ok"] = false;
+                    reply["error"] = "restoring previous binary failed: " + ec.message();
+                } else {
+                    eventLog(logDir_, "[update] manual rollback: previous binary restored; restarting");
+                    g_restartRequested = true;
+                    reply["ok"] = true;
+                    reply["result"] = {{"message", "previous binary restored; restarting"}};
+                }
+            }
         } else if (action == "list_tools" || action == "call") {
             // Fresh client per command: this runs on the WS thread, never
             // share the supervision loop's connection.
@@ -538,6 +690,7 @@ private:
     }
 
     StartOptions opt_;
+    fs::path logDir_;
     string url_;
     tcx::websocket::WebSocketClient ws_;
     EventListener openL_, msgL_, closeL_;
@@ -576,6 +729,7 @@ bool parseArgs(const vector<string>& args, StartOptions& opt) {
         }
         else if (a == "--ws-port")  { auto v = next("--ws-port");  if (!v) return false; opt.wsPort = stoi(*v); }
         else if (a == "--allow-control") { opt.allowControl = true; }
+        else if (a == "--allow-update")  { opt.allowUpdate = true; }
         else if (a == "--thumb-interval") { auto v = next("--thumb-interval"); if (!v) return false; opt.thumbIntervalSec = stoi(*v); }
         else if (a == "--thumb-width")    { auto v = next("--thumb-width");    if (!v) return false; opt.thumbWidth = stoi(*v); }
         else if (a == "--thumb-quality")  { auto v = next("--thumb-quality");  if (!v) return false; opt.thumbQuality = stoi(*v); }
@@ -677,6 +831,11 @@ bool loadConfig(const fs::path& path, StartOptions& opt) {
     if (c.contains("port")) { opt.port = c["port"].get<int>(); opt.portExplicit = true; }
     opt.wsPort    = c.value("wsPort", opt.wsPort);
     opt.allowControl = c.value("allowControl", opt.allowControl);
+    opt.allowUpdate  = c.value("allowUpdate", opt.allowUpdate);
+    if (c.contains("update") && c["update"].is_array()) {
+        opt.updateCmds.clear();
+        for (auto& u : c["update"]) opt.updateCmds.push_back(u.get<string>());
+    }
     opt.graceSec  = c.value("grace", opt.graceSec);
     opt.watchdogTimeoutSec = c.value("watchdogTimeout", opt.watchdogTimeoutSec);
     if (c.contains("log") && c["log"].is_object()) {
@@ -876,6 +1035,7 @@ int cmdStart(const vector<string>& args) {
     }
     opt.runPath = runPath.string();
     if (opt.cwd.empty()) opt.cwd = runPath.parent_path().string();
+    opt.projectDir = deriveProjectDir(runPath, opt.cwd);
     if (opt.appId.empty()) opt.appId = runPath.stem().string();
     for (char& c : opt.appId) {
         if (!isalnum((unsigned char)c) && c != '-' && c != '_' && c != '.') c = '-';
@@ -902,10 +1062,11 @@ int cmdStart(const vector<string>& args) {
     optional<CommandChannel> channel;
     if (!opt.serverUrl.empty()) {
         push.emplace(opt.serverUrl, opt.appId, opt.token);
-        channel.emplace(opt);
+        channel.emplace(opt, logDir);
         logNotice("anchorbolt") << "pushing to fleet server " << opt.serverUrl
                                 << " as '" << opt.appId << "'"
-                                << (opt.allowControl ? " (REMOTE CONTROL ENABLED)" : "");
+                                << (opt.allowControl ? " (REMOTE CONTROL ENABLED)" : "")
+                                << (opt.allowUpdate ? " (REMOTE UPDATE ENABLED)" : "");
     }
     // Log forwarding: app log + supervisor events. Pushed every poll cycle
     // INDEPENDENT of app health — while the app hangs, the supervisor's
@@ -979,6 +1140,12 @@ int cmdStart(const vector<string>& args) {
         // One file per day; TRUSSC_LOG_FILE appends, so restarts on the same
         // day continue the same file.
         string logFile = (logDir / ("app-" + getTimestampString("%Y-%m-%d") + ".log")).string();
+        // Once per app run (it only changes through updates): the commit the
+        // dashboard shows next to this venue.
+        string appGit = gitHash(opt.projectDir);
+        // Claimed at spawn, not at loop exit: the flag is raised BEFORE the
+        // update-restart, and it's the run AFTER that restart being audited.
+        bool audit = g_updateVerify.exchange(false);
 
         pid_t pid = spawnApp(opt, logFile);
         if (pid < 0) {
@@ -1077,6 +1244,11 @@ int cmdStart(const vector<string>& args) {
                                        << (*h).value("fps", 0.0f) << ", "
                                        << (*h).value("width", 0) << "x" << (*h).value("height", 0) << ")";
                     eventLog(logDir, "app healthy");
+                    if (audit) {
+                        audit = false;
+                        eventLog(logDir, "[update] verified: app healthy on the new binary" +
+                                         (appGit.empty() ? "" : " (" + appGit + ")"));
+                    }
                 }
                 if (push) {
                     // Custom ops status (the anchorbolt convention): probe
@@ -1096,6 +1268,7 @@ int cmdStart(const vector<string>& args) {
                     MachineMem mm = machineMem();
                     hb["machine"] = {{"memTotalBytes", mm.totalBytes},
                                      {"memAvailBytes", mm.availBytes}};
+                    if (!appGit.empty()) hb["git"] = appGit;
                     if (hasStatus) {
                         if (auto s = callTool(cli, "tc_get_status")) {
                             imageNames.clear();
@@ -1152,6 +1325,28 @@ int cmdStart(const vector<string>& args) {
         if (g_stop) {
             if (childAlive) terminateApp(pid);
             break;
+        }
+
+        // First run after an update must prove itself: with the watchdog on,
+        // "never became healthy" fails the audition; without MCP, dying
+        // within 30s does. Failure restores the pre-update binary — the
+        // respawn below then relaunches the old, known-good version.
+        if (audit) {
+            bool bootFailed = opt.watchdogTimeoutSec > 0
+                ? !healthy
+                : chrono::steady_clock::now() - bootAt < chrono::seconds(30);
+            if (bootFailed) {
+                fs::path prev = opt.runPath + ".prev";
+                error_code ec;
+                if (fs::exists(prev, ec)) {
+                    fs::copy_file(prev, opt.runPath, fs::copy_options::overwrite_existing, ec);
+                    eventLog(logDir, ec
+                        ? "[update] rollback FAILED: " + ec.message()
+                        : "[update] rolling back: the new binary never became healthy; previous binary restored");
+                } else {
+                    eventLog(logDir, "[update] rollback impossible: no previous binary kept");
+                }
+            }
         }
 
         ++restarts;
