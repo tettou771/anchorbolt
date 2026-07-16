@@ -432,7 +432,8 @@ const char* kDashboardHtml = R"HTML(<!DOCTYPE html>
   </div>
 </div>
 
-<script>
+)HTML"
+R"HTML(<script>
 const STALE_SEC = 10;
 const seq = {};        // app id -> last rendered thumbSeq (wall)
 let lastApps = [];
@@ -809,7 +810,8 @@ document.getElementById('dRun').addEventListener('click', async () => {
   showResult(await sendCommand(detailId, { action: 'call', tool, args }));
 });
 
-// ---- log panel ----
+)HTML"
+R"HTML(// ---- log panel ----
 
 let logCursor = 0;
 
