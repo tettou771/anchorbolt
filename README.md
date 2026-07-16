@@ -1,303 +1,111 @@
 # AnchorBolt
 
-TrussC installation ops tool — anchors a running installation to home base.
+**Keep an eye on the apps you left running somewhere else.**
 
-One binary, two roles (both ends of the protocol live in this repo, so they
-can never drift apart):
+[日本語](README.ja.md) ・ [Get started](docs/GET_STARTED.md) ・ [Architecture](docs/ARCHITECTURE.md)
 
-- **`anchorbolt start`** — kiosk mode: the venue-side supervisor. Launches your TrussC app
-  with the ops environment injected (`TRUSSC_MCP`, `TRUSSC_LOG_FILE`), then
-  watches it two ways — process exit and hang (silence on the standard
-  `tc_get_health` MCP tool) — and restarts it. The app needs **zero code
-  changes**.
-- **`anchorbolt serve`** — fleet server: live thumbnail wall, log storage,
-  webhook notifications, MCP endpoint for AI-driven operations.
+![The fleet wall — every venue at a glance](docs/images/wall.png)
 
-Deliberately a separate tool from `trusscli`: the dev CLI builds projects;
-AnchorBolt babysits them in production. See the TrussC ROADMAP (kiosk / fleet
-entries) for the full settled design.
+## Why
 
-## Status
+You built an app for an art installation, a museum piece, an event booth — and
+now it runs unattended on a machine in another building, another city, for
+weeks. Then it crashes at 2am. Or it quietly hangs. Or the client asks for a
+change and you'd rather not drive there. The usual answers are a pile of shell
+scripts, a cron job, and someone pointing a phone camera at the screen "just to
+be sure".
 
-Early / Phase 0. Working today (macOS / Linux):
+**AnchorBolt is the ops layer for those installations.** It babysits your app
+on the venue machine — restarts it when it dies or hangs, collects the logs,
+and phones home with a live thumbnail so you can see every venue at a glance
+from your desk. When something needs a human, it can restart, update, or even
+let you drive the app remotely from the browser. Your app needs **zero code
+changes** to get the core of this.
+
+It's built for [TrussC](https://github.com/TrussC-org/TrussC) apps (it uses
+their MCP endpoint for health and screenshots), but the supervision, logging,
+and notification parts work for any program you can launch.
+
+## What it does
+
+- **Auto-restart** — watches the app two ways (it exited / it went silent) and
+  brings it back. No app code needed.
+- **The wall** — a live thumbnail of every venue in one browser page, green/red
+  at a glance, grouped into tabs.
+- **Logs, always** — the venue's logs are collected locally and shipped to your
+  server, surviving hours of network outage and reconnecting where it left off.
+- **Notifications** — a crash, a hang, or an app-raised alert lands in Slack /
+  Discord / ntfy / Uptime Kuma, or a red badge on the wall.
+- **Remote update** — press a button to `git pull` + rebuild on the venue
+  machine while the app keeps running; it only switches over if the build
+  succeeds, and rolls back automatically if the new build won't start.
+- **Live view + remote control** — watch the app's screen live and, when you
+  allow it, click and type into it from the browser.
+- **Graphs & status** — fps, memory (the app's and the whole machine's), and
+  any numbers/images your app chooses to publish, plotted over time.
+- **For AI** — the server is itself an MCP endpoint, so an assistant can search
+  last night's logs, pull screenshots, and (with permission) restart a venue.
+- **Access control** — operator logins with roles, per-client visibility scopes,
+  and 6-digit codes so nobody copies long secret strings around.
+
+## One tool, two roles
+
+AnchorBolt is a single binary. On the **venue machine** you run the supervisor;
+on **your server** you run the fleet dashboard. Both ends of the protocol live
+in the same codebase, so they can never drift out of sync.
 
 ```bash
-# venue machine — inside the TrussC project directory:
-anchorbolt start --server http://192.168.1.10:54722
+# on the venue machine — supervise the app, phone home
+anchorbolt start -p myApp --server https://ops.example.com
 
-# monitoring machine — dashboard at http://localhost:54722/
+# on your server — the dashboard everyone looks at
 anchorbolt serve
 ```
 
-`start` (kiosk mode):
+A venue that only needs local auto-restart can skip `--server` entirely — the
+supervisor works fine on its own.
 
-- app resolution mirrors trusscli: bare `anchorbolt start` treats the
-  current directory as a TrussC project (`bin/<name>.app` / `bin/<name>`);
-  `-p <path>` points at a project directory, a `.app` bundle, or a binary
-- spawn with env injection and the app's own arguments (everything after
-  `--` is passed verbatim: `anchorbolt start -p demo -- --venue osaka`),
-  boot grace period
-- watchdog: no healthy `tc_get_health` reply for `--watchdog-timeout`
-  seconds (wall clock, default 10) → SIGTERM/SIGKILL → restart.
-  `--watchdog-timeout 0` = supervise process exit only, which also makes
-  AnchorBolt useful for binaries without an MCP endpoint
-- process-exit detection → restart
-- SIGINT/SIGTERM to AnchorBolt shuts the app down cleanly too
-- logs land in the platform-conventional place by default
-  (`~/Library/Logs/anchorbolt/<id>/` on macOS,
-  `$XDG_STATE_HOME/anchorbolt/<id>/` on Linux) and are pruned after
-  `--log-keep` days (default 30; 0 keeps everything)
-- with `--server`: pushes a heartbeat per health poll, a downscaled JPEG
-  every `--thumb-interval` sec (default 30, 0 = never — e.g. for venues
-  where screenshots must not leave the machine; `--thumb-width` /
-  `--thumb-quality` tune size), and every new app-log / supervisor-event
-  line. Log push is independent of app health, so while an app hangs the
-  server still sees "unresponsive / restarting" — remotely distinguishable
-  from a machine that went dark
-- **offline-proof log delivery**: the local daily files are the spool, and
-  a persisted cursor (`push-cursor.json`, flushed lazily — SD-card
-  friendly) advances only when the server confirms receipt. Hours of
-  venue-network outage, an AnchorBolt restart, even a machine reboot — the
-  backlog ships on reconnect. At-least-once semantics: the server dedups
-  retries, and files not yet delivered are protected from local pruning
-- **remote update** (opt-in via `--allow-update` — it is remote code
-  execution by definition): the dashboard's Update button runs a pipeline
-  on the venue machine (default `git pull --ff-only` → `trusscli update` →
-  `trusscli build`; override with the config `update` array — prepend
-  `"trusscli upgrade"` to also pull TrussC itself) **while the old binary
-  keeps running**, so a failed build never takes the installation down.
-  Build output streams live into the dashboard log panel. On success the
-  app restarts onto the new binary; the previous one is kept as
-  `<binary>.prev`, and if the new binary doesn't become healthy on its
-  first run it is rolled back automatically. A Roll back button restores
-  `.prev` manually. If the pull brings nothing new, the remaining steps
-  are skipped and the app is left untouched — pressing Update "just in
-  case" is free (custom pipelines always run fully and restart; a retry
-  after a failed attempt also runs fully, so transient build failures
-  stay retryable). The agent also reports the project's git commit on
-  every heartbeat, so the wall shows which venue runs which version
+![Clicking a venue opens the detail view: live thumbnail, graphs, events, logs](docs/images/detail.png)
 
-- **notification sinks** (config `sinks` array): push supervisor events
-  (`restart` / `up` / `down` / `update` / `stop`, plus `alert` — messages the app itself raises with `mcp::alert("IR camera disconnected!")`, drained from the standard `tc_get_alerts` tool) to the outside world —
-  ONE templated HTTP engine, no per-service adapters. Presets prefill it:
-  `slack`, `discord`, `ntfy` (event messages) and `uptime-kuma` (heartbeat
-  mode: pings while the app is healthy, so Kuma alerts on silence). Generic
-  sinks take `method` / `contentType` / `body` with `{{app}}` `{{event}}`
-  `{{msg}}` `{{time}}` variables (JSON-escaped automatically). Webhook URLs
-  are secrets — use `urlFile` (gitignored file next to the config) or
-  `urlEnv` instead of an inline `url`. Delivery is at-least-once with an
-  in-memory queue per sink: a venue-network outage holds events until it
-  heals; 4xx responses drop the event (a bad webhook must not retry
-  forever). `events` filters what a sink receives (default: everything).
+## Get started
 
-```jsonc
-"sinks": [
-  { "preset": "slack",   "urlFile": "slack.url" },
-  { "preset": "ntfy",    "url": "https://ntfy.sh/my-venue-alerts" },
-  { "preset": "uptime-kuma", "url": "https://kuma.example.com/api/push/KEY" },
-  { "url": "https://example.com/hook", "events": ["restart", "down"],
-    "body": "{\"venue\":\"osaka\",\"what\":\"{{event}}: {{msg}}\"}" }
-]
-```
-
-Flags: see `anchorbolt --help`. Precedence: flags > `ANCHORBOLT_TOKEN` env >
-config file > defaults.
-
-### Config file
-
-For launchd/systemd installs, put everything in a JSON file (comments
-allowed) instead of a flag string — `anchorbolt start --config venue.json`,
-or just `anchorbolt start` next to an `anchorbolt.json`:
-
-```jsonc
-{
-  // osaka-entrance kiosk
-  "app": "./bin/myApp.app/Contents/MacOS/myApp",
-  "args": ["--fullscreen"],
-  "id": "osaka-entrance",
-  "server": "https://ops.example.com",
-  "tokenFile": "demo.token",          // the token itself NEVER goes in here
-  "watchdogTimeout": 10,
-  "log": { "keepDays": 30 },
-  "thumb": { "interval": 30, "width": 512, "quality": 75 }
-}
-```
-
-A `token` key in the config is refused with a warning — configs get
-committed to git; keep the secret in a separate (gitignored) file pointed
-to by `tokenFile`, or in the `ANCHORBOLT_TOKEN` env var.
-
-`serve` (fleet server):
-
-- live thumbnail wall at `/` — green/red per app, fps / size / uptime,
-  stale marking after 10s of silence
-- click a card for the detail view: big live thumbnail, app-published
-  status values, time-series graphs (fps / process memory / machine free /
-  custom metrics), custom image streams, and a live log panel (app log +
-  supervisor events, severity-colored, filterable)
-- ingest: `POST /api/heartbeat` (JSON), `POST /api/thumb/<id>` and
-  `POST /api/image/<id>/<name>` (raw JPEG), `POST /api/log/<id>` (JSON lines)
-- read: `GET /api/apps`, `GET /api/thumb/<id>`, `GET /api/image/<id>/<name>`,
-  `GET /api/history/<id>`, `GET /api/log/<id>?after=<seq>`
-- DB-free storage under `--data` (default `./anchorbolt-data`): daily
-  heartbeat JSONL + timestamp-named JPEGs per app
-- retention (`--keep-days`, default 90, 0 = forever, independent of any
-  venue's local policy — deletions never propagate): stored JSONL and
-  images older than the cutoff are pruned hourly; thumbnails older than
-  24h are additionally thinned to one per hour
-- **incident badge + event list**: every venue event (`restart` / `up` /
-  `down` / `update` / `stop` / `alert`) lands in a per-app event list in
-  the detail view, and incidents (`restart` / `down` / `alert`) light a
-  red badge on the wall card until an operator presses Clear — "Osaka
-  restarted 3 times overnight" is visible at a glance the next morning.
-  The `restart` event fires at the actual respawn, not at exit detection,
-  so an OS shutdown that kills the app before the supervisor records only
-  a quiet `stop`, never a phantom incident
-- **remote control** (agent keeps one outbound WebSocket, NAT-friendly):
-  the detail view shows a live/offline chip, Update / Roll back / Restart
-  buttons, and a tool console that relays MCP tool calls to the app.
-  Read-only tools (`tc_get_*`) relay freely; anything mutating requires
-  the venue operator to have started the agent with `--allow-control`
-  (updates: `--allow-update`)
-- **live view + remote control**: a Live button in the detail view streams
-  the app's screen (JPEG over the agent's WebSocket, ~10fps, only while a
-  browser watches — auto-stops after 10s idle). An operator can toggle
-  control to drive the app: clicks/drags map to app coordinates and
-  keystrokes forward as `tc_mouse_*` / `tc_key_press` (needs the operator
-  role AND the venue's `--allow-control`; the app opts in with
-  `mcp::registerDebuggerTools()`)
-- **groups, tabs & scoped visibility**: assign apps to groups (server-side,
-  in the settings page); the wall gets per-group tabs. Operators can carry
-  a `scope` (group names or `app:<id>`) so a client sees only their own
-  venues — out-of-scope apps 404 everywhere, including fleet /mcp
-- **settings page** (admin): manage app groups, operators (create with a
-  role + scope, revoke, token shown once) and agents from the dashboard
-- **6-digit codes**: single-use, 10-min codes for two flows — venue
-  pairing (`anchorbolt start --pair 483201` trades the code for an agent
-  token and saves it to the platform state dir at 0600 — keyed by binary
-  name, never inside a repo — so nobody copies `tc-...` strings) and operator
-  login (paste 6 digits instead of the `op-...` token; mints a browser
-  session that dies the moment the operator is revoked)
-
-Options: `--port` (HTTP port, default 54722 — "truss" typed on the QWERTY number row; ws = port+1) `--ws-port <n>` (command
-channel, default port+1) `--data <dir>`.
-
-## Tokens
-
-Two classes, both minted on the **server** side, shown once, stored as
-SHA-256 hashes only. An empty registry = open mode for that class, so the
-zero-config path keeps working on trusted networks.
-
-**Agent tokens** — publish-only identity for a venue supervisor:
+The [Get Started guide](docs/GET_STARTED.md) walks from a 30-second local trial
+to a real deployment behind a Cloudflare tunnel — grouping venues, wiring up
+Slack, giving a client a read-only login, and turning on remote control. Each
+step is copy-pasteable.
 
 ```bash
-# on the server
-anchorbolt token agent new osaka-entrance --data ./anchorbolt-data
-# -> prints tc-... once. From then on EVERY agent must authenticate.
-
-# on the venue machine
-anchorbolt start ./bin/myApp --server https://ops.example.com \
-    --id osaka-entrance --token tc-...       # or ANCHORBOLT_TOKEN env
+# the 30-second taste (two terminals on one machine)
+anchorbolt serve                       # open http://localhost:54722/
+anchorbolt start -p myApp --server http://localhost:54722
 ```
 
-**Operator tokens** — dashboard login, with roles:
+## How it's built
 
-```bash
-anchorbolt token operator new toru   --role admin
-anchorbolt token operator new staff  --role operator   # + restart/update/tools/clear
-anchorbolt token operator new client --role viewer     # read-only wall & detail
-```
+The [Architecture doc](docs/ARCHITECTURE.md) covers the design: the two-layer
+supervision model, the DB-free file storage, the offline-proof log delivery
+cursor, the two token classes, the WebSocket command channel, the fleet MCP
+surface, and the reasoning behind the choices (why it's separate from
+`trusscli`, why files instead of a database, why tokens instead of OAuth).
 
-With any operator registered, the dashboard shows a login page; the token
-goes into an HttpOnly cookie (so `<img>` thumbnails authenticate too) and
-is re-verified against the hash on every request — revoking an operator
-(`token operator revoke <name>`) locks them out on their next poll, no
-sessions to chase. Viewers get the wall, detail view, graphs, logs and
-events; the Update / Roll back / Restart buttons, tool console and alert
-Clear require the operator role (and the venue-side --allow-control /
---allow-update gates still apply on top). `token list` shows both classes.
-TLS remains the reverse proxy's job (Caddy, Cloudflare Tunnel).
+## Status
 
-## Fleet MCP (AI operations)
+Feature-complete for real use on **macOS and Linux**; the venue supervisor also
+builds for **Windows** (real-hardware verification in progress). It's a young
+tool moving fast — the CLI and dashboard are stable enough to deploy, and the
+remaining roadmap items (an approval queue for AI-driven changes, shareable
+view-only URLs) are additive.
 
-`POST /mcp` on the serve port is a full MCP server (same JSON-RPC-over-HTTP
-transport as TrussC apps), so an AI assistant can investigate "the Osaka
-piece crashed last night" end-to-end:
-
-```bash
-claude mcp add --transport http anchorbolt http://localhost:54722/mcp \
-    --header "Authorization: Bearer op-..."   # an operator token
-```
-
-Tools: `list_apps`, `search_logs`, `tail_logs`, `get_events`,
-`get_health_history`, `list_screenshots`, `get_screenshot` (returns a real
-image block — the AI sees the installation), `restart_app`,
-`app_list_tools` / `app_call` (passthrough to each app's own MCP tools —
-tool names stay unchanged, the `app` argument addresses the venue; the two
-fixed proxies avoid a tools/list explosion across venues). Roles apply:
-viewers get the read-only tools, `restart_app` and mutating `app_call`
-need operator — and the venue-side `--allow-control` gate still applies
-on top. Open mode (no operators) leaves /mcp open too.
-
-## Custom app status
-
-Apps can publish their own monitoring data with one line per value — the
-supervisor discovers it via MCP `tools/list`, no AnchorBolt configuration:
-
-```cpp
-void tcApp::setup() {
-    mcp::status("scene",         [&] { return sceneName; });     // shown as-is
-    mcp::statusGraph("visitors", [&] { return visitorCount; });  // plotted over time
-    mcp::statusImage("entranceCam", [&] { return camPixels; });  // e.g. a webcam
-}
-```
-
-Values ride every heartbeat; images are fetched on the thumbnail interval
-(cheap for the app — same two-stage encode as `tc_get_screenshot`). See
-`demo/` for a complete example and TrussC's `docs/AI_AUTOMATION.md`
-("Publishing Custom Ops Status") for the convention.
-
-Next: Windows support, retention/pruning, sinks (webhook notifications),
-approval queue for AI-driven mutating calls, live view, operator auth.
+Deliberately a **separate tool from `trusscli`**: the dev CLI builds projects;
+AnchorBolt babysits them in production. See the TrussC ROADMAP (kiosk / fleet
+entries) for the full settled design.
 
 ## Build
 
 A standard TrussC project. Requires a TrussC core with `tc_get_health` /
-`tc_get_screenshot(width)` / `TRUSSC_LOG_FILE` (v0.7.0+, currently the `feat/kiosk`
-branch).
+`tc_get_screenshot` / `TRUSSC_LOG_FILE` (v0.7.0+).
 
 ```bash
 trusscli update   # regenerate CMakeLists/CMakePresets (they are gitignored)
 trusscli build
 ```
-
-## Exposing the server (reverse proxy / Cloudflare tunnel)
-
-TLS terminates at the proxy; point it at the HTTP port (54722). The
-command channel is a **separate WebSocket hub** on `port+1` (54723) — the
-interactive features (Restart / Update buttons, live view, remote control,
-fleet `/mcp` `restart_app`/`app_call`) ride it. To reach it through a
-single hostname, route a path to the hub and tell the agent about it:
-
-```yaml
-# cloudflared ingress — same hostname, path split
-ingress:
-  - hostname: ops.example.com
-    path: /ws
-    service: ws://localhost:54723
-  - hostname: ops.example.com
-    service: http://localhost:54722
-```
-
-```bash
-# venue agent: HTTP over the hostname, WS over the /ws path
-anchorbolt start -p myApp --server https://ops.example.com \
-    --ws-url wss://ops.example.com/ws --allow-control
-```
-
-Monitoring alone (wall, logs, graphs, alerts, screenshot history, fleet
-`/mcp` read tools) needs only the HTTP route — `--ws-url` is required
-solely for the interactive/control features. **Before exposing publicly,
-register an operator token** (`token operator new ... --role admin`) or the
-dashboard and `/mcp` are wide open — in open mode `/mcp` grants everyone
-admin, which means remote restart to anyone with the URL.
