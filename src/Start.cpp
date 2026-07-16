@@ -456,6 +456,18 @@ bool parseArgs(const vector<string>& args, StartOptions& opt) {
         else if (a == "--server")   { auto v = next("--server");   if (!v) return false; opt.serverUrl = *v; }
         else if (a == "--id")       { auto v = next("--id");       if (!v) return false; opt.appId = *v; }
         else if (a == "--token")    { auto v = next("--token");    if (!v) return false; opt.token = *v; }
+        else if (a == "--token-file") {
+            auto v = next("--token-file");
+            if (!v) return false;
+            ifstream tin(*v);
+            string tok;
+            if (!tin || !getline(tin, tok)) {
+                cerr << "anchorbolt start: cannot read token file " << *v << endl;
+                return false;
+            }
+            while (!tok.empty() && (tok.back() == '\r' || tok.back() == ' ')) tok.pop_back();
+            opt.token = tok;
+        }
         else if (a == "--ws-port")  { auto v = next("--ws-port");  if (!v) return false; opt.wsPort = stoi(*v); }
         else if (a == "--allow-control") { opt.allowControl = true; }
         else if (a == "--thumb-interval") { auto v = next("--thumb-interval"); if (!v) return false; opt.thumbIntervalSec = stoi(*v); }

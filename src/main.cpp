@@ -44,6 +44,7 @@ static void printHelp() {
         "  --server <url>     fleet server to push to (e.g. http://192.168.1.10:8787)\n"
         "  --id <name>        app id on the fleet server (default: binary name)\n"
         "  --token <tok>      agent token minted by the server\n"
+        "  --token-file <path>  read the token from a file (keeps it out of ps/plists)\n"
         "  --ws-port <n>      server command-channel port (default: server port + 1)\n"
         "  --allow-control    let the server relay MUTATING tools to the app\n"
         "                     (input injection, node writes, custom tools; default: read-only)\n"
