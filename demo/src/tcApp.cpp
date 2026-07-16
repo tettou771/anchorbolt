@@ -16,6 +16,13 @@ void tcApp::setup() {
             frozen = true;
             return Json{{"status", "ok"}, {"message", "freezing after this reply"}};
         }));
+
+    // Exercises mcp::alert -> tc_get_alerts -> supervisor notification sinks.
+    mcp::tool("raise_alert", "Raise a test operator alert (mcp::alert demo)")
+        .bind(std::function<Json()>([]() -> Json {
+            mcp::alert("test alert raised from the demo app");
+            return Json{{"status", "ok"}};
+        }));
 }
 
 void tcApp::update() {

@@ -1447,8 +1447,9 @@ int cmdStart(const vector<string>& args) {
         bool childAlive = true;
         bool pidWarned = false;  // one-shot port-collision warning
         chrono::steady_clock::time_point lastThumb{};  // epoch -> push right away
-        bool statusChecked = false;   // tools/list probed for tc_get_status
+        bool statusChecked = false;   // tools/list probed for optional conventions
         bool hasStatus = false;
+        bool hasAlerts = false;
         vector<string> imageNames;    // statusImage names from the last status
 
         while (!g_stop) {
@@ -1540,20 +1541,30 @@ int cmdStart(const vector<string>& args) {
                         if (notifier) notifier->notify("update", vmsg);
                     }
                 }
-                if (push) {
-                    // Custom ops status (the anchorbolt convention): probe
-                    // tools/list once per app run, then ride every heartbeat.
-                    if (!statusChecked) {
-                        statusChecked = true;
-                        if (auto r = callRpc(cli, "tools/list")) {
-                            for (auto& t : r->value("tools", Json::array())) {
-                                if (t.value("name", "") == "tc_get_status") {
-                                    hasStatus = true;
-                                    break;
-                                }
-                            }
+                // Probe tools/list once per app run: which of the optional
+                // conventions does this app speak? (status for push, alerts
+                // for the notification sinks — either consumer can be absent.)
+                if ((push || notifier) && !statusChecked) {
+                    statusChecked = true;
+                    if (auto r = callRpc(cli, "tools/list")) {
+                        for (auto& t : r->value("tools", Json::array())) {
+                            string n = t.value("name", "");
+                            if (n == "tc_get_status") hasStatus = true;
+                            if (n == "tc_get_alerts") hasAlerts = true;
                         }
                     }
+                }
+                // App-raised operator alerts (mcp::alert) -> sinks. Drain on
+                // the health cadence; the tool clears what it returns.
+                if (notifier && hasAlerts) {
+                    if (auto a = callTool(cli, "tc_get_alerts")) {
+                        for (auto& al : a->value("alerts", Json::array())) {
+                            string text = al.value("text", "");
+                            if (!text.empty()) notifier->notify("alert", text);
+                        }
+                    }
+                }
+                if (push) {
                     Json hb = *h;
                     MachineMem mm = machineMem();
                     hb["machine"] = {{"memTotalBytes", mm.totalBytes},

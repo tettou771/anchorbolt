@@ -78,7 +78,7 @@ anchorbolt serve
   every heartbeat, so the wall shows which venue runs which version
 
 - **notification sinks** (config `sinks` array): push supervisor events
-  (`restart` / `up` / `down` / `update` / `stop`) to the outside world —
+  (`restart` / `up` / `down` / `update` / `stop`, plus `alert` — messages the app itself raises with `mcp::alert("IR camera disconnected!")`, drained from the standard `tc_get_alerts` tool) to the outside world —
   ONE templated HTTP engine, no per-service adapters. Presets prefill it:
   `slack`, `discord`, `ntfy` (event messages) and `uptime-kuma` (heartbeat
   mode: pings while the app is healthy, so Kuma alerts on silence). Generic

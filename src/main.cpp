@@ -36,7 +36,7 @@ static void printHelp() {
         "                     refused — keep secrets in tokenFile or the env, not in a\n"
         "                     config that lands in git.\n"
         "                     sinks: [{preset: slack|discord|ntfy|uptime-kuma, url|urlEnv|\n"
-        "                     urlFile, events?: [restart,up,down,update,stop], body?,\n"
+        "                     urlFile, events?: [restart,up,down,update,stop,alert], body?,\n"
         "                     method?, contentType?, interval?}] — ONE templated HTTP\n"
         "                     engine ({{app}} {{event}} {{msg}} {{time}}); presets prefill\n"
         "                     it. uptime-kuma = heartbeat mode (pings while healthy).\n"
