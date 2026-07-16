@@ -22,9 +22,8 @@ entries) for the full settled design.
 Early / Phase 0. Working today (macOS / Linux):
 
 ```bash
-# venue machine — supervise the app and push to the fleet server
-anchorbolt start /path/to/bin/myApp.app/Contents/MacOS/myApp \
-    --server http://192.168.1.10:8787 -- --fullscreen
+# venue machine — inside the TrussC project directory:
+anchorbolt start --server http://192.168.1.10:8787
 
 # monitoring machine — dashboard at http://localhost:8787/
 anchorbolt serve
@@ -32,8 +31,12 @@ anchorbolt serve
 
 `start` (kiosk mode):
 
+- app resolution mirrors trusscli: bare `anchorbolt start` treats the
+  current directory as a TrussC project (`bin/<name>.app` / `bin/<name>`);
+  `-p <path>` points at a project directory, a `.app` bundle, or a binary
 - spawn with env injection and the app's own arguments (everything after
-  `--` is passed verbatim), boot grace period
+  `--` is passed verbatim: `anchorbolt start -p demo -- --venue osaka`),
+  boot grace period
 - watchdog: no healthy `tc_get_health` reply for `--watchdog-timeout`
   seconds (wall clock, default 10) → SIGTERM/SIGKILL → restart.
   `--watchdog-timeout 0` = supervise process exit only, which also makes
@@ -99,7 +102,7 @@ to by `tokenFile`, or in the `ANCHORBOLT_TOKEN` env var.
   (`tc_get_*`) relay freely; anything mutating requires the venue operator
   to have started the agent with `--allow-control`
 
-Options: `-p/--port` (HTTP port, default 8787) `--ws-port <n>` (command
+Options: `--port` (HTTP port, default 8787) `--ws-port <n>` (command
 channel, default port+1) `--data <dir>`.
 
 ## Agent tokens

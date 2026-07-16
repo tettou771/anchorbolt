@@ -474,30 +474,64 @@ bool parseArgs(const vector<string>& args, StartOptions& opt) {
         else if (a == "--thumb-width")    { auto v = next("--thumb-width");    if (!v) return false; opt.thumbWidth = stoi(*v); }
         else if (a == "--thumb-quality")  { auto v = next("--thumb-quality");  if (!v) return false; opt.thumbQuality = stoi(*v); }
         else if (a == "--config") { ++i; /* consumed in the pre-pass */ }
+        else if (a == "-p" || a == "--path") { auto v = next("-p"); if (!v) return false; opt.runPath = *v; }
         else if (a == "--") {
             // Everything after -- goes to the app verbatim.
             opt.appArgs.assign(args.begin() + i + 1, args.end());
             break;
         }
-        else if (!a.empty() && a[0] != '-') {
-            if (!opt.runPath.empty()) {
-                cerr << "anchorbolt start: unexpected extra argument '" << a
-                     << "' (app arguments go after --)" << endl;
-                return false;
-            }
-            opt.runPath = a;  // positional: the app binary
-        }
         else {
-            cerr << "anchorbolt start: unknown option '" << a << "'" << endl;
+            cerr << "anchorbolt start: unexpected argument '" << a
+                 << "' (use -p <path> for the app, app arguments go after --)" << endl;
             return false;
         }
     }
-    if (opt.runPath.empty()) {
-        cerr << "anchorbolt start: an app binary is required "
-             << "(anchorbolt start <app-binary> [options] [-- app-args])" << endl;
-        return false;
-    }
     return true;
+}
+
+// Resolve what the user pointed at — a binary, a .app bundle, or a TrussC
+// project directory (mirrors trusscli's layout: bin/<name>.app on macOS,
+// bin/<name> elsewhere). Empty input means the current directory, so a bare
+// `anchorbolt start` inside a project just works. `tried` collects the
+// locations probed, for the error message.
+fs::path resolveApp(fs::path input, vector<string>& tried) {
+    error_code ec;
+    if (input.empty()) input = fs::current_path(ec);
+    input = fs::absolute(input, ec);
+
+    if (fs::is_regular_file(input, ec)) return input;
+
+    auto bundleBinary = [&](const fs::path& app) -> fs::path {
+        fs::path inner = app / "Contents" / "MacOS" / app.stem();
+        tried.push_back(inner.string());
+        error_code e2;
+        return fs::is_regular_file(inner, e2) ? inner : fs::path{};
+    };
+
+    if (input.extension() == ".app" && fs::is_directory(input, ec)) {
+        return bundleBinary(input);
+    }
+    if (fs::is_directory(input, ec)) {
+        string name = input.filename().string();
+        if (fs::path p = bundleBinary(input / "bin" / (name + ".app")); !p.empty()) return p;
+        fs::path flat = input / "bin" / name;
+        tried.push_back(flat.string());
+        if (fs::is_regular_file(flat, ec)) return flat;
+        // Last resort: exactly one .app in bin/ (project dir renamed etc.)
+        fs::path onlyApp;
+        for (auto& e : fs::directory_iterator(input / "bin", ec)) {
+            if (e.path().extension() == ".app" && fs::is_directory(e.path(), ec)) {
+                if (!onlyApp.empty()) { onlyApp.clear(); break; }  // ambiguous
+                onlyApp = e.path();
+            }
+        }
+        if (!onlyApp.empty()) {
+            if (fs::path p = bundleBinary(onlyApp); !p.empty()) return p;
+        }
+    } else {
+        tried.push_back(input.string());
+    }
+    return {};
 }
 
 // Config file: JSON with comments allowed. Loaded BEFORE flags, so flags win.
@@ -522,7 +556,11 @@ bool loadConfig(const fs::path& path, StartOptions& opt) {
              << "Configs end up in git; put the token in a separate file and point\n"
              << "'tokenFile' at it (or use the ANCHORBOLT_TOKEN env var)." << endl;
     }
-    opt.runPath  = c.value("app", opt.runPath);
+    if (c.contains("app")) {
+        // Relative app paths resolve next to the config file, not our cwd.
+        fs::path a = c["app"].get<string>();
+        opt.runPath = (a.is_absolute() ? a : path.parent_path() / a).string();
+    }
     if (c.contains("args") && c["args"].is_array()) {
         opt.appArgs.clear();
         for (auto& a : c["args"]) opt.appArgs.push_back(a.get<string>());
@@ -664,11 +702,15 @@ int cmdStart(const vector<string>& args) {
     if (const char* envTok = getenv("ANCHORBOLT_TOKEN")) opt.token = envTok;
     if (!parseArgs(args, opt)) return 1;
 
-    // Resolve paths up front so restarts don't depend on our cwd.
-    error_code ec;
-    fs::path runPath = fs::absolute(opt.runPath, ec);
-    if (ec || !fs::exists(runPath)) {
-        cerr << "anchorbolt start: app binary not found: " << opt.runPath << endl;
+    // Resolve what -p / config / the current directory points at: a binary,
+    // a .app bundle, or a TrussC project. Absolute up front so restarts
+    // don't depend on our cwd.
+    vector<string> tried;
+    fs::path runPath = resolveApp(opt.runPath, tried);
+    if (runPath.empty()) {
+        cerr << "anchorbolt start: no app found. Looked for:" << endl;
+        for (auto& t : tried) cerr << "  " << t << endl;
+        cerr << "point -p at a binary, a .app bundle, or a TrussC project directory" << endl;
         return 1;
     }
     opt.runPath = runPath.string();

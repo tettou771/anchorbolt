@@ -21,7 +21,7 @@ static void printHelp() {
         "anchorbolt - TrussC installation ops tool\n"
         "\n"
         "USAGE\n"
-        "  anchorbolt start <app-binary> [options] [-- app-args...]\n"
+        "  anchorbolt start [-p <path>] [options] [-- app-args...]\n"
         "                                            kiosk mode: supervise an app on this machine\n"
         "  anchorbolt serve [options]                fleet server: dashboard + ingest + command channel\n"
         "  anchorbolt token <new|list|revoke> [app-id] [--data <dir>]\n"
@@ -53,7 +53,7 @@ static void printHelp() {
         "  --thumb-quality <1-100> JPEG quality (default 75)\n"
         "\n"
         "SERVE OPTIONS\n"
-        "  -p, --port <n>     HTTP port (default 8787)\n"
+        "  --port <n>         HTTP port (default 8787)\n"
         "  --ws-port <n>      agent command-channel port (default: port + 1)\n"
         "  --data <dir>       storage directory for heartbeats/thumbnails\n"
         "                     (default ./anchorbolt-data)\n";

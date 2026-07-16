@@ -146,7 +146,7 @@ bool parseArgs(const vector<string>& args, ServeOptions& opt) {
             }
             return args[++i];
         };
-        if      (a == "-p" || a == "--port") { auto v = next("--port"); if (!v) return false; opt.port = stoi(*v); }
+        if      (a == "--port")              { auto v = next("--port"); if (!v) return false; opt.port = stoi(*v); }
         else if (a == "--ws-port")           { auto v = next("--ws-port"); if (!v) return false; opt.wsPort = stoi(*v); }
         else if (a == "--data")              { auto v = next("--data"); if (!v) return false; opt.dataDir = *v; }
         else {
