@@ -163,14 +163,17 @@ to by `tokenFile`, or in the `ANCHORBOLT_TOKEN` env var.
 Options: `--port` (HTTP port, default 54722 — "truss" typed on the QWERTY number row; ws = port+1) `--ws-port <n>` (command
 channel, default port+1) `--data <dir>`.
 
-## Agent tokens
+## Tokens
 
-Tokens are minted on the **server** side and only their SHA-256 hashes are
-stored; the venue machine carries the token:
+Two classes, both minted on the **server** side, shown once, stored as
+SHA-256 hashes only. An empty registry = open mode for that class, so the
+zero-config path keeps working on trusted networks.
+
+**Agent tokens** — publish-only identity for a venue supervisor:
 
 ```bash
 # on the server
-anchorbolt token new osaka-entrance --data ./anchorbolt-data
+anchorbolt token agent new osaka-entrance --data ./anchorbolt-data
 # -> prints tc-... once. From then on EVERY agent must authenticate.
 
 # on the venue machine
@@ -178,10 +181,23 @@ anchorbolt start ./bin/myApp --server https://ops.example.com \
     --id osaka-entrance --token tc-...       # or ANCHORBOLT_TOKEN env
 ```
 
-`token list` / `token revoke <app-id>` manage them. No tokens registered =
-open mode (today's zero-config behavior on trusted networks). Dashboard
-viewers are not authenticated yet — put the HTTP port behind a reverse
-proxy (Caddy basic-auth, Cloudflare Tunnel) when exposing it.
+**Operator tokens** — dashboard login, with roles:
+
+```bash
+anchorbolt token operator new toru   --role admin
+anchorbolt token operator new staff  --role operator   # + restart/update/tools/clear
+anchorbolt token operator new client --role viewer     # read-only wall & detail
+```
+
+With any operator registered, the dashboard shows a login page; the token
+goes into an HttpOnly cookie (so `<img>` thumbnails authenticate too) and
+is re-verified against the hash on every request — revoking an operator
+(`token operator revoke <name>`) locks them out on their next poll, no
+sessions to chase. Viewers get the wall, detail view, graphs, logs and
+events; the Update / Roll back / Restart buttons, tool console and alert
+Clear require the operator role (and the venue-side --allow-control /
+--allow-update gates still apply on top). `token list` shows both classes.
+TLS remains the reverse proxy's job (Caddy, Cloudflare Tunnel).
 
 ## Custom app status
 

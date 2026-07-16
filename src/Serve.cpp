@@ -316,6 +316,22 @@ const char* kDashboardHtml = R"HTML(<!DOCTYPE html>
          flex: none; }
   .stale .dot, .dot.bad { background: #f85149; }
   #empty { color: #4a4f59; text-align: center; padding: 80px 20px; }
+  #logoutBtn { background: none; border: 1px solid #2a2e36; color: #7d838e;
+               border-radius: 5px; font-size: 11px; padding: 2px 10px; cursor: pointer; }
+  #logoutBtn:hover { color: #d4d7dd; }
+  #login { position: fixed; inset: 0; background: #16181d; z-index: 100;
+           display: flex; align-items: center; justify-content: center; }
+  #login[hidden] { display: none; }
+  #loginBox { display: flex; flex-direction: column; gap: 12px; width: 320px; }
+  #loginBox h2 { margin: 0 0 4px; font-size: 18px; text-align: center;
+                 letter-spacing: .04em; }
+  #loginTok { background: #1e2128; border: 1px solid #2a2e36; border-radius: 6px;
+              color: #d4d7dd; padding: 9px 12px; font-size: 14px; outline: none; }
+  #loginTok:focus { border-color: #3d4450; }
+  #loginBtn { background: #1c2a3a; color: #79b8ff; border: 1px solid #2c405a;
+              border-radius: 6px; font-size: 14px; padding: 8px; cursor: pointer; }
+  #loginBtn:hover { background: #223449; }
+  #loginErr { color: #ff8a80; font-size: 12px; text-align: center; min-height: 16px; }
 
   /* ---- detail view ---- */
   #detail { position: fixed; inset: 0; background: rgba(10,11,14,.75);
@@ -419,10 +435,22 @@ const char* kDashboardHtml = R"HTML(<!DOCTYPE html>
 <header>
   <h1>AnchorBolt</h1>
   <span class="sub" id="summary"></span>
+  <span style="flex:1"></span>
+  <span class="sub" id="who"></span>
+  <button id="logoutBtn" hidden>logout</button>
 </header>
 <div id="grid"></div>
 <div id="empty" hidden>no apps have reported yet &mdash; run
   <code>anchorbolt start &lt;app&gt; --server &lt;this url&gt;</code></div>
+
+<div id="login" hidden>
+  <div id="loginBox">
+    <h2>AnchorBolt</h2>
+    <input id="loginTok" type="password" placeholder="operator token (op-...)" autocomplete="off">
+    <button id="loginBtn">Sign in</button>
+    <div id="loginErr"></div>
+  </div>
+</div>
 
 <div id="detail" hidden>
   <div id="dPanel">
@@ -471,6 +499,51 @@ const char* kDashboardHtml = R"HTML(<!DOCTYPE html>
 )HTML"
 R"HTML(<script>
 const STALE_SEC = 10;
+let myRole = null;   // null = open mode (everything allowed)
+
+function showLogin() {
+  document.getElementById('login').hidden = false;
+  document.getElementById('loginTok').focus();
+}
+
+async function doLogin() {
+  const tok = document.getElementById('loginTok').value.trim();
+  if (!tok) return;
+  const r = await fetch('/api/login', { method: 'POST', body: JSON.stringify({ token: tok }) });
+  if (r.ok) location.reload();
+  else document.getElementById('loginErr').textContent = 'invalid token';
+}
+document.getElementById('loginBtn').addEventListener('click', doLogin);
+document.getElementById('loginTok').addEventListener('keydown', e => {
+  if (e.key === 'Enter') doLogin();
+});
+document.getElementById('logoutBtn').addEventListener('click', async () => {
+  await fetch('/api/logout', { method: 'POST' });
+  location.reload();
+});
+
+// The server enforces roles regardless; this only hides what a viewer
+// cannot use anyway.
+function applyRole(me) {
+  if (me.open) return;
+  myRole = me.role;
+  document.getElementById('who').textContent = me.name + ' (' + me.role + ')';
+  document.getElementById('logoutBtn').hidden = false;
+  if (me.role === 'viewer') {
+    for (const id of ['dRestart', 'dUpdate', 'dRollback', 'dAckBtn', 'dConsole']) {
+      const el = document.getElementById(id);
+      if (el) el.style.display = 'none';
+    }
+  }
+}
+
+(async () => {
+  try {
+    const r = await fetch('/api/me');
+    if (r.status === 401) { showLogin(); return; }
+    if (r.ok) applyRole(await r.json());
+  } catch {}
+})();
 const seq = {};        // app id -> last rendered thumbSeq (wall)
 let lastApps = [];
 let detailId = null;
@@ -764,7 +837,8 @@ async function renderDetail() {
   });
 }
 
-// ---- remote control (restart + tool console) ----
+)HTML"
+R"HTML(// ---- remote control (restart + tool console) ----
 
 async function sendCommand(id, body) {
   try {
@@ -984,7 +1058,9 @@ function syncImages(app) {
 async function refresh() {
   let apps;
   try {
-    apps = await (await fetch('/api/apps')).json();
+    const r = await fetch('/api/apps');
+    if (r.status === 401) { showLogin(); return; }
+    apps = await r.json();
   } catch { return; }
   lastApps = apps;
 
@@ -1056,6 +1132,33 @@ int cmdServe(const vector<string>& args) {
         return token::verify(d, appId, h.substr(prefix.size()));
     };
 
+    // Dashboard authentication: with any operator registered, every read and
+    // command endpoint wants the login cookie. The cookie carries the token
+    // itself (HttpOnly — set by /api/login, sent automatically by <img> tags
+    // too, which Authorization headers can't do); verification re-hashes per
+    // request, so revoking an operator locks them out on their next poll.
+    auto cookieToken = [](const httplib::Request& req) -> string {
+        string c = req.get_header_value("Cookie");
+        size_t pos = c.find("abtoken=");
+        if (pos == string::npos) return "";
+        pos += 8;
+        size_t end = c.find(';', pos);
+        return c.substr(pos, end == string::npos ? string::npos : end - pos);
+    };
+    // Minimum-role gate: viewer=1 operator=2 admin=3. Open mode admits all.
+    auto requireRole = [dataDir, cookieToken](const httplib::Request& req,
+                                              httplib::Response& res, int minRank) {
+        string d = dataDir.string();
+        if (!token::operatorsEnabled(d)) return true;
+        auto op = token::verifyOperator(d, cookieToken(req));
+        if (op && token::roleRank(op->role) >= minRank) return true;
+        // 401 = not signed in (UI shows the login overlay); 403 = signed in
+        // but this role can't do that (UI hides those controls anyway).
+        res.status = op ? 403 : 401;
+        res.set_content(op ? "forbidden" : "unauthorized", "text/plain");
+        return false;
+    };
+
     // WS hub: agents say hello {type, app, token}; replies to commands come
     // back as {type:"result", id, ...}. Callbacks run on socket threads.
     g_agents.hub.onMessage = [dataDir](int clientId, const string& text) {
@@ -1120,10 +1223,57 @@ int cmdServe(const vector<string>& args) {
 
     httplib::Server svr;
 
+    // Login: token in, HttpOnly cookie out. The dashboard shows an overlay
+    // on any 401 and posts here.
+    svr.Post("/api/login", [dataDir](const httplib::Request& req, httplib::Response& res) {
+        Json body;
+        try {
+            body = Json::parse(req.body);
+        } catch (...) {
+            res.status = 400;
+            return;
+        }
+        string tok = body.value("token", "");
+        auto op = token::verifyOperator(dataDir.string(), tok);
+        if (!op) {
+            res.status = 401;
+            res.set_content("invalid token", "text/plain");
+            return;
+        }
+        res.set_header("Set-Cookie", "abtoken=" + tok +
+                       "; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000");
+        res.set_content(Json({{"name", op->name}, {"role", op->role}}).dump(),
+                        "application/json");
+    });
+
+    svr.Post("/api/logout", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Set-Cookie", "abtoken=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0");
+        res.set_content("ok", "text/plain");
+    });
+
+    // Who am I? Drives the login overlay and role-based UI hiding.
+    svr.Get("/api/me", [dataDir, cookieToken](const httplib::Request& req, httplib::Response& res) {
+        string d = dataDir.string();
+        if (!token::operatorsEnabled(d)) {
+            res.set_content(Json({{"open", true}}).dump(), "application/json");
+            return;
+        }
+        auto op = token::verifyOperator(d, cookieToken(req));
+        if (!op) {
+            res.status = 401;
+            res.set_content("unauthorized", "text/plain");
+            return;
+        }
+        res.set_content(Json({{"open", false}, {"name", op->name}, {"role", op->role}}).dump(),
+                        "application/json");
+    });
+
+
     // Dashboard -> agent command bridge. Blocks until the agent replies (or
     // 15s). Restart is handled by the supervisor itself; 'call' relays an MCP
     // tool call to the app (agent-side allowlist applies).
-    svr.Post(R"(/api/command/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
+    svr.Post(R"(/api/command/([^/]+))", [requireRole](const httplib::Request& req, httplib::Response& res) {
+        if (!requireRole(req, res, 2)) return;
         string id = req.matches[1];
         Json body;
         try {
@@ -1240,7 +1390,8 @@ int cmdServe(const vector<string>& args) {
         res.set_content("ok", "text/plain");
     });
 
-    svr.Get(R"(/api/image/([^/]+)/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
+    svr.Get(R"(/api/image/([^/]+)/([^/]+))", [requireRole](const httplib::Request& req, httplib::Response& res) {
+        if (!requireRole(req, res, 1)) return;
         string id = req.matches[1];
         string name = req.matches[2];
         lock_guard<mutex> lock(g_appsMutex);
@@ -1295,7 +1446,8 @@ int cmdServe(const vector<string>& args) {
     });
 
     // Log lines newer than ?after=<seq> (0 = everything buffered).
-    svr.Get(R"(/api/log/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
+    svr.Get(R"(/api/log/([^/]+))", [requireRole](const httplib::Request& req, httplib::Response& res) {
+        if (!requireRole(req, res, 1)) return;
         string id = req.matches[1];
         uint64_t after = 0;
         if (req.has_param("after")) {
@@ -1352,7 +1504,8 @@ int cmdServe(const vector<string>& args) {
     });
 
     // Alerts newer than ?after=<seq> (0 = everything buffered).
-    svr.Get(R"(/api/alert/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
+    svr.Get(R"(/api/alert/([^/]+))", [requireRole](const httplib::Request& req, httplib::Response& res) {
+        if (!requireRole(req, res, 1)) return;
         string id = req.matches[1];
         uint64_t after = 0;
         if (req.has_param("after")) {
@@ -1375,7 +1528,8 @@ int cmdServe(const vector<string>& args) {
 
     // Operator pressed Clear: acknowledged — the wall badge goes quiet. The
     // list itself (and the JSONL on disk) stays.
-    svr.Post(R"(/api/alert/([^/]+)/clear)", [](const httplib::Request& req, httplib::Response& res) {
+    svr.Post(R"(/api/alert/([^/]+)/clear)", [requireRole](const httplib::Request& req, httplib::Response& res) {
+        if (!requireRole(req, res, 2)) return;
         string id = req.matches[1];
         lock_guard<mutex> lock(g_appsMutex);
         auto it = g_apps.find(id);
@@ -1386,7 +1540,8 @@ int cmdServe(const vector<string>& args) {
     // Recent heartbeat history for the detail-view graphs: tail of today's
     // JSONL as a JSON array (raw line concatenation — every line is already
     // a JSON object). ~1200 entries = 1h at the default 3s poll.
-    svr.Get(R"(/api/history/([^/]+))", [dataDir](const httplib::Request& req, httplib::Response& res) {
+    svr.Get(R"(/api/history/([^/]+))", [dataDir, requireRole](const httplib::Request& req, httplib::Response& res) {
+        if (!requireRole(req, res, 1)) return;
         string id = req.matches[1];
         if (!validAppId(id)) { res.status = 400; return; }
         ifstream in(dataDir / id / ("heartbeat-" + getTimestampString("%Y-%m-%d") + ".jsonl"));
@@ -1406,7 +1561,8 @@ int cmdServe(const vector<string>& args) {
         res.set_content(body, "application/json");
     });
 
-    svr.Get("/api/apps", [](const httplib::Request&, httplib::Response& res) {
+    svr.Get("/api/apps", [requireRole](const httplib::Request& req, httplib::Response& res) {
+        if (!requireRole(req, res, 1)) return;
         Json list = Json::array();
         auto now = chrono::steady_clock::now();
         lock_guard<mutex> lock(g_appsMutex);
@@ -1425,7 +1581,8 @@ int cmdServe(const vector<string>& args) {
         res.set_content(list.dump(), "application/json");
     });
 
-    svr.Get(R"(/api/thumb/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
+    svr.Get(R"(/api/thumb/([^/]+))", [requireRole](const httplib::Request& req, httplib::Response& res) {
+        if (!requireRole(req, res, 1)) return;
         string id = req.matches[1];
         lock_guard<mutex> lock(g_appsMutex);
         auto it = g_apps.find(id);

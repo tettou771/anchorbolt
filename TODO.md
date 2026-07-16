@@ -9,11 +9,11 @@ templated webhook, at-least-once with per-sink queues; Windows start —
 real-hardware verified on a JP-locale box incl. remote update + rollback,
 CP932 dump crash fixed with dumpSafe, dual-stack serve.)
 
-## 1. Operator tokens + dashboard login
+## 1. Share URLs (deferred from operator tokens)
 
-viewer / operator / admin roles; share URLs = viewer-scoped tokens
-(+ optional password + expiry). Agent tokens stay publish-only.
-Admin lockout recovery = `reset-admin` on the server shell.
+A share link = viewer-scoped token in URL form (+ optional password +
+expiry). Operator tokens/login shipped; admin mint/revoke UI in the
+dashboard (CLI-only today) and `reset-admin` recovery verb also pending.
 
 ## 2. Fleet /mcp for AI
 
