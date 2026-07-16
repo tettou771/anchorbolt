@@ -39,3 +39,4 @@ Thumbs.db
 .env
 secrets.*
 *.url
+anchorbolt.token.json
