@@ -1,0 +1,53 @@
+# Compile check on the platforms the author can't build locally.
+# macOS is verified on the dev machine; Windows/Linux build here against
+# TrussC dev. CMakeLists.txt is gitignored (trusscli regenerates it), so the
+# job writes the same 5 lines trusscli would.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: TrussC-org/TrussC
+          ref: dev
+          path: trussc
+
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xorg-dev libgl1-mesa-dev libasound2-dev libudev-dev
+
+      - name: Generate CMakeLists
+        shell: bash
+        run: |
+          cat > CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.20)
+          project(anchorbolt)
+          include(${TRUSSC_DIR}/cmake/trussc_app.cmake)
+          trussc_app()
+          EOF
+
+      - name: Configure
+        shell: bash
+        run: |
+          TC="$(cd trussc/core && (pwd -W 2>/dev/null || pwd))"
+          cmake -B build-ci -DTRUSSC_DIR="$TC" -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        shell: bash
+        run: cmake --build build-ci --config Release --parallel 4

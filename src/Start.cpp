@@ -26,7 +26,17 @@
 #include <optional>
 #include <thread>
 
-#ifndef _WIN32
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#else
 #include <sys/wait.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -185,7 +195,14 @@ struct MachineMem {
 
 MachineMem machineMem() {
     MachineMem m;
-#if defined(__APPLE__)
+#if defined(_WIN32)
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof(ms);
+    if (GlobalMemoryStatusEx(&ms)) {
+        m.totalBytes = (int64_t)ms.ullTotalPhys;
+        m.availBytes = (int64_t)ms.ullAvailPhys;
+    }
+#elif defined(__APPLE__)
     int64_t total = 0;
     size_t len = sizeof(total);
     if (sysctlbyname("hw.memsize", &total, &len, nullptr, 0) == 0) m.totalBytes = total;
@@ -241,7 +258,12 @@ string machineMemNote() {
 #define pclose _pclose
 #endif
 
-string shellQuote(const string& s) {
+// Quote a path for the shell popen() runs commands in: cmd.exe wants double
+// quotes, /bin/sh gets the bulletproof single-quote form.
+string quotePath(const string& s) {
+#ifdef _WIN32
+    return "\"" + s + "\"";
+#else
     string out = "'";
     for (char c : s) {
         if (c == '\'') out += "'\\''";
@@ -249,13 +271,18 @@ string shellQuote(const string& s) {
     }
     out += "'";
     return out;
+#endif
 }
 
 // Current commit of the project (short hash), for the fleet dashboard —
 // "which venue runs which version" at a glance. Empty if not a git checkout.
 string gitHash(const string& projectDir) {
     if (projectDir.empty()) return "";
-    string cmd = "git -C " + shellQuote(projectDir) + " rev-parse --short HEAD 2>/dev/null";
+#ifdef _WIN32
+    string cmd = "git -C " + quotePath(projectDir) + " rev-parse --short HEAD 2>nul";
+#else
+    string cmd = "git -C " + quotePath(projectDir) + " rev-parse --short HEAD 2>/dev/null";
+#endif
     FILE* f = popen(cmd.c_str(), "r");
     if (!f) return "";
     char buf[64] = {};
@@ -288,23 +315,45 @@ string g_updateFailedAt;
 void startUpdateJob(const StartOptions& opt, const fs::path& logDir) {
     if (g_updateRunning.exchange(true)) return;
     thread([opt, logDir]() {
-#ifndef _WIN32
+#ifdef _WIN32
+        _putenv_s("GIT_TERMINAL_PROMPT", "0");  // never hang on a credential prompt
+#else
         setenv("GIT_TERMINAL_PROMPT", "0", 1);  // never hang on a credential prompt
 #endif
         eventLog(logDir, "[update] started (" + to_string(opt.updateCmds.size()) +
                          " steps in " + opt.projectDir + ")");
         string gitBefore = gitHash(opt.projectDir);
         // Keep the running binary for rollback BEFORE the build replaces it.
+        fs::path prev = opt.runPath + ".prev";
         error_code ec;
-        fs::copy_file(opt.runPath, opt.runPath + ".prev",
-                      fs::copy_options::overwrite_existing, ec);
+#ifdef _WIN32
+        // Windows write-locks a running exe but allows RENAME: moving the
+        // live binary aside both frees the path for the linker and doubles
+        // as the rollback backup. The running process keeps its image.
+        fs::remove(prev, ec);
+        ec.clear();
+        fs::rename(opt.runPath, prev, ec);
+        // Any exit below that leaves no new binary at runPath must put the
+        // live one back, or the next (re)spawn finds nothing to launch.
+        auto restoreIfMissing = [&]() {
+            error_code e2;
+            if (!fs::exists(opt.runPath, e2)) fs::rename(prev, opt.runPath, e2);
+        };
+#else
+        fs::copy_file(opt.runPath, prev, fs::copy_options::overwrite_existing, ec);
+        auto restoreIfMissing = []() {};
+#endif
         if (ec) eventLog(logDir, "[update] warning: binary backup failed: " + ec.message());
 
         bool ok = true;
         for (size_t i = 0; i < opt.updateCmds.size(); ++i) {
             const string& cmd = opt.updateCmds[i];
             eventLog(logDir, "[update] $ " + cmd);
-            string full = "cd " + shellQuote(opt.projectDir) + " && (" + cmd + ") 2>&1";
+#ifdef _WIN32
+            string full = "cd /d " + quotePath(opt.projectDir) + " && (" + cmd + ") 2>&1";
+#else
+            string full = "cd " + quotePath(opt.projectDir) + " && (" + cmd + ") 2>&1";
+#endif
             FILE* f = popen(full.c_str(), "r");
             if (!f) {
                 eventLog(logDir, "[update] FAILED to launch: " + cmd);
@@ -340,9 +389,21 @@ void startUpdateJob(const StartOptions& opt, const fs::path& logDir) {
                 if (!gitAfter.empty() && gitAfter == gitBefore && gitAfter != g_updateFailedAt) {
                     eventLog(logDir, "[update] already up to date (" + gitAfter +
                                      "); nothing to do, app keeps running");
+                    restoreIfMissing();
                     g_updateRunning = false;
                     return;
                 }
+            }
+        }
+        if (ok) {
+            error_code e2;
+            if (!fs::exists(opt.runPath, e2)) {
+                // A "successful" pipeline that produced no binary (custom
+                // pipeline oddity): nothing to restart onto.
+                eventLog(logDir, "[update] pipeline produced no binary at " + opt.runPath +
+                                 "; app keeps running");
+                restoreIfMissing();
+                ok = false;
             }
         }
         if (ok) {
@@ -352,6 +413,7 @@ void startUpdateJob(const StartOptions& opt, const fs::path& logDir) {
             g_restartRequested = true;
         } else {
             g_updateFailedAt = gitHash(opt.projectDir);
+            restoreIfMissing();
         }
         g_updateRunning = false;
     }).detach();
@@ -665,7 +727,16 @@ private:
                 reply["ok"] = false;
                 reply["error"] = "no previous binary kept (no update has run here)";
             } else {
+#ifdef _WIN32
+                // The running exe is write-locked but renameable: swap by
+                // moving it aside instead of copying over it.
+                error_code e2;
+                fs::remove(opt_.runPath + ".old", e2);
+                fs::rename(opt_.runPath, opt_.runPath + ".old", ec);
+                if (!ec) fs::rename(prev, opt_.runPath, ec);
+#else
                 fs::copy_file(prev, opt_.runPath, fs::copy_options::overwrite_existing, ec);
+#endif
                 if (ec) {
                     reply["ok"] = false;
                     reply["error"] = "restoring previous binary failed: " + ec.message();
@@ -800,6 +871,11 @@ fs::path resolveApp(fs::path input, vector<string>& tried) {
     if (fs::is_directory(input, ec)) {
         string name = input.filename().string();
         if (fs::path p = bundleBinary(input / "bin" / (name + ".app")); !p.empty()) return p;
+#ifdef _WIN32
+        fs::path exe = input / "bin" / (name + ".exe");
+        tried.push_back(exe.string());
+        if (fs::is_regular_file(exe, ec)) return exe;
+#endif
         fs::path flat = input / "bin" / name;
         tried.push_back(flat.string());
         if (fs::is_regular_file(flat, ec)) return flat;
@@ -896,11 +972,15 @@ bool loadConfig(const fs::path& path, StartOptions& opt) {
 // Platform-conventional log home (CWD-relative defaults break under
 // launchd/systemd, whose cwd is /). --log-dir / config log.dir override.
 fs::path platformLogDir(const string& appId) {
-    const char* home = getenv("HOME");
     fs::path base;
-#if defined(__APPLE__)
+#if defined(_WIN32)
+    const char* lad = getenv("LOCALAPPDATA");
+    base = fs::path(lad ? lad : ".") / "anchorbolt";
+#elif defined(__APPLE__)
+    const char* home = getenv("HOME");
     base = fs::path(home ? home : ".") / "Library" / "Logs" / "anchorbolt";
 #else
+    const char* home = getenv("HOME");
     const char* xdg = getenv("XDG_STATE_HOME");
     base = xdg ? fs::path(xdg) : fs::path(home ? home : ".") / ".local" / "state";
     base /= "anchorbolt";
@@ -941,14 +1021,43 @@ void pruneLogs(const fs::path& logDir, int keepDays,
     }
 }
 
-#ifndef _WIN32
-
 // Can we bind this port right now? Checks BOTH loopback stacks: the app's
 // server binds "localhost", which resolves to ::1 on some systems and
 // 127.0.0.1 on others — two apps once coexisted on one port by taking one
 // stack each, and health polls then reached a random one of them.
-// (SO_REUSEADDR matches how the app's own HTTP server binds, so TIME_WAIT
-// leftovers don't read as "busy".)
+// (POSIX: SO_REUSEADDR matches how the app's own HTTP server binds, so
+// TIME_WAIT leftovers don't read as "busy". Windows: SO_REUSEADDR would let
+// the probe bind OVER a live listener, so it stays off there.)
+#ifdef _WIN32
+
+bool portFree(int port) {
+    auto probe = [port](int family) -> bool {
+        SOCKET s = ::socket(family, SOCK_STREAM, 0);
+        if (s == INVALID_SOCKET) return true;  // stack unavailable -> not our problem
+        bool ok;
+        if (family == AF_INET) {
+            sockaddr_in a4{};
+            a4.sin_family = AF_INET;
+            a4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            a4.sin_port = htons((u_short)port);
+            ok = ::bind(s, (sockaddr*)&a4, sizeof(a4)) == 0;
+        } else {
+            int yes = 1;
+            setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, (const char*)&yes, sizeof(yes));
+            sockaddr_in6 a6{};
+            a6.sin6_family = AF_INET6;
+            a6.sin6_addr = in6addr_loopback;
+            a6.sin6_port = htons((u_short)port);
+            ok = ::bind(s, (sockaddr*)&a6, sizeof(a6)) == 0;
+        }
+        closesocket(s);
+        return ok;
+    };
+    return probe(AF_INET) && probe(AF_INET6);
+}
+
+#else
+
 bool portFree(int port) {
     int yes = 1;
 
@@ -979,6 +1088,8 @@ bool portFree(int port) {
     return true;
 }
 
+#endif
+
 // Default port taken (another anchorbolt on this machine) -> scan upward so
 // a second bare `anchorbolt start` just works. An EXPLICIT --port is a
 // contract: fail loudly instead of silently moving.
@@ -992,7 +1103,98 @@ int choosePort(const StartOptions& opt) {
     return -1;
 }
 
-pid_t spawnApp(const StartOptions& opt, const string& logFile) {
+// --- child process control (platform layer) -----------------------------------
+// Proc + spawnApp / pollExit / terminateApp / closeProc. The supervision loop
+// only sees these five names; everything OS-specific lives here.
+
+#ifdef _WIN32
+
+struct Proc {
+    HANDLE process = nullptr;
+    HANDLE job = nullptr;
+    DWORD  pid = 0;
+    bool valid() const { return process != nullptr; }
+};
+
+// CreateProcess with the ops env injected (children inherit our environment).
+// The child goes into a job object with KILL_ON_JOB_CLOSE, so the whole app
+// process tree dies with the supervisor — no orphaned fullscreen window left
+// on the venue machine if anchorbolt itself is killed.
+Proc spawnApp(const StartOptions& opt, const string& logFile) {
+    Proc p;
+    _putenv_s("TRUSSC_MCP", "1");
+    _putenv_s("TRUSSC_MCP_PORT", to_string(opt.port).c_str());
+    _putenv_s("TRUSSC_LOG_FILE", logFile.c_str());
+    string cmdLine = "\"" + opt.runPath + "\"";
+    for (const auto& a : opt.appArgs) cmdLine += " \"" + a + "\"";
+    vector<char> cl(cmdLine.begin(), cmdLine.end());
+    cl.push_back('\0');
+    STARTUPINFOA si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessA(opt.runPath.c_str(), cl.data(), nullptr, nullptr, FALSE,
+                        CREATE_SUSPENDED,  // join the job BEFORE it runs
+                        nullptr, opt.cwd.empty() ? nullptr : opt.cwd.c_str(),
+                        &si, &pi)) {
+        return p;  // invalid -> caller gives up (bad path is the usual cause)
+    }
+    p.job = CreateJobObjectA(nullptr, nullptr);
+    if (p.job) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION li{};
+        li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        SetInformationJobObject(p.job, JobObjectExtendedLimitInformation, &li, sizeof(li));
+        AssignProcessToJobObject(p.job, pi.hProcess);
+    }
+    ResumeThread(pi.hThread);
+    CloseHandle(pi.hThread);
+    p.process = pi.hProcess;
+    p.pid = pi.dwProcessId;
+    return p;
+}
+
+// Exited? Fills `how` for the event log; giveUp = unrecoverable, stop retrying.
+bool pollExit(Proc& p, string& how, bool& giveUp) {
+    if (WaitForSingleObject(p.process, 0) != WAIT_OBJECT_0) return false;
+    DWORD code = 0;
+    GetExitCodeProcess(p.process, &code);
+    how = "app exited (code " + to_string((unsigned long)code) + ")";
+    giveUp = false;
+    return true;
+}
+
+// WM_CLOSE to the app's top-level windows first (a clean quit request — the
+// sokol window handles it), then TerminateProcess. Windows has no SIGTERM.
+void terminateApp(Proc& p) {
+    struct Ctx { DWORD pid; };
+    Ctx ctx{p.pid};
+    EnumWindows([](HWND h, LPARAM lp) -> BOOL {
+        DWORD wpid = 0;
+        GetWindowThreadProcessId(h, &wpid);
+        if (wpid == ((Ctx*)lp)->pid) PostMessageA(h, WM_CLOSE, 0, 0);
+        return TRUE;
+    }, (LPARAM)&ctx);
+    if (WaitForSingleObject(p.process, 5000) != WAIT_OBJECT_0) {
+        logWarning("anchorbolt") << "app ignored WM_CLOSE for 5s; terminating";
+        TerminateProcess(p.process, 1);
+        WaitForSingleObject(p.process, 2000);
+    }
+}
+
+// Closing the job handle fires KILL_ON_JOB_CLOSE for any leftover children.
+void closeProc(Proc& p) {
+    if (p.process) CloseHandle(p.process);
+    if (p.job) CloseHandle(p.job);
+    p = Proc{};
+}
+
+#else  // POSIX
+
+struct Proc {
+    pid_t pid = -1;
+    bool valid() const { return pid > 0; }
+};
+
+Proc spawnApp(const StartOptions& opt, const string& logFile) {
     pid_t pid = fork();
     if (pid == 0) {
         if (!opt.cwd.empty() && chdir(opt.cwd.c_str()) != 0) _exit(126);
@@ -1006,32 +1208,59 @@ pid_t spawnApp(const StartOptions& opt, const string& logFile) {
         execv(opt.runPath.c_str(), argv.data());
         _exit(127);  // exec failed
     }
-    return pid;
+    return Proc{pid};
+}
+
+// Exited? Fills `how` for the event log; giveUp = exec failure (bad path) —
+// retrying would fail forever.
+bool pollExit(Proc& p, string& how, bool& giveUp) {
+    int st = 0;
+    if (waitpid(p.pid, &st, WNOHANG) != p.pid) return false;
+    giveUp = false;
+    if (WIFEXITED(st)) {
+        int code = WEXITSTATUS(st);
+        if (code == 127) {
+            how = "app failed to exec (bad path?)";
+            giveUp = true;
+        } else {
+            how = "app exited (code " + to_string(code) + ")";
+        }
+    } else if (WIFSIGNALED(st)) {
+        how = "app killed by signal " + to_string(WTERMSIG(st));
+    } else {
+        how = "app stopped unexpectedly";
+    }
+    return true;
 }
 
 // SIGTERM with a 5s window for a clean shutdown, then SIGKILL. Reaps the child.
-void terminateApp(pid_t pid) {
-    kill(pid, SIGTERM);
+void terminateApp(Proc& p) {
+    kill(p.pid, SIGTERM);
     for (int i = 0; i < 50; ++i) {
         int st = 0;
-        if (waitpid(pid, &st, WNOHANG) == pid) return;
+        if (waitpid(p.pid, &st, WNOHANG) == p.pid) return;
         this_thread::sleep_for(chrono::milliseconds(100));
     }
     logWarning("anchorbolt") << "app ignored SIGTERM for 5s; sending SIGKILL";
-    kill(pid, SIGKILL);
+    kill(p.pid, SIGKILL);
     int st = 0;
-    waitpid(pid, &st, 0);
+    waitpid(p.pid, &st, 0);
 }
 
-#endif // !_WIN32
+void closeProc(Proc&) {}
+
+#endif // platform layer
 
 } // namespace
 
 int cmdStart(const vector<string>& args) {
 #ifdef _WIN32
-    cerr << "anchorbolt start: Windows support is not implemented yet" << endl;
-    return 1;
-#else
+    // Raw port probes may run before any library socket use.
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+    // Console close / logoff / shutdown all funnel into the same clean stop.
+    SetConsoleCtrlHandler([](DWORD) -> BOOL { g_stop = true; return TRUE; }, TRUE);
+#endif
     StartOptions opt;
 
     // Pre-pass: config file loads first so flags override it. Explicit
@@ -1174,15 +1403,22 @@ int cmdStart(const vector<string>& args) {
         // update-restart, and it's the run AFTER that restart being audited.
         bool audit = g_updateVerify.exchange(false);
 
-        pid_t pid = spawnApp(opt, logFile);
-        if (pid < 0) {
+        Proc proc = spawnApp(opt, logFile);
+        if (!proc.valid()) {
+#ifdef _WIN32
+            // CreateProcess fails synchronously — almost always a bad path.
+            logError("anchorbolt") << "app failed to launch (bad path?); giving up";
+            eventLog(logDir, "app failed to launch; giving up");
+            return 1;
+#else
             logError("anchorbolt") << "fork failed; retrying in 5s";
             eventLog(logDir, "fork failed; retrying in 5s");
             sleepChecked(5);
             continue;
+#endif
         }
-        logNotice("anchorbolt") << "app launched (pid " << pid << ")";
-        eventLog(logDir, "app launched (pid " + to_string(pid) + ")");
+        logNotice("anchorbolt") << "app launched (pid " << proc.pid << ")";
+        eventLog(logDir, "app launched (pid " + to_string(proc.pid) + ")");
 
         httplib::Client cli("localhost", opt.port);
         cli.set_connection_timeout(2, 0);
@@ -1200,22 +1436,18 @@ int cmdStart(const vector<string>& args) {
 
         while (!g_stop) {
             // Process exit?
-            int st = 0;
-            if (waitpid(pid, &st, WNOHANG) == pid) {
+            string how;
+            bool giveUp = false;
+            if (pollExit(proc, how, giveUp)) {
                 childAlive = false;
-                if (WIFEXITED(st)) {
-                    int code = WEXITSTATUS(st);
-                    if (code == 127) {
-                        logError("anchorbolt") << "app failed to exec (bad path?); giving up";
-                        eventLog(logDir, "app failed to exec; giving up");
-                        return 1;
-                    }
-                    logWarning("anchorbolt") << "app exited (code " << code << ")";
-                    eventLog(logDir, "app exited (code " + to_string(code) + ", " + machineMemNote() + ")");
-                } else if (WIFSIGNALED(st)) {
-                    logWarning("anchorbolt") << "app killed by signal " << WTERMSIG(st);
-                    eventLog(logDir, "app killed by signal " + to_string(WTERMSIG(st)) + " (" + machineMemNote() + ")");
+                if (giveUp) {
+                    logError("anchorbolt") << how << "; giving up";
+                    eventLog(logDir, how + "; giving up");
+                    closeProc(proc);
+                    return 1;
                 }
+                logWarning("anchorbolt") << how;
+                eventLog(logDir, how + " (" + machineMemNote() + ")");
                 break;
             }
 
@@ -1237,7 +1469,7 @@ int cmdStart(const vector<string>& args) {
             if (g_restartRequested.exchange(false)) {
                 logNotice("anchorbolt") << "remote restart requested";
                 eventLog(logDir, "remote restart requested; terminating app");
-                terminateApp(pid);
+                terminateApp(proc);
                 childAlive = false;
                 break;
             }
@@ -1252,13 +1484,13 @@ int cmdStart(const vector<string>& args) {
                 // Confirm the reply is from OUR child — on a shared port a
                 // stale or foreign app could answer and mask a dead child.
                 int64_t hpid = h->value("pid", (int64_t)0);
-                if (hpid != 0 && hpid != (int64_t)pid) {
+                if (hpid != 0 && hpid != (int64_t)proc.pid) {
                     if (!pidWarned) {
                         pidWarned = true;
                         logError("anchorbolt") << "health answered by pid " << hpid
-                                               << ", expected " << pid << " (port collision?)";
+                                               << ", expected " << proc.pid << " (port collision?)";
                         eventLog(logDir, "health answered by pid " + to_string(hpid) +
-                                         ", expected " + to_string(pid) + " (port collision?)");
+                                         ", expected " + to_string(proc.pid) + " (port collision?)");
                     }
                     h.reset();  // our app is unobservable -> counts as a miss
                 }
@@ -1341,7 +1573,7 @@ int cmdStart(const vector<string>& args) {
                         logError("anchorbolt") << "app unresponsive; restarting";
                         eventLog(logDir, "app unresponsive for " + to_string(silentSec) +
                                          "s; terminating (" + machineMemNote() + ")");
-                        terminateApp(pid);
+                        terminateApp(proc);
                         childAlive = false;
                         break;
                     }
@@ -1350,9 +1582,11 @@ int cmdStart(const vector<string>& args) {
         }
 
         if (g_stop) {
-            if (childAlive) terminateApp(pid);
+            if (childAlive) terminateApp(proc);
+            closeProc(proc);
             break;
         }
+        closeProc(proc);
 
         // First run after an update must prove itself: with the watchdog on,
         // "never became healthy" fails the audition; without MCP, dying
@@ -1390,5 +1624,4 @@ int cmdStart(const vector<string>& args) {
     if (push && (appShip.dirty() || supShip.dirty())) saveCursorNow();
     if (channel) channel->shutdown();
     return 0;
-#endif
 }
