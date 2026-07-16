@@ -468,6 +468,18 @@ public:
         report(res && res->status == 200, "image");
     }
 
+    // Supervisor/app event for the dashboard (badge + event list). Best-effort
+    // one-shot: the same information also reaches the server through the
+    // cursor-spooled logs, so a miss here is cosmetic.
+    void alert(const string& event, const string& text) {
+        Json body = {{"alerts", Json::array({Json{
+            {"at", getTimestampString("%Y-%m-%dT%H:%M:%S")},
+            {"event", event},
+            {"text", text}}})}};
+        auto res = cli_.Post("/api/alert/" + appId_, body.dump(), "application/json");
+        report(res && res->status == 200, "alert");
+    }
+
     // src is "app" (the app's TRUSSC_LOG_FILE) or "sup" (supervisor events).
     // Returns delivery success — the shipper's cursor advances only on true.
     bool logs(const string& src, const LogBatch& b) {
@@ -1329,6 +1341,12 @@ int cmdStart(const vector<string>& args) {
     }
     optional<ServerPush> push;
     optional<CommandChannel> channel;
+    // ONE event stream, two audiences: the notification sinks (Slack etc.)
+    // and the fleet dashboard (wall badge + event list) get the same events.
+    auto fireEvent = [&](const string& ev, const string& msg) {
+        if (notifier) notifier->notify(ev, msg);
+        if (push) push->alert(ev, msg);
+    };
     if (!opt.serverUrl.empty()) {
         push.emplace(opt.serverUrl, opt.appId, opt.token);
         channel.emplace(opt, logDir);
@@ -1422,10 +1440,8 @@ int cmdStart(const vector<string>& args) {
             // CreateProcess fails synchronously — almost always a bad path.
             logError("anchorbolt") << "app failed to launch (bad path?); giving up";
             eventLog(logDir, "app failed to launch; giving up");
-            if (notifier) {
-                notifier->notify("down", "app failed to launch; giving up");
-                notifier->flushAndStop();
-            }
+            fireEvent("down", "app failed to launch; giving up");
+            if (notifier) notifier->flushAndStop();
             return 1;
 #else
             logError("anchorbolt") << "fork failed; retrying in 5s";
@@ -1450,6 +1466,11 @@ int cmdStart(const vector<string>& args) {
         bool statusChecked = false;   // tools/list probed for optional conventions
         bool hasStatus = false;
         bool hasAlerts = false;
+        // Why this run ended. The "restart" event fires at the actual respawn
+        // (not at detection): when an OS shutdown kills the app before us,
+        // g_stop arrives during the pre-respawn pause and no phantom incident
+        // is recorded — a normal power-off leaves only a quiet "stop".
+        string restartReason;
         vector<string> imageNames;    // statusImage names from the last status
 
         while (!g_stop) {
@@ -1461,16 +1482,14 @@ int cmdStart(const vector<string>& args) {
                 if (giveUp) {
                     logError("anchorbolt") << how << "; giving up";
                     eventLog(logDir, how + "; giving up");
-                    if (notifier) {
-                        notifier->notify("down", how + "; giving up");
-                        notifier->flushAndStop();
-                    }
+                    fireEvent("down", how + "; giving up");
+                    if (notifier) notifier->flushAndStop();
                     closeProc(proc);
                     return 1;
                 }
                 logWarning("anchorbolt") << how;
                 eventLog(logDir, how + " (" + machineMemNote() + ")");
-                if (notifier) notifier->notify("restart", how + "; restarting (" + machineMemNote() + ")");
+                restartReason = how + " (" + machineMemNote() + ")";
                 break;
             }
 
@@ -1492,7 +1511,7 @@ int cmdStart(const vector<string>& args) {
             if (g_restartRequested.exchange(false)) {
                 logNotice("anchorbolt") << "remote restart requested";
                 eventLog(logDir, "remote restart requested; terminating app");
-                if (notifier) notifier->notify("restart", "remote restart requested");
+                restartReason = "remote restart requested";
                 terminateApp(proc);
                 childAlive = false;
                 break;
@@ -1528,17 +1547,17 @@ int cmdStart(const vector<string>& args) {
                                        << (*h).value("fps", 0.0f) << ", "
                                        << (*h).value("width", 0) << "x" << (*h).value("height", 0) << ")";
                     eventLog(logDir, "app healthy");
-                    if (notifier && restarts > 0) {
-                        notifier->notify("up", "app healthy again (pid " +
-                                               to_string(proc.pid) + ", restart #" +
-                                               to_string(restarts) + ")");
+                    if (restarts > 0) {
+                        fireEvent("up", "app healthy again (pid " +
+                                        to_string(proc.pid) + ", restart #" +
+                                        to_string(restarts) + ")");
                     }
                     if (audit) {
                         audit = false;
                         string vmsg = "update verified: app healthy on the new binary" +
                                       (appGit.empty() ? "" : " (" + appGit + ")");
                         eventLog(logDir, "[update] " + vmsg);
-                        if (notifier) notifier->notify("update", vmsg);
+                        fireEvent("update", vmsg);
                     }
                 }
                 // Probe tools/list once per app run: which of the optional
@@ -1556,11 +1575,11 @@ int cmdStart(const vector<string>& args) {
                 }
                 // App-raised operator alerts (mcp::alert) -> sinks. Drain on
                 // the health cadence; the tool clears what it returns.
-                if (notifier && hasAlerts) {
+                if ((notifier || push) && hasAlerts) {
                     if (auto a = callTool(cli, "tc_get_alerts")) {
                         for (auto& al : a->value("alerts", Json::array())) {
                             string text = al.value("text", "");
-                            if (!text.empty()) notifier->notify("alert", text);
+                            if (!text.empty()) fireEvent("alert", text);
                         }
                     }
                 }
@@ -1615,11 +1634,8 @@ int cmdStart(const vector<string>& args) {
                         logError("anchorbolt") << "app unresponsive; restarting";
                         eventLog(logDir, "app unresponsive for " + to_string(silentSec) +
                                          "s; terminating (" + machineMemNote() + ")");
-                        if (notifier) {
-                            notifier->notify("restart", "app unresponsive for " +
-                                             to_string(silentSec) + "s; restarting (" +
-                                             machineMemNote() + ")");
-                        }
+                        restartReason = "app unresponsive for " + to_string(silentSec) +
+                                        "s (" + machineMemNote() + ")";
                         terminateApp(proc);
                         childAlive = false;
                         break;
@@ -1652,10 +1668,10 @@ int cmdStart(const vector<string>& args) {
                         ? "rollback FAILED: " + ec.message()
                         : "rolling back: the new binary never became healthy; previous binary restored";
                     eventLog(logDir, "[update] " + rmsg);
-                    if (notifier) notifier->notify("update", rmsg);
+                    fireEvent("update", rmsg);
                 } else {
                     eventLog(logDir, "[update] rollback impossible: no previous binary kept");
-                    if (notifier) notifier->notify("update", "rollback impossible: no previous binary kept");
+                    fireEvent("update", "rollback impossible: no previous binary kept");
                 }
             }
         }
@@ -1664,12 +1680,20 @@ int cmdStart(const vector<string>& args) {
         logNotice("anchorbolt") << "restarting app (#" << restarts << ") in 2s";
         eventLog(logDir, "restarting app (#" + to_string(restarts) + ")");
         sleepChecked(2);
+        // Fire only if we are actually going to respawn — if g_stop arrived
+        // during the pause (OS shutdown killed the app first), this was never
+        // an incident and only the "stop" event goes out.
+        if (!g_stop) {
+            fireEvent("restart", restartReason.empty()
+                ? "restarting (#" + to_string(restarts) + ")"
+                : restartReason + " — restarting (#" + to_string(restarts) + ")");
+        }
     }
 
     logNotice("anchorbolt") << "anchorbolt stopped (restarts: " << restarts << ")";
     eventLog(logDir, "anchorbolt stopped (restarts: " + to_string(restarts) + ")");
+    fireEvent("stop", "anchorbolt stopped (restarts: " + to_string(restarts) + ")");
     if (notifier) {
-        notifier->notify("stop", "anchorbolt stopped (restarts: " + to_string(restarts) + ")");
         notifier->flushAndStop();
         g_notifier.reset();
     }

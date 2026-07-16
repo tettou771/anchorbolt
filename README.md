@@ -145,6 +145,14 @@ to by `tokenFile`, or in the `ANCHORBOLT_TOKEN` env var.
   venue's local policy — deletions never propagate): stored JSONL and
   images older than the cutoff are pruned hourly; thumbnails older than
   24h are additionally thinned to one per hour
+- **incident badge + event list**: every venue event (`restart` / `up` /
+  `down` / `update` / `stop` / `alert`) lands in a per-app event list in
+  the detail view, and incidents (`restart` / `down` / `alert`) light a
+  red badge on the wall card until an operator presses Clear — "Osaka
+  restarted 3 times overnight" is visible at a glance the next morning.
+  The `restart` event fires at the actual respawn, not at exit detection,
+  so an OS shutdown that kills the app before the supervisor records only
+  a quiet `stop`, never a phantom incident
 - **remote control** (agent keeps one outbound WebSocket, NAT-friendly):
   the detail view shows a live/offline chip, Update / Roll back / Restart
   buttons, and a tool console that relays MCP tool calls to the app.

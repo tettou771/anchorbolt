@@ -70,6 +70,9 @@ struct AppState {
     deque<LogLine> logs;                            // ring buffer, newest last
     uint64_t nextLogSeq = 1;
     map<string, pair<string, int64_t>> logSeen;     // src -> (file, acked end offset)
+    deque<LogLine> alerts;                          // app-raised operator alerts
+    uint64_t nextAlertSeq = 1;
+    int unackedAlerts = 0;                          // wall badge; Clear resets
 };
 
 constexpr size_t kLogRingSize = 500;
@@ -199,6 +202,7 @@ void pruneData(const fs::path& dataDir, int keepDays) {
                 size_t ps = 0;
                 if (n.rfind("heartbeat-", 0) == 0) ps = 10;
                 else if (n.rfind("log-", 0) == 0) ps = 4;
+                else if (n.rfind("alert-", 0) == 0) ps = 6;
                 else continue;
                 if (n.size() < ps + 10 + 6 || n.compare(n.size() - 6, 6, ".jsonl") != 0) continue;
                 if (n.compare(ps, 10, dropDate) < 0) {
@@ -287,6 +291,26 @@ const char* kDashboardHtml = R"HTML(<!DOCTYPE html>
                 white-space: nowrap; }
   .meta .stats { color: #7d838e; font-size: 12px; white-space: nowrap;
                  overflow: hidden; text-overflow: ellipsis; }
+  .abadge { background: #4a1d1d; color: #ff8a80; border: 1px solid #7a3030;
+            border-radius: 10px; font-size: 11px; padding: 0 8px; flex: none;
+            margin-left: 6px; }
+  #dEvWrap { background: #101216; border: 1px solid #262b34; border-radius: 8px; }
+  #dEvHead { display: flex; align-items: center; gap: 10px; padding: 8px 12px;
+             border-bottom: 1px solid #21252d; }
+  #dEvHead .glabel { font-size: 12px; color: #9aa3b2; flex: 1; }
+  #dAckBtn { background: #191c22; color: #9aa3b2; border: 1px solid #2a2e36;
+             border-radius: 5px; font-size: 12px; padding: 2px 12px; cursor: pointer; }
+  #dAckBtn:hover { color: #d4d7dd; }
+  #dEvents { max-height: 180px; overflow-y: auto; padding: 6px 0;
+             font: 12px/1.6 ui-monospace, "SF Mono", Menlo, monospace; }
+  #dEvents .ev { padding: 0 12px; white-space: pre-wrap; word-break: break-all; }
+  #dEvents .ev .lt { color: #565c66; margin-right: 8px; }
+  #dEvents .ev .tag { display: inline-block; min-width: 52px; margin-right: 8px;
+                      font-weight: 600; }
+  .ev-restart .tag, .ev-down .tag, .ev-alert .tag { color: #ff8a80; }
+  .ev-up .tag     { color: #4ecb71; }
+  .ev-update .tag { color: #79b8ff; }
+  .ev-stop .tag   { color: #8d939e; }
   .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
          margin-right: 6px; background: #3fb950; vertical-align: baseline;
          flex: none; }
@@ -411,6 +435,13 @@ const char* kDashboardHtml = R"HTML(<!DOCTYPE html>
     <div class="dbody">
       <div id="dThumbWrap"><img hidden></div>
       <div id="dValues"></div>
+      <div id="dEvWrap" hidden>
+        <div id="dEvHead">
+          <span class="glabel">events</span>
+          <button id="dAckBtn" title="acknowledge — clears the wall badge">Clear</button>
+        </div>
+        <div id="dEvents"></div>
+      </div>
       <div id="dGraphs"></div>
       <div id="dImages"></div>
       <div id="dLogWrap">
@@ -463,7 +494,7 @@ function card(app) {
   el.innerHTML = `
     <div class="thumbWrap"><span class="none">no thumbnail</span><img hidden></div>
     <div class="meta">
-      <span class="name"><span class="dot"></span><span class="label"></span></span>
+      <span class="name"><span class="dot"></span><span class="label"></span><span class="abadge" hidden></span></span>
       <span class="stats"></span>
     </div>`;
   el.addEventListener('click', () => openDetail(app.id));
@@ -476,6 +507,9 @@ function openDetail(id) {
   detailId = id;
   dThumbSeq = -1;
   logCursor = 0;
+  evCursor = 0;
+  document.getElementById('dEvWrap').hidden = true;
+  document.getElementById('dEvents').replaceChildren();
   document.getElementById('dImages').replaceChildren();
   document.getElementById('dLog').replaceChildren(
     Object.assign(document.createElement('div'), {className: 'empty', textContent: 'no log lines yet'}));
@@ -667,6 +701,7 @@ async function renderDetail() {
   syncImages(app);
 
   await pollLog(app.id);
+  await pollEvents(app.id);
 
   // Graphs: fps + memory + every mode=graph custom value
   let hist = [];
@@ -811,7 +846,45 @@ document.getElementById('dRun').addEventListener('click', async () => {
 });
 
 )HTML"
-R"HTML(// ---- log panel ----
+R"HTML(// ---- event list (supervisor + app alerts) ----
+
+let evCursor = 0;
+
+async function pollEvents(id) {
+  let r;
+  try {
+    r = await (await fetch('/api/alert/' + encodeURIComponent(id) + '?after=' + evCursor)).json();
+  } catch { return; }
+  if (detailId !== id) return;
+  evCursor = r.next;
+  if (!r.alerts.length) return;
+  document.getElementById('dEvWrap').hidden = false;
+  const box = document.getElementById('dEvents');
+  for (const a of r.alerts) {
+    const el = document.createElement('div');
+    el.className = 'ev ev-' + a.event;
+    const t = document.createElement('span');
+    t.className = 'lt';
+    t.textContent = (a.at || '').replace('T', ' ');
+    const tag = document.createElement('span');
+    tag.className = 'tag';
+    tag.textContent = a.event;
+    el.appendChild(t);
+    el.appendChild(tag);
+    el.appendChild(document.createTextNode(a.text));
+    box.prepend(el);            // newest on top
+  }
+  while (box.children.length > 100) box.lastChild.remove();
+}
+
+document.getElementById('dAckBtn').addEventListener('click', async () => {
+  if (!detailId) return;
+  try {
+    await fetch('/api/alert/' + encodeURIComponent(detailId) + '/clear', { method: 'POST' });
+  } catch {}
+});
+
+// ---- log panel ----
 
 let logCursor = 0;
 
@@ -906,6 +979,9 @@ async function refresh() {
     el.classList.toggle('stale', app.ageSec > STALE_SEC);
     el.querySelector('.label').textContent = app.id;
     el.querySelector('.stats').textContent = statsLine(app);
+    const badge = el.querySelector('.abadge');
+    badge.hidden = !(app.alerts > 0);
+    if (app.alerts > 0) badge.textContent = '\u26a0 ' + app.alerts;
 
     if (app.thumbSeq > 0 && seq[app.id] !== app.thumbSeq) {
       seq[app.id] = app.thumbSeq;
@@ -1214,6 +1290,74 @@ int cmdServe(const vector<string>& args) {
         res.set_content(Json({{"next", next}, {"lines", lines}}).dump(), "application/json");
     });
 
+    // Agent push: app-raised operator alerts (mcp::alert, drained from
+    // tc_get_alerts). Stored like logs, but surfaced loudly: wall badge +
+    // dedicated list in the detail view.
+    svr.Post(R"(/api/alert/([^/]+))", [dataDir, authOk](const httplib::Request& req, httplib::Response& res) {
+        string id = req.matches[1];
+        if (!validAppId(id)) { res.status = 400; return; }
+        if (!authOk(req, id)) { res.status = 401; res.set_content("unauthorized", "text/plain"); return; }
+        Json body;
+        try {
+            body = Json::parse(req.body);
+        } catch (...) {
+            res.status = 400;
+            return;
+        }
+        fs::path dir = dataDir / id;
+        error_code ec;
+        fs::create_directories(dir, ec);
+        ofstream out(dir / ("alert-" + getTimestampString("%Y-%m-%d") + ".jsonl"), ios::app);
+        string now = getTimestampString("%H:%M:%S");
+        lock_guard<mutex> lock(g_appsMutex);
+        auto& st = g_apps[id];
+        for (auto& a : body.value("alerts", Json::array())) {
+            // LogLine.src carries the event type (restart/up/down/update/
+            // stop/alert). Only incidents bump the wall badge — recoveries
+            // and clean stops are list-only, or a normal day would glow red.
+            string ev = a.value("event", "alert");
+            LogLine line{st.nextAlertSeq++, a.value("at", now), ev, a.value("text", "")};
+            if (line.text.empty()) continue;
+            out << Json({{"at", line.at}, {"event", ev}, {"text", line.text}}).dump() << "\n";
+            st.alerts.push_back(std::move(line));
+            if (st.alerts.size() > 100) st.alerts.pop_front();
+            if (ev == "restart" || ev == "down" || ev == "alert") ++st.unackedAlerts;
+        }
+        res.set_content("ok", "text/plain");
+    });
+
+    // Alerts newer than ?after=<seq> (0 = everything buffered).
+    svr.Get(R"(/api/alert/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
+        string id = req.matches[1];
+        uint64_t after = 0;
+        if (req.has_param("after")) {
+            try { after = stoull(req.get_param_value("after")); } catch (...) {}
+        }
+        Json lines = Json::array();
+        uint64_t next = after;
+        lock_guard<mutex> lock(g_appsMutex);
+        auto it = g_apps.find(id);
+        if (it != g_apps.end()) {
+            for (const auto& a : it->second.alerts) {
+                if (a.seq <= after) continue;
+                lines.push_back({{"seq", a.seq}, {"at", a.at},
+                                 {"event", a.src}, {"text", a.text}});
+                next = a.seq;
+            }
+        }
+        res.set_content(Json({{"next", next}, {"alerts", lines}}).dump(), "application/json");
+    });
+
+    // Operator pressed Clear: acknowledged — the wall badge goes quiet. The
+    // list itself (and the JSONL on disk) stays.
+    svr.Post(R"(/api/alert/([^/]+)/clear)", [](const httplib::Request& req, httplib::Response& res) {
+        string id = req.matches[1];
+        lock_guard<mutex> lock(g_appsMutex);
+        auto it = g_apps.find(id);
+        if (it != g_apps.end()) it->second.unackedAlerts = 0;
+        res.set_content("ok", "text/plain");
+    });
+
     // Recent heartbeat history for the detail-view graphs: tail of today's
     // JSONL as a JSON array (raw line concatenation — every line is already
     // a JSON object). ~1200 entries = 1h at the default 3s poll.
@@ -1250,6 +1394,7 @@ int cmdServe(const vector<string>& args) {
                             {"thumbSeq", st.thumbSeq},
                             {"images", images},
                             {"live", g_agents.live(id)},
+                            {"alerts", st.unackedAlerts},
                             {"health", st.health}});
         }
         res.set_content(list.dump(), "application/json");
