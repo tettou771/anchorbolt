@@ -70,7 +70,11 @@ anchorbolt serve
   app restarts onto the new binary; the previous one is kept as
   `<binary>.prev`, and if the new binary doesn't become healthy on its
   first run it is rolled back automatically. A Roll back button restores
-  `.prev` manually. The agent also reports the project's git commit on
+  `.prev` manually. If the pull brings nothing new, the remaining steps
+  are skipped and the app is left untouched — pressing Update "just in
+  case" is free (custom pipelines always run fully and restart; a retry
+  after a failed attempt also runs fully, so transient build failures
+  stay retryable). The agent also reports the project's git commit on
   every heartbeat, so the wall shows which venue runs which version
 
 Flags: see `anchorbolt --help`. Precedence: flags > `ANCHORBOLT_TOKEN` env >

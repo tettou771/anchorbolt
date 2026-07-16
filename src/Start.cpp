@@ -63,6 +63,7 @@ struct StartOptions {
     int    wsPort = 0;           // command channel port (0 = server port + 1)
     bool   allowControl = false; // let the server relay MUTATING tools
     bool   allowUpdate = false;  // let the server trigger the update pipeline
+    bool   updateCustom = false; // config overrode the pipeline (no smart skip)
     vector<string> updateCmds = {// remote-update pipeline, run in projectDir;
         "git pull --ff-only",    // override with the config "update" array
         "trusscli update",       // (e.g. prepend "trusscli upgrade" to also
@@ -275,6 +276,12 @@ string deriveProjectDir(const fs::path& runPath, const string& cwd) {
     return cwd;
 }
 
+// A pipeline that failed remembers the commit it failed AT: a retry on the
+// same commit must not be short-circuited by the "already up to date" skip,
+// or a transient build failure (disk full etc.) could never be retried.
+// Single writer: only one update thread runs at a time (g_updateRunning).
+string g_updateFailedAt;
+
 // Runs detached: pipeline output streams into the supervisor event log line
 // by line (prefixed "[update]"), which the log push forwards live — the
 // dashboard's log panel doubles as the build console.
@@ -286,6 +293,7 @@ void startUpdateJob(const StartOptions& opt, const fs::path& logDir) {
 #endif
         eventLog(logDir, "[update] started (" + to_string(opt.updateCmds.size()) +
                          " steps in " + opt.projectDir + ")");
+        string gitBefore = gitHash(opt.projectDir);
         // Keep the running binary for rollback BEFORE the build replaces it.
         error_code ec;
         fs::copy_file(opt.runPath, opt.runPath + ".prev",
@@ -293,7 +301,8 @@ void startUpdateJob(const StartOptions& opt, const fs::path& logDir) {
         if (ec) eventLog(logDir, "[update] warning: binary backup failed: " + ec.message());
 
         bool ok = true;
-        for (const auto& cmd : opt.updateCmds) {
+        for (size_t i = 0; i < opt.updateCmds.size(); ++i) {
+            const string& cmd = opt.updateCmds[i];
             eventLog(logDir, "[update] $ " + cmd);
             string full = "cd " + shellQuote(opt.projectDir) + " && (" + cmd + ") 2>&1";
             FILE* f = popen(full.c_str(), "r");
@@ -321,11 +330,28 @@ void startUpdateJob(const StartOptions& opt, const fs::path& logDir) {
                 ok = false;
                 break;
             }
+            // Smart skip, DEFAULT pipeline only (there step 1 IS the pull; a
+            // custom pipeline makes no such promise, so it always runs fully
+            // and restarts): if the pull brought nothing new, stop here —
+            // no regeneration, no rebuild, no restart. Pressing Update "just
+            // in case" costs seconds and touches nothing.
+            if (i == 0 && !opt.updateCustom) {
+                string gitAfter = gitHash(opt.projectDir);
+                if (!gitAfter.empty() && gitAfter == gitBefore && gitAfter != g_updateFailedAt) {
+                    eventLog(logDir, "[update] already up to date (" + gitAfter +
+                                     "); nothing to do, app keeps running");
+                    g_updateRunning = false;
+                    return;
+                }
+            }
         }
         if (ok) {
+            g_updateFailedAt.clear();
             eventLog(logDir, "[update] pipeline succeeded; restarting onto the new binary");
             g_updateVerify = true;
             g_restartRequested = true;
+        } else {
+            g_updateFailedAt = gitHash(opt.projectDir);
         }
         g_updateRunning = false;
     }).detach();
@@ -835,6 +861,7 @@ bool loadConfig(const fs::path& path, StartOptions& opt) {
     if (c.contains("update") && c["update"].is_array()) {
         opt.updateCmds.clear();
         for (auto& u : c["update"]) opt.updateCmds.push_back(u.get<string>());
+        opt.updateCustom = true;
     }
     opt.graceSec  = c.value("grace", opt.graceSec);
     opt.watchdogTimeoutSec = c.value("watchdogTimeout", opt.watchdogTimeoutSec);
