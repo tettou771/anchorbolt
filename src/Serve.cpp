@@ -852,10 +852,6 @@ R"HTML(
   #gearBtn { background: none; border: 1px solid #2a2e36; color: #7d838e;
              border-radius: 5px; font-size: 13px; padding: 2px 9px; cursor: pointer; }
   #gearBtn:hover { color: #d4d7dd; }
-  #loginCode { background: #1e2128; border: 1px solid #2a2e36; border-radius: 6px;
-               color: #d4d7dd; padding: 9px 12px; font-size: 14px; outline: none; }
-  #loginCode:focus { border-color: #3d4450; }
-  #loginOr { color: #565c66; font-size: 12px; text-align: center; }
 
   /* ---- settings overlay (admin) ---- */
   #settings { position: fixed; inset: 0; background: rgba(10,11,14,.75);
@@ -904,10 +900,7 @@ R"HTML(
 <div id="login" hidden>
   <div id="loginBox">
     <h2>AnchorBolt</h2>
-    <input id="loginTok" type="password" placeholder="operator token (op-...)" autocomplete="off">
-    <div id="loginOr">or</div>
-    <input id="loginCode" type="text" inputmode="numeric" maxlength="6"
-           placeholder="6-digit login code" autocomplete="off">
+    <input id="loginTok" type="password" placeholder="operator token or 6-digit code" autocomplete="off">
     <button id="loginBtn">Sign in</button>
     <div id="loginErr"></div>
   </div>
@@ -1014,26 +1007,18 @@ function showLogin() {
 }
 
 async function doLogin() {
-  // One overlay, two credentials: a 6-digit code posts to the login-code path
-  // (mints a session), anything else is treated as an op-... token.
-  const tok = document.getElementById('loginTok').value.trim();
-  const code = document.getElementById('loginCode').value.trim();
-  let r;
-  if (/^\d{6}$/.test(code)) {
-    r = await fetch('/api/login/code', { method: 'POST', body: JSON.stringify({ code }) });
-  } else if (tok) {
-    r = await fetch('/api/login', { method: 'POST', body: JSON.stringify({ token: tok }) });
-  } else {
-    return;
-  }
+  // One field, two credentials: exactly 6 digits posts to the login-code
+  // path (mints a session), anything else is treated as an op-... token.
+  const val = document.getElementById('loginTok').value.trim();
+  if (!val) return;
+  const r = /^\d{6}$/.test(val)
+    ? await fetch('/api/login/code', { method: 'POST', body: JSON.stringify({ code: val }) })
+    : await fetch('/api/login', { method: 'POST', body: JSON.stringify({ token: val }) });
   if (r.ok) location.reload();
   else document.getElementById('loginErr').textContent = 'invalid token or code';
 }
 document.getElementById('loginBtn').addEventListener('click', doLogin);
 document.getElementById('loginTok').addEventListener('keydown', e => {
-  if (e.key === 'Enter') doLogin();
-});
-document.getElementById('loginCode').addEventListener('keydown', e => {
   if (e.key === 'Enter') doLogin();
 });
 document.getElementById('logoutBtn').addEventListener('click', async () => {
@@ -1548,6 +1533,21 @@ window.addEventListener('mousemove', e => {
   const p = liveToApp(e);
   sendCommand(detailId, { action: 'call', tool: 'tc_mouse_move', args: { x: p.x, y: p.y } });
 });
+// Hover passthrough: forward plain pointer movement (no button) as
+// tc_mouse_move so hover-reactive installations respond. Throttled to ~20/s
+// — the command channel is one HTTP POST per event, so an unthrottled hover
+// would flood it; 50ms keeps it responsive without the deluge. Drags are
+// handled by the window listener above, so skip while a press is in flight.
+let lastHoverSent = 0;
+liveImg.addEventListener('mousemove', e => {
+  if (!ctlOn() || liveDown) return;
+  const now = Date.now();
+  if (now - lastHoverSent < 50) return;
+  lastHoverSent = now;
+  const p = liveToApp(e);
+  sendCommand(detailId, { action: 'call', tool: 'tc_mouse_move', args: { x: p.x, y: p.y } });
+});
+
 window.addEventListener('mouseup', e => {
   if (!liveDown) return;
   const down = liveDown;

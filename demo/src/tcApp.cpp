@@ -59,6 +59,46 @@ void tcApp::draw() {
     setColor(1.0f);
     drawBitmapString("anchorbolt demo / scene: " + sceneName,
                      -getWidth() / 2.0f + 20, -getHeight() / 2.0f + 30);
+
+    // Draw cursor feedback in window space (undo the center translate).
+    translate(-getWidth() / 2.0f, -getHeight() / 2.0f);
+
+    // Fading pointer trail.
+    for (size_t i = 0; i < trail.size(); ++i) {
+        float a = (float)i / trail.size();
+        setColor(Color(1.0f, 0.85f, 0.3f, a * 0.7f));
+        drawCircle(trail[i].x, trail[i].y, 2.0f + 4.0f * a);
+    }
+    // Cursor crosshair.
+    setColor(1.0f);
+    drawCircle(cursor.x, cursor.y, 4.0f);
+    setColor(Color(1.0f, 1.0f, 1.0f, 0.5f));
+    drawLine(cursor.x - 12, cursor.y, cursor.x + 12, cursor.y);
+    drawLine(cursor.x, cursor.y - 12, cursor.x, cursor.y + 12);
+
+    // Expanding click ripples (stroke mode = outline ring).
+    noFill();
+    for (auto it = ripples.begin(); it != ripples.end();) {
+        it->t += 1.0f / 60.0f;
+        float r = it->t * 120.0f;
+        setColor(Color(0.3f, 0.9f, 1.0f, max(0.0f, 0.8f - it->t)));
+        drawCircle(it->p.x, it->p.y, r);
+        if (it->t > 0.8f) it = ripples.erase(it); else ++it;
+    }
+    fill();
+}
+
+void tcApp::mouseMoved(Vec2 pos) {
+    cursor = pos;
+    trail.push_back(cursor);
+    if (trail.size() > 40) trail.erase(trail.begin());
+}
+
+void tcApp::mouseDragged(Vec2 pos, int button) { mouseMoved(pos); }
+
+void tcApp::mousePressed(Vec2 pos, int button) {
+    cursor = pos;
+    ripples.push_back({cursor, 0.0f});
 }
 
 // Fake "entrance camera": a slow plasma so the pushed image visibly changes.
