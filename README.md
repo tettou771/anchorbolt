@@ -77,6 +77,29 @@ anchorbolt serve
   stay retryable). The agent also reports the project's git commit on
   every heartbeat, so the wall shows which venue runs which version
 
+- **notification sinks** (config `sinks` array): push supervisor events
+  (`restart` / `up` / `down` / `update` / `stop`) to the outside world —
+  ONE templated HTTP engine, no per-service adapters. Presets prefill it:
+  `slack`, `discord`, `ntfy` (event messages) and `uptime-kuma` (heartbeat
+  mode: pings while the app is healthy, so Kuma alerts on silence). Generic
+  sinks take `method` / `contentType` / `body` with `{{app}}` `{{event}}`
+  `{{msg}}` `{{time}}` variables (JSON-escaped automatically). Webhook URLs
+  are secrets — use `urlFile` (gitignored file next to the config) or
+  `urlEnv` instead of an inline `url`. Delivery is at-least-once with an
+  in-memory queue per sink: a venue-network outage holds events until it
+  heals; 4xx responses drop the event (a bad webhook must not retry
+  forever). `events` filters what a sink receives (default: everything).
+
+```jsonc
+"sinks": [
+  { "preset": "slack",   "urlFile": "slack.url" },
+  { "preset": "ntfy",    "url": "https://ntfy.sh/my-venue-alerts" },
+  { "preset": "uptime-kuma", "url": "https://kuma.example.com/api/push/KEY" },
+  { "url": "https://example.com/hook", "events": ["restart", "down"],
+    "body": "{\"venue\":\"osaka\",\"what\":\"{{event}}: {{msg}}\"}" }
+]
+```
+
 Flags: see `anchorbolt --help`. Precedence: flags > `ANCHORBOLT_TOKEN` env >
 config file > defaults.
 

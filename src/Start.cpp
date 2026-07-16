@@ -9,6 +9,7 @@
 // =============================================================================
 
 #include "Start.h"
+#include "Sink.h"
 
 #include <TrussC.h>
 #include <impl/httplib.h>
@@ -74,6 +75,7 @@ struct StartOptions {
     bool   allowControl = false; // let the server relay MUTATING tools
     bool   allowUpdate = false;  // let the server trigger the update pipeline
     bool   updateCustom = false; // config overrode the pipeline (no smart skip)
+    vector<SinkConfig> sinks;    // outbound notifications (config "sinks" array)
     vector<string> updateCmds = {// remote-update pipeline, run in projectDir;
         "git pull --ff-only",    // override with the config "update" array
         "trusscli update",       // (e.g. prepend "trusscli upgrade" to also
@@ -374,8 +376,10 @@ void startUpdateJob(const StartOptions& opt, const fs::path& logDir) {
             int code = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
 #endif
             if (code != 0) {
-                eventLog(logDir, "[update] FAILED (exit " + to_string(code) + "): " + cmd +
-                                 " — app keeps running on the old binary");
+                string fmsg = "update FAILED (exit " + to_string(code) + "): " + cmd +
+                              " — app keeps running on the old binary";
+                eventLog(logDir, "[update] " + fmsg);
+                if (auto n = g_notifier) n->notify("update", fmsg);
                 ok = false;
                 break;
             }
@@ -952,6 +956,9 @@ bool loadConfig(const fs::path& path, StartOptions& opt) {
         opt.thumbWidth       = t.value("width", opt.thumbWidth);
         opt.thumbQuality     = t.value("quality", opt.thumbQuality);
     }
+    if (c.contains("sinks")) {
+        opt.sinks = parseSinks(c["sinks"], path.parent_path());
+    }
     if (c.contains("tokenFile")) {
         // Relative paths resolve next to the config file, not our cwd.
         fs::path tf = path.parent_path() / fs::path(c["tokenFile"].get<string>());
@@ -1314,6 +1321,12 @@ int cmdStart(const vector<string>& args) {
         logNotice("anchorbolt") << "mcp port " << chosen << " (" << opt.port << " busy)";
     }
     opt.port = chosen;
+    shared_ptr<Notifier> notifier;
+    if (!opt.sinks.empty()) {
+        notifier = make_shared<Notifier>(opt.sinks, opt.appId);
+        g_notifier = notifier;
+        logNotice("anchorbolt") << opt.sinks.size() << " notification sink(s) armed";
+    }
     optional<ServerPush> push;
     optional<CommandChannel> channel;
     if (!opt.serverUrl.empty()) {
@@ -1409,6 +1422,10 @@ int cmdStart(const vector<string>& args) {
             // CreateProcess fails synchronously — almost always a bad path.
             logError("anchorbolt") << "app failed to launch (bad path?); giving up";
             eventLog(logDir, "app failed to launch; giving up");
+            if (notifier) {
+                notifier->notify("down", "app failed to launch; giving up");
+                notifier->flushAndStop();
+            }
             return 1;
 #else
             logError("anchorbolt") << "fork failed; retrying in 5s";
@@ -1443,11 +1460,16 @@ int cmdStart(const vector<string>& args) {
                 if (giveUp) {
                     logError("anchorbolt") << how << "; giving up";
                     eventLog(logDir, how + "; giving up");
+                    if (notifier) {
+                        notifier->notify("down", how + "; giving up");
+                        notifier->flushAndStop();
+                    }
                     closeProc(proc);
                     return 1;
                 }
                 logWarning("anchorbolt") << how;
                 eventLog(logDir, how + " (" + machineMemNote() + ")");
+                if (notifier) notifier->notify("restart", how + "; restarting (" + machineMemNote() + ")");
                 break;
             }
 
@@ -1469,6 +1491,7 @@ int cmdStart(const vector<string>& args) {
             if (g_restartRequested.exchange(false)) {
                 logNotice("anchorbolt") << "remote restart requested";
                 eventLog(logDir, "remote restart requested; terminating app");
+                if (notifier) notifier->notify("restart", "remote restart requested");
                 terminateApp(proc);
                 childAlive = false;
                 break;
@@ -1497,16 +1520,24 @@ int cmdStart(const vector<string>& args) {
             }
             if (h) {
                 lastOkAt = chrono::steady_clock::now();
+                if (notifier) notifier->healthyTick();
                 if (!healthy) {
                     healthy = true;
                     logNotice("anchorbolt") << "app healthy (fps "
                                        << (*h).value("fps", 0.0f) << ", "
                                        << (*h).value("width", 0) << "x" << (*h).value("height", 0) << ")";
                     eventLog(logDir, "app healthy");
+                    if (notifier && restarts > 0) {
+                        notifier->notify("up", "app healthy again (pid " +
+                                               to_string(proc.pid) + ", restart #" +
+                                               to_string(restarts) + ")");
+                    }
                     if (audit) {
                         audit = false;
-                        eventLog(logDir, "[update] verified: app healthy on the new binary" +
-                                         (appGit.empty() ? "" : " (" + appGit + ")"));
+                        string vmsg = "update verified: app healthy on the new binary" +
+                                      (appGit.empty() ? "" : " (" + appGit + ")");
+                        eventLog(logDir, "[update] " + vmsg);
+                        if (notifier) notifier->notify("update", vmsg);
                     }
                 }
                 if (push) {
@@ -1573,6 +1604,11 @@ int cmdStart(const vector<string>& args) {
                         logError("anchorbolt") << "app unresponsive; restarting";
                         eventLog(logDir, "app unresponsive for " + to_string(silentSec) +
                                          "s; terminating (" + machineMemNote() + ")");
+                        if (notifier) {
+                            notifier->notify("restart", "app unresponsive for " +
+                                             to_string(silentSec) + "s; restarting (" +
+                                             machineMemNote() + ")");
+                        }
                         terminateApp(proc);
                         childAlive = false;
                         break;
@@ -1601,11 +1637,14 @@ int cmdStart(const vector<string>& args) {
                 error_code ec;
                 if (fs::exists(prev, ec)) {
                     fs::copy_file(prev, opt.runPath, fs::copy_options::overwrite_existing, ec);
-                    eventLog(logDir, ec
-                        ? "[update] rollback FAILED: " + ec.message()
-                        : "[update] rolling back: the new binary never became healthy; previous binary restored");
+                    string rmsg = ec
+                        ? "rollback FAILED: " + ec.message()
+                        : "rolling back: the new binary never became healthy; previous binary restored";
+                    eventLog(logDir, "[update] " + rmsg);
+                    if (notifier) notifier->notify("update", rmsg);
                 } else {
                     eventLog(logDir, "[update] rollback impossible: no previous binary kept");
+                    if (notifier) notifier->notify("update", "rollback impossible: no previous binary kept");
                 }
             }
         }
@@ -1618,6 +1657,11 @@ int cmdStart(const vector<string>& args) {
 
     logNotice("anchorbolt") << "anchorbolt stopped (restarts: " << restarts << ")";
     eventLog(logDir, "anchorbolt stopped (restarts: " + to_string(restarts) + ")");
+    if (notifier) {
+        notifier->notify("stop", "anchorbolt stopped (restarts: " + to_string(restarts) + ")");
+        notifier->flushAndStop();
+        g_notifier.reset();
+    }
     // Final flush so the shutdown events reach the server too, then persist
     // the cursor unconditionally — the lazy 60s cadence doesn't apply to exit.
     pushLogs((logDir / ("app-" + getTimestampString("%Y-%m-%d") + ".log")).string());
