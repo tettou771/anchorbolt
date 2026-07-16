@@ -14,6 +14,7 @@
 #include <impl/httplib.h>
 #include <tcWebSocketClient.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -41,18 +42,29 @@ namespace {
 
 struct StartOptions {
     string runPath;              // app binary (positional, required)
-    string cwd;                  // working dir (default: binary's directory)
-    string logDir = "anchorbolt-logs";
+    vector<string> appArgs;      // passed to the app verbatim (after --)
+    string cwd;                  // working dir (default: the binary's directory)
+    string logDir;               // empty = platform default (~/Library/Logs/anchorbolt/<id> etc.)
+    int    logKeepDays = 30;     // prune logs older than this (0 = keep forever)
     int    port        = 47777;  // TRUSSC_MCP_PORT
-    int    intervalSec = 3;      // health poll interval
-    int    graceSec    = 15;     // boot grace before misses count
-    int    maxMisses   = 3;      // consecutive misses -> restart
+    int    watchdogTimeoutSec = 10;  // unresponsive this long -> restart (0 = process-exit only)
+    int    graceSec    = 15;     // boot grace before the watchdog arms
     string serverUrl;            // fleet server base URL (empty = no push)
     string appId;                // id on the fleet server (default: binary name)
-    string token;                // agent token (--token / ANCHORBOLT_TOKEN)
-    int    thumbIntervalSec = 30;
+    string token;                // agent token (--token > ANCHORBOLT_TOKEN > tokenFile)
+    int    thumbIntervalSec = 30;    // 0 = never push screenshots
+    int    thumbWidth = 512;
+    int    thumbQuality = 75;
     int    wsPort = 0;           // command channel port (0 = server port + 1)
     bool   allowControl = false; // let the server relay MUTATING tools
+
+    // Derived: health poll cadence — a third of the watchdog window, clamped.
+    // The watchdog itself is wall-clock (time since the last healthy reply),
+    // so HTTP timeouts don't stretch the effective window.
+    int pollSec() const {
+        if (watchdogTimeoutSec <= 0) return 3;  // logs/channel still need a heartbeat
+        return std::clamp(watchdogTimeoutSec / 3, 1, 5);
+    }
 };
 
 atomic<bool> g_stop{false};
@@ -438,18 +450,27 @@ bool parseArgs(const vector<string>& args, StartOptions& opt) {
         if      (a == "--cwd")      { auto v = next("--cwd");      if (!v) return false; opt.cwd = *v; }
         else if (a == "--log-dir")  { auto v = next("--log-dir");  if (!v) return false; opt.logDir = *v; }
         else if (a == "--port")     { auto v = next("--port");     if (!v) return false; opt.port = stoi(*v); }
-        else if (a == "--interval") { auto v = next("--interval"); if (!v) return false; opt.intervalSec = stoi(*v); }
         else if (a == "--grace")    { auto v = next("--grace");    if (!v) return false; opt.graceSec = stoi(*v); }
-        else if (a == "--misses")   { auto v = next("--misses");   if (!v) return false; opt.maxMisses = stoi(*v); }
+        else if (a == "--watchdog-timeout") { auto v = next("--watchdog-timeout"); if (!v) return false; opt.watchdogTimeoutSec = stoi(*v); }
+        else if (a == "--log-keep") { auto v = next("--log-keep"); if (!v) return false; opt.logKeepDays = stoi(*v); }
         else if (a == "--server")   { auto v = next("--server");   if (!v) return false; opt.serverUrl = *v; }
         else if (a == "--id")       { auto v = next("--id");       if (!v) return false; opt.appId = *v; }
         else if (a == "--token")    { auto v = next("--token");    if (!v) return false; opt.token = *v; }
         else if (a == "--ws-port")  { auto v = next("--ws-port");  if (!v) return false; opt.wsPort = stoi(*v); }
         else if (a == "--allow-control") { opt.allowControl = true; }
         else if (a == "--thumb-interval") { auto v = next("--thumb-interval"); if (!v) return false; opt.thumbIntervalSec = stoi(*v); }
+        else if (a == "--thumb-width")    { auto v = next("--thumb-width");    if (!v) return false; opt.thumbWidth = stoi(*v); }
+        else if (a == "--thumb-quality")  { auto v = next("--thumb-quality");  if (!v) return false; opt.thumbQuality = stoi(*v); }
+        else if (a == "--config") { ++i; /* consumed in the pre-pass */ }
+        else if (a == "--") {
+            // Everything after -- goes to the app verbatim.
+            opt.appArgs.assign(args.begin() + i + 1, args.end());
+            break;
+        }
         else if (!a.empty() && a[0] != '-') {
             if (!opt.runPath.empty()) {
-                cerr << "anchorbolt start: unexpected extra argument '" << a << "'" << endl;
+                cerr << "anchorbolt start: unexpected extra argument '" << a
+                     << "' (app arguments go after --)" << endl;
                 return false;
             }
             opt.runPath = a;  // positional: the app binary
@@ -461,10 +482,115 @@ bool parseArgs(const vector<string>& args, StartOptions& opt) {
     }
     if (opt.runPath.empty()) {
         cerr << "anchorbolt start: an app binary is required "
-             << "(anchorbolt start <app-binary> [options])" << endl;
+             << "(anchorbolt start <app-binary> [options] [-- app-args])" << endl;
         return false;
     }
     return true;
+}
+
+// Config file: JSON with comments allowed. Loaded BEFORE flags, so flags win.
+// The token itself is deliberately NOT a config key — configs get committed
+// to git; secrets live in `tokenFile` (a path) or the ANCHORBOLT_TOKEN env.
+bool loadConfig(const fs::path& path, StartOptions& opt) {
+    ifstream in(path);
+    if (!in) {
+        cerr << "anchorbolt start: cannot read config " << path.string() << endl;
+        return false;
+    }
+    Json c;
+    try {
+        c = Json::parse(in, nullptr, /*allow_exceptions=*/true, /*ignore_comments=*/true);
+    } catch (const std::exception& e) {
+        cerr << "anchorbolt start: config parse error in " << path.string()
+             << ": " << e.what() << endl;
+        return false;
+    }
+    if (c.contains("token")) {
+        cerr << "anchorbolt start: config contains a 'token' key — refusing to read it.\n"
+             << "Configs end up in git; put the token in a separate file and point\n"
+             << "'tokenFile' at it (or use the ANCHORBOLT_TOKEN env var)." << endl;
+    }
+    opt.runPath  = c.value("app", opt.runPath);
+    if (c.contains("args") && c["args"].is_array()) {
+        opt.appArgs.clear();
+        for (auto& a : c["args"]) opt.appArgs.push_back(a.get<string>());
+    }
+    opt.cwd       = c.value("cwd", opt.cwd);
+    opt.appId     = c.value("id", opt.appId);
+    opt.serverUrl = c.value("server", opt.serverUrl);
+    opt.port      = c.value("port", opt.port);
+    opt.wsPort    = c.value("wsPort", opt.wsPort);
+    opt.allowControl = c.value("allowControl", opt.allowControl);
+    opt.graceSec  = c.value("grace", opt.graceSec);
+    opt.watchdogTimeoutSec = c.value("watchdogTimeout", opt.watchdogTimeoutSec);
+    if (c.contains("log") && c["log"].is_object()) {
+        auto& l = c["log"];
+        opt.logDir      = l.value("dir", opt.logDir);
+        opt.logKeepDays = l.value("keepDays", opt.logKeepDays);
+    }
+    if (c.contains("thumb") && c["thumb"].is_object()) {
+        auto& t = c["thumb"];
+        opt.thumbIntervalSec = t.value("interval", opt.thumbIntervalSec);
+        opt.thumbWidth       = t.value("width", opt.thumbWidth);
+        opt.thumbQuality     = t.value("quality", opt.thumbQuality);
+    }
+    if (c.contains("tokenFile")) {
+        // Relative paths resolve next to the config file, not our cwd.
+        fs::path tf = path.parent_path() / fs::path(c["tokenFile"].get<string>());
+        ifstream tin(tf);
+        string tok;
+        if (tin && getline(tin, tok)) {
+            while (!tok.empty() && (tok.back() == '\r' || tok.back() == ' ')) tok.pop_back();
+            opt.token = tok;
+        } else {
+            cerr << "anchorbolt start: cannot read tokenFile " << tf.string() << endl;
+            return false;
+        }
+    }
+    logNotice("anchorbolt") << "config loaded: " << path.string();
+    return true;
+}
+
+// Platform-conventional log home (CWD-relative defaults break under
+// launchd/systemd, whose cwd is /). --log-dir / config log.dir override.
+fs::path platformLogDir(const string& appId) {
+    const char* home = getenv("HOME");
+    fs::path base;
+#if defined(__APPLE__)
+    base = fs::path(home ? home : ".") / "Library" / "Logs" / "anchorbolt";
+#else
+    const char* xdg = getenv("XDG_STATE_HOME");
+    base = xdg ? fs::path(xdg) : fs::path(home ? home : ".") / ".local" / "state";
+    base /= "anchorbolt";
+#endif
+    return base / appId;
+}
+
+// Delete our own daily files older than keepDays. Only touches names we
+// create (app-*.log / anchorbolt-*.log) — never anything else in the dir.
+void pruneLogs(const fs::path& logDir, int keepDays) {
+    if (keepDays <= 0) return;
+    auto cutoff = chrono::system_clock::now() - chrono::hours(24 * keepDays);
+    error_code ec;
+    int removed = 0;
+    for (auto& e : fs::directory_iterator(logDir, ec)) {
+        if (!e.is_regular_file(ec)) continue;
+        string name = e.path().filename().string();
+        bool ours = (name.rfind("app-", 0) == 0 || name.rfind("anchorbolt-", 0) == 0) &&
+                    name.find(".log") != string::npos;
+        if (!ours) continue;
+        auto ft = fs::last_write_time(e.path(), ec);
+        if (ec) continue;
+        auto sys = chrono::time_point_cast<chrono::system_clock::duration>(
+            ft - fs::file_time_type::clock::now() + chrono::system_clock::now());
+        if (sys < cutoff) {
+            if (fs::remove(e.path(), ec)) ++removed;
+        }
+    }
+    if (removed > 0) {
+        logNotice("anchorbolt") << "pruned " << removed << " log file(s) older than "
+                                << keepDays << " days";
+    }
 }
 
 #ifndef _WIN32
@@ -476,7 +602,11 @@ pid_t spawnApp(const StartOptions& opt, const string& logFile) {
         setenv("TRUSSC_MCP", "1", 1);
         setenv("TRUSSC_MCP_PORT", to_string(opt.port).c_str(), 1);
         setenv("TRUSSC_LOG_FILE", logFile.c_str(), 1);
-        execl(opt.runPath.c_str(), opt.runPath.c_str(), (char*)nullptr);
+        vector<char*> argv;
+        argv.push_back(const_cast<char*>(opt.runPath.c_str()));
+        for (const auto& a : opt.appArgs) argv.push_back(const_cast<char*>(a.c_str()));
+        argv.push_back(nullptr);
+        execv(opt.runPath.c_str(), argv.data());
         _exit(127);  // exec failed
     }
     return pid;
@@ -506,6 +636,20 @@ int cmdStart(const vector<string>& args) {
     return 1;
 #else
     StartOptions opt;
+
+    // Pre-pass: config file loads first so flags override it. Explicit
+    // --config <path>, or ./anchorbolt.json when present.
+    {
+        fs::path cfg;
+        for (size_t i = 0; i + 1 < args.size(); ++i) {
+            if (args[i] == "--config") cfg = args[i + 1];
+            if (args[i] == "--") break;
+        }
+        if (cfg.empty() && fs::exists("anchorbolt.json")) cfg = "anchorbolt.json";
+        if (!cfg.empty() && !loadConfig(cfg, opt)) return 1;
+    }
+    // Env token sits between config (tokenFile) and the --token flag.
+    if (const char* envTok = getenv("ANCHORBOLT_TOKEN")) opt.token = envTok;
     if (!parseArgs(args, opt)) return 1;
 
     // Resolve paths up front so restarts don't depend on our cwd.
@@ -517,17 +661,15 @@ int cmdStart(const vector<string>& args) {
     }
     opt.runPath = runPath.string();
     if (opt.cwd.empty()) opt.cwd = runPath.parent_path().string();
-    fs::path logDir = fs::absolute(opt.logDir);
-    fs::create_directories(logDir);
-
-    // Fleet server push is optional and never affects supervision.
     if (opt.appId.empty()) opt.appId = runPath.stem().string();
     for (char& c : opt.appId) {
         if (!isalnum((unsigned char)c) && c != '-' && c != '_' && c != '.') c = '-';
     }
-    if (opt.token.empty()) {
-        if (const char* envTok = getenv("ANCHORBOLT_TOKEN")) opt.token = envTok;
-    }
+    fs::path logDir = opt.logDir.empty() ? platformLogDir(opt.appId)
+                                         : fs::absolute(opt.logDir);
+    fs::create_directories(logDir);
+    pruneLogs(logDir, opt.logKeepDays);
+    string pruneDay = getTimestampString("%Y-%m-%d");
     optional<ServerPush> push;
     optional<CommandChannel> channel;
     if (!opt.serverUrl.empty()) {
@@ -583,10 +725,10 @@ int cmdStart(const vector<string>& args) {
         cli.set_read_timeout(2, 0);
 
         auto bootAt = chrono::steady_clock::now();
+        auto lastOkAt = bootAt;  // last healthy reply (watchdog reference point)
         bool healthy = false;    // first successful poll seen
         bool childAlive = true;
         bool pidWarned = false;  // one-shot port-collision warning
-        int  misses = 0;
         chrono::steady_clock::time_point lastThumb{};  // epoch -> push right away
         bool statusChecked = false;   // tools/list probed for tc_get_status
         bool hasStatus = false;
@@ -613,8 +755,15 @@ int cmdStart(const vector<string>& args) {
                 break;
             }
 
-            sleepChecked(opt.intervalSec);
+            sleepChecked(opt.pollSec());
             if (g_stop) break;
+
+            // Day changed? Prune old logs once per day.
+            string today = getTimestampString("%Y-%m-%d");
+            if (today != pruneDay) {
+                pruneDay = today;
+                pruneLogs(logDir, opt.logKeepDays);
+            }
 
             pushLogs(logFile);
             if (channel) channel->maintain();
@@ -628,6 +777,10 @@ int cmdStart(const vector<string>& args) {
                 childAlive = false;
                 break;
             }
+
+            // Watchdog off: supervise process exit only (works for apps
+            // without an MCP endpoint); logs and the channel still flow.
+            if (opt.watchdogTimeoutSec <= 0 && !push) continue;
 
             // Hang detection via tc_get_health.
             auto h = callTool(cli, "tc_get_health");
@@ -647,7 +800,7 @@ int cmdStart(const vector<string>& args) {
                 }
             }
             if (h) {
-                misses = 0;
+                lastOkAt = chrono::steady_clock::now();
                 if (!healthy) {
                     healthy = true;
                     logNotice("anchorbolt") << "app healthy (fps "
@@ -685,10 +838,13 @@ int cmdStart(const vector<string>& args) {
                     push->heartbeat(hb);
 
                     auto now = chrono::steady_clock::now();
-                    if (now - lastThumb >= chrono::seconds(opt.thumbIntervalSec)) {
+                    if (opt.thumbIntervalSec > 0 &&
+                        now - lastThumb >= chrono::seconds(opt.thumbIntervalSec)) {
                         lastThumb = now;
                         if (auto t = callTool(cli, "tc_get_screenshot",
-                                              {{"format", "jpg"}, {"width", 512}})) {
+                                              {{"format", "jpg"},
+                                               {"width", opt.thumbWidth},
+                                               {"quality", opt.thumbQuality}})) {
                             if (t->contains("data") && (*t)["data"].is_string()) {
                                 auto jpg = fromBase64((*t)["data"].get<string>());
                                 if (!jpg.empty()) push->thumbnail(jpg);
@@ -704,16 +860,17 @@ int cmdStart(const vector<string>& args) {
                         }
                     }
                 }
-            } else {
-                bool inGrace = !healthy &&
-                    chrono::steady_clock::now() - bootAt < chrono::seconds(opt.graceSec);
+            } else if (opt.watchdogTimeoutSec > 0) {
+                auto now = chrono::steady_clock::now();
+                bool inGrace = !healthy && now - bootAt < chrono::seconds(opt.graceSec);
                 if (!inGrace) {
-                    ++misses;
-                    logWarning("anchorbolt") << "health poll miss (" << misses << "/" << opt.maxMisses << ")";
-                    if (misses >= opt.maxMisses) {
+                    int silentSec = (int)chrono::duration_cast<chrono::seconds>(now - lastOkAt).count();
+                    logWarning("anchorbolt") << "health poll miss (silent " << silentSec
+                                             << "s / " << opt.watchdogTimeoutSec << "s)";
+                    if (silentSec >= opt.watchdogTimeoutSec) {
                         logError("anchorbolt") << "app unresponsive; restarting";
-                        eventLog(logDir, "app unresponsive after " + to_string(misses) +
-                                         " misses; terminating (" + machineMemNote() + ")");
+                        eventLog(logDir, "app unresponsive for " + to_string(silentSec) +
+                                         "s; terminating (" + machineMemNote() + ")");
                         terminateApp(pid);
                         childAlive = false;
                         break;

@@ -24,7 +24,7 @@ Early / Phase 0. Working today (macOS / Linux):
 ```bash
 # venue machine — supervise the app and push to the fleet server
 anchorbolt start /path/to/bin/myApp.app/Contents/MacOS/myApp \
-    --server http://192.168.1.10:8787
+    --server http://192.168.1.10:8787 -- --fullscreen
 
 # monitoring machine — dashboard at http://localhost:8787/
 anchorbolt serve
@@ -32,21 +32,52 @@ anchorbolt serve
 
 `start` (kiosk mode):
 
-- spawn with env injection, boot grace period
-- `tc_get_health` polling → hang detection → SIGTERM/SIGKILL → restart
+- spawn with env injection and the app's own arguments (everything after
+  `--` is passed verbatim), boot grace period
+- watchdog: no healthy `tc_get_health` reply for `--watchdog-timeout`
+  seconds (wall clock, default 10) → SIGTERM/SIGKILL → restart.
+  `--watchdog-timeout 0` = supervise process exit only, which also makes
+  anchorbolt useful for binaries without an MCP endpoint
 - process-exit detection → restart
 - SIGINT/SIGTERM to anchorbolt shuts the app down cleanly too
+- logs land in the platform-conventional place by default
+  (`~/Library/Logs/anchorbolt/<id>/` on macOS,
+  `$XDG_STATE_HOME/anchorbolt/<id>/` on Linux) and are pruned after
+  `--log-keep` days (default 30; 0 keeps everything)
 - with `--server`: pushes a heartbeat per health poll, a downscaled JPEG
-  every 30s (raw bytes, cheap for the app — no frame stutter), and every new
-  app-log / supervisor-event line. Log push is independent of app health, so
-  while an app hangs the server still sees "unresponsive / restarting" —
-  remotely distinguishable from a machine that went dark
+  every `--thumb-interval` sec (default 30, 0 = never — e.g. for venues
+  where screenshots must not leave the machine; `--thumb-width` /
+  `--thumb-quality` tune size), and every new app-log / supervisor-event
+  line. Log push is independent of app health, so while an app hangs the
+  server still sees "unresponsive / restarting" — remotely distinguishable
+  from a machine that went dark
 
-Options: `--port` (MCP port, default 47777) `--interval` (poll sec, 3)
-`--grace` (boot grace sec, 15) `--misses` (restart threshold, 3)
-`--log-dir` (app log destination) `--cwd` `--server <url>` `--id <name>`
-(default: binary name) `--token <tok>` `--ws-port <n>` `--allow-control`
-`--thumb-interval <sec>` (30).
+Flags: see `anchorbolt --help`. Precedence: flags > `ANCHORBOLT_TOKEN` env >
+config file > defaults.
+
+### Config file
+
+For launchd/systemd installs, put everything in a JSON file (comments
+allowed) instead of a flag string — `anchorbolt start --config venue.json`,
+or just `anchorbolt start` next to an `anchorbolt.json`:
+
+```jsonc
+{
+  // osaka-entrance kiosk
+  "app": "./bin/myApp.app/Contents/MacOS/myApp",
+  "args": ["--fullscreen"],
+  "id": "osaka-entrance",
+  "server": "https://ops.example.com",
+  "tokenFile": "demo.token",          // the token itself NEVER goes in here
+  "watchdogTimeout": 10,
+  "log": { "keepDays": 30 },
+  "thumb": { "interval": 30, "width": 512, "quality": 75 }
+}
+```
+
+A `token` key in the config is refused with a warning — configs get
+committed to git; keep the secret in a separate (gitignored) file pointed
+to by `tokenFile`, or in the `ANCHORBOLT_TOKEN` env var.
 
 `serve` (fleet server):
 
