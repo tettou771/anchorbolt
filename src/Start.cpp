@@ -187,6 +187,18 @@ vector<unsigned char> fromBase64(const string& s) {
     return out;
 }
 
+// nlohmann::json::dump() THROWS on invalid UTF-8 (type_error.316), and log
+// lines are not under our control: a localized MSVC streams CP932 build
+// output into the supervisor log during a remote update, which crashed the
+// whole supervisor (uncaught -> std::terminate, 0xC0000409) when LogShipper
+// shipped those lines — and kept crashing on every rerun until the
+// "poisoned" file aged out. Every OUTBOUND dump goes through this: invalid
+// sequences become U+FFFD instead of a crash. (Found on a JP-locale Windows
+// box; clang emits UTF-8 so mac/linux never hit it.)
+string dumpSafe(const Json& j) {
+    return j.dump(-1, ' ', false, Json::error_handler_t::replace);
+}
+
 // Machine-wide memory, the OS's view. Rides every heartbeat and gets
 // snapshotted into the event log on failures — so an operator can tell
 // "our app leaked" from "something else ate the machine" (OOM exoneration).
@@ -452,7 +464,7 @@ public:
 
     void heartbeat(Json health) {
         health["app"] = appId_;
-        auto res = cli_.Post("/api/heartbeat", health.dump(), "application/json");
+        auto res = cli_.Post("/api/heartbeat", dumpSafe(health), "application/json");
         report(res && res->status == 200, "heartbeat");
     }
 
@@ -476,7 +488,7 @@ public:
             {"at", getTimestampString("%Y-%m-%dT%H:%M:%S")},
             {"event", event},
             {"text", text}}})}};
-        auto res = cli_.Post("/api/alert/" + appId_, body.dump(), "application/json");
+        auto res = cli_.Post("/api/alert/" + appId_, dumpSafe(body), "application/json");
         report(res && res->status == 200, "alert");
     }
 
@@ -485,7 +497,7 @@ public:
     bool logs(const string& src, const LogBatch& b) {
         Json body = {{"src", src}, {"file", b.file},
                      {"start", b.start}, {"end", b.end}, {"lines", b.lines}};
-        auto res = cli_.Post("/api/log/" + appId_, body.dump(), "application/json");
+        auto res = cli_.Post("/api/log/" + appId_, dumpSafe(body), "application/json");
         bool ok = res && res->status == 200;
         report(ok, "log");
         return ok;
@@ -799,7 +811,7 @@ private:
             reply["ok"] = false;
             reply["error"] = "unknown action";
         }
-        ws_.send(reply.dump());
+        ws_.send(dumpSafe(reply));
     }
 
     StartOptions opt_;

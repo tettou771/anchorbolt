@@ -38,5 +38,8 @@ HTML mirror (`tcx_imgui_get_widgets` → native HTML controls →
 
 ## Small stuff
 
+- CP932/mojibake cosmetics: dumpSafe (U+FFFD) stops the crash, but a
+  localized MSVC's build output shows as replacement chars on the
+  dashboard — consider decoding the console codepage at ingest on Windows
 - serve restart empties the log panel ring — preload tail from disk JSONL
 - `tc::fromBase64` is a candidate for TrussC core (currently vendored here)

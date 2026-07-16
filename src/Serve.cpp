@@ -1089,7 +1089,11 @@ int cmdServe(const vector<string>& args) {
         g_agents.byClient.erase(it);
     };
     if (!g_agents.hub.start(opt.wsPort)) {
-        cerr << "anchorbolt serve: failed to listen on ws port " << opt.wsPort << endl;
+        cerr << "anchorbolt serve: failed to listen on ws port " << opt.wsPort << "\n"
+             << "If the port looks free, on Windows it may sit inside a reserved\n"
+             << "range (Hyper-V/WSL2 exclusions). Check with:\n"
+             << "  netsh interface ipv4 show excludedportrange protocol=tcp\n"
+             << "and pick a port outside those ranges with --port (ws = port+1)." << endl;
         return 1;
     }
 
@@ -1436,7 +1440,16 @@ int cmdServe(const vector<string>& args) {
                             << " (ws " << opt.wsPort << ", data " << dataDir.string()
                             << (token::enforcementEnabled(dataDir.string())
                                 ? ", agent tokens ENFORCED)" : ", open mode)");
-    bool ok = svr.listen("0.0.0.0", opt.port);
+    // Dual-stack listen: Windows resolves `localhost` to ::1 first, so an
+    // IPv4-only listener made agent POSTs fail silently there (the WS channel
+    // still connected — a confusing half-alive state). "::" with the httplib
+    // default v6only=false accepts both stacks; fall back to plain IPv4 on
+    // systems without IPv6.
+    bool ok = svr.listen("::", opt.port);
+    if (!ok && !g_stop) {
+        logNotice("anchorbolt") << "IPv6 listen unavailable; falling back to IPv4";
+        ok = svr.listen("0.0.0.0", opt.port);
+    }
     bool stoppedBySignal = g_stop.load();
     g_stop = true;
     stopWatcher.join();
@@ -1444,7 +1457,11 @@ int cmdServe(const vector<string>& args) {
     g_agents.hub.stop();
 
     if (!ok && !stoppedBySignal) {
-        cerr << "anchorbolt serve: failed to listen on port " << opt.port << endl;
+        cerr << "anchorbolt serve: failed to listen on port " << opt.port << "\n"
+             << "If the port looks free, on Windows it may sit inside a reserved\n"
+             << "range (Hyper-V/WSL2 exclusions). Check with:\n"
+             << "  netsh interface ipv4 show excludedportrange protocol=tcp\n"
+             << "and pick a port outside those ranges with --port." << endl;
         return 1;
     }
     logNotice("anchorbolt") << "fleet server stopped";
