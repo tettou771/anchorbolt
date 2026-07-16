@@ -6,10 +6,15 @@ This file tracks what's left, roughly in priority order.
 remote update — `--allow-update` + pipeline + auto-rollback + git hash on
 the wall.)
 
-## 1. Windows support for `start`
+## 1. Windows: real-hardware verification
 
-CreateProcess + job object (kill child tree), Windows log dir
-(`%LOCALAPPDATA%\anchorbolt\<id>\`), port probe already portable?
+Code shipped (CreateProcess + job object w/ KILL_ON_JOB_CLOSE, WM_CLOSE →
+TerminateProcess stop, winsock dual-stack port probe, GlobalMemoryStatusEx,
+`%LOCALAPPDATA%\anchorbolt\<id>\` logs, rename-based update backup because
+a running exe is write-locked but renameable) and compiles on windows-2022
+CI. Still needs a real-machine pass: spawn / watchdog restart / clean stop,
+remote update incl. the exe rename dance and rollback, log push + cursor,
+MCP port scan with two supervisors.
 
 ## 2. Sink engine (webhook notifications)
 
