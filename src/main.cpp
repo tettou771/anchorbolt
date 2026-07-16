@@ -18,7 +18,7 @@ using namespace std;
 
 static void printHelp() {
     cout <<
-        "anchorbolt - TrussC installation ops tool\n"
+        "AnchorBolt - TrussC installation ops tool (command: anchorbolt)\n"
         "\n"
         "USAGE\n"
         "  anchorbolt start [-p <path>] [options] [-- app-args...]\n"
@@ -85,7 +85,7 @@ int main(int argc, char* argv[]) {
         return 0;
     }
     if (cmd == "-v" || cmd == "--version" || cmd == "version") {
-        cout << "anchorbolt 0.0.1 (TrussC " << tc::getVersion() << ")" << endl;
+        cout << "AnchorBolt 0.0.1 (TrussC " << tc::getVersion() << ")" << endl;
         return 0;
     }
     if (cmd == "start") {

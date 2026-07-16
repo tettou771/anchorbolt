@@ -1,4 +1,4 @@
-# anchorbolt
+# AnchorBolt
 
 TrussC installation ops tool — anchors a running installation to home base.
 
@@ -14,7 +14,7 @@ can never drift apart):
   webhook notifications, MCP endpoint for AI-driven operations.
 
 Deliberately a separate tool from `trusscli`: the dev CLI builds projects;
-anchorbolt babysits them in production. See the TrussC ROADMAP (kiosk / fleet
+AnchorBolt babysits them in production. See the TrussC ROADMAP (kiosk / fleet
 entries) for the full settled design.
 
 ## Status
@@ -40,9 +40,9 @@ anchorbolt serve
 - watchdog: no healthy `tc_get_health` reply for `--watchdog-timeout`
   seconds (wall clock, default 10) → SIGTERM/SIGKILL → restart.
   `--watchdog-timeout 0` = supervise process exit only, which also makes
-  anchorbolt useful for binaries without an MCP endpoint
+  AnchorBolt useful for binaries without an MCP endpoint
 - process-exit detection → restart
-- SIGINT/SIGTERM to anchorbolt shuts the app down cleanly too
+- SIGINT/SIGTERM to AnchorBolt shuts the app down cleanly too
 - logs land in the platform-conventional place by default
   (`~/Library/Logs/anchorbolt/<id>/` on macOS,
   `$XDG_STATE_HOME/anchorbolt/<id>/` on Linux) and are pruned after
@@ -57,7 +57,7 @@ anchorbolt serve
 - **offline-proof log delivery**: the local daily files are the spool, and
   a persisted cursor (`push-cursor.json`, flushed lazily — SD-card
   friendly) advances only when the server confirms receipt. Hours of
-  venue-network outage, an anchorbolt restart, even a machine reboot — the
+  venue-network outage, an AnchorBolt restart, even a machine reboot — the
   backlog ships on reconnect. At-least-once semantics: the server dedups
   retries, and files not yet delivered are protected from local pruning
 - **remote update** (opt-in via `--allow-update` — it is remote code
@@ -155,7 +155,7 @@ proxy (Caddy basic-auth, Cloudflare Tunnel) when exposing it.
 ## Custom app status
 
 Apps can publish their own monitoring data with one line per value — the
-supervisor discovers it via MCP `tools/list`, no anchorbolt configuration:
+supervisor discovers it via MCP `tools/list`, no AnchorBolt configuration:
 
 ```cpp
 void tcApp::setup() {

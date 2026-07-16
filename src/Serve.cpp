@@ -259,7 +259,7 @@ const char* kDashboardHtml = R"HTML(<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>anchorbolt</title>
+<title>AnchorBolt</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -389,7 +389,7 @@ const char* kDashboardHtml = R"HTML(<!DOCTYPE html>
 </head>
 <body>
 <header>
-  <h1>anchorbolt</h1>
+  <h1>AnchorBolt</h1>
   <span class="sub" id="summary"></span>
 </header>
 <div id="grid"></div>
