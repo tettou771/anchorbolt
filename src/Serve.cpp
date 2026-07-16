@@ -31,6 +31,7 @@
 #include <iostream>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <thread>
 
 using namespace std;
@@ -170,6 +171,46 @@ struct AgentChannel {
 };
 
 AgentChannel g_agents;
+
+// --- 6-digit code brute-force guard -------------------------------------------
+// Codes are only a million-wide space, so redemption endpoints (/api/pair,
+// /api/login/code) throttle globally: >=10 failures inside a 10-minute window
+// locks ALL redemption with 429 until the window cools. In-memory only — a
+// restart clears it, which is fine (an attacker gains nothing from a bounce).
+mutex g_codeGuardMutex;
+int g_codeFails = 0;
+chrono::steady_clock::time_point g_codeWindowStart;
+constexpr int  kCodeFailLimit  = 10;
+constexpr auto kCodeFailWindow = chrono::minutes(10);
+
+bool codeGuardBlocked() {
+    lock_guard<mutex> lock(g_codeGuardMutex);
+    if (g_codeFails >= kCodeFailLimit) {
+        if (chrono::steady_clock::now() - g_codeWindowStart < kCodeFailWindow) return true;
+        g_codeFails = 0;  // window cooled off
+    }
+    return false;
+}
+
+void codeGuardFail() {
+    lock_guard<mutex> lock(g_codeGuardMutex);
+    auto now = chrono::steady_clock::now();
+    if (g_codeFails == 0 || now - g_codeWindowStart >= kCodeFailWindow) {
+        g_codeWindowStart = now;
+        g_codeFails = 0;
+    }
+    if (++g_codeFails == kCodeFailLimit) {
+        logWarning("anchorbolt") << "code brute-force guard tripped: " << kCodeFailLimit
+                                 << " failed redemptions — locking all codes for 10 min";
+    }
+}
+
+// Scope gate for a resolved operator (nullopt = open mode / full access).
+bool opSeesApp(const optional<token::Operator>& op, const string& dataDir,
+               const string& appId) {
+    if (!op) return true;
+    return token::inScope(*op, appId, token::groupOf(dataDir, appId));
+}
 
 // --- server-side retention ----------------------------------------------------
 // Independent policy from any venue's local --log-keep (deletions never
@@ -401,17 +442,22 @@ Json fleetToolsList() {
     return Json{{"tools", tools}};
 }
 
-// rank: caller's role rank (3 in open mode). Returns an MCP result object.
-Json fleetToolCall(const fs::path& dataDir, const string& name, const Json& args, int rank) {
+// rank: caller's role rank (3 in open mode). op: resolved operator for scope
+// filtering (nullopt = open mode / full visibility). Returns an MCP result.
+Json fleetToolCall(const fs::path& dataDir, const string& name, const Json& args,
+                   int rank, const optional<token::Operator>& op) {
     auto appArg = [&]() { return args.value("app", ""); };
 
     if (name == "list_apps") {
         Json list = Json::array();
         auto now = chrono::steady_clock::now();
+        string d = dataDir.string();
         lock_guard<mutex> lock(g_appsMutex);
         for (auto& [id, st] : g_apps) {
+            if (!opSeesApp(op, d, id)) continue;  // out-of-scope apps stay hidden
             Json h = st.health;
             Json e = {{"id", id},
+                      {"group", token::groupOf(d, id)},
                       {"live", g_agents.live(id)},
                       {"lastSeenSec", (int)chrono::duration<double>(now - st.lastSeen).count()},
                       {"unackedAlerts", st.unackedAlerts}};
@@ -425,6 +471,9 @@ Json fleetToolCall(const fs::path& dataDir, const string& name, const Json& args
 
     string app = appArg();
     if (!validAppId(app)) return mcpError("missing or invalid 'app' (see list_apps)");
+    // Out-of-scope apps 404-equivalent: don't leak that the app exists.
+    if (!opSeesApp(op, dataDir.string(), app))
+        return mcpError("unknown app '" + app + "' (see list_apps)");
 
     if (name == "search_logs" || name == "tail_logs") {
         bool tailMode = (name == "tail_logs");
@@ -789,6 +838,53 @@ const char* kDashboardHtml = R"HTML(<!DOCTYPE html>
               outline: none; display: block; }
   #dLiveStage.ctl #dLiveImg { cursor: crosshair; }
   #dLiveStage.ctl { outline: 2px solid #55402c; outline-offset: -2px; }
+)HTML"
+R"HTML(
+  /* ---- wall tabs (per-group filtering) ---- */
+  #tabs { display: flex; flex-wrap: wrap; gap: 6px; padding: 12px 20px 0; }
+  #tabs[hidden] { display: none; }
+  #tabs .tab { background: #1e2128; border: 1px solid #2a2e36; color: #9aa3b2;
+               border-radius: 14px; font-size: 12px; padding: 3px 14px; cursor: pointer; }
+  #tabs .tab:hover { color: #d4d7dd; }
+  #tabs .tab.active { background: #1c2a3a; color: #79b8ff; border-color: #2c405a; }
+
+  /* ---- header gear (admin only) ---- */
+  #gearBtn { background: none; border: 1px solid #2a2e36; color: #7d838e;
+             border-radius: 5px; font-size: 13px; padding: 2px 9px; cursor: pointer; }
+  #gearBtn:hover { color: #d4d7dd; }
+  #loginCode { background: #1e2128; border: 1px solid #2a2e36; border-radius: 6px;
+               color: #d4d7dd; padding: 9px 12px; font-size: 14px; outline: none; }
+  #loginCode:focus { border-color: #3d4450; }
+  #loginOr { color: #565c66; font-size: 12px; text-align: center; }
+
+  /* ---- settings overlay (admin) ---- */
+  #settings { position: fixed; inset: 0; background: rgba(10,11,14,.75);
+              display: flex; align-items: flex-start; justify-content: center;
+              padding: 4vh 16px; overflow-y: auto; z-index: 20; }
+  #settings[hidden] { display: none; }
+  #sPanel { background: #1b1e24; border: 1px solid #323844; border-radius: 12px;
+            width: min(820px, 100%); margin-bottom: 4vh; }
+  .sSection { padding: 16px 18px; border-top: 1px solid #23262d; }
+  .sSection h3 { margin: 0 0 10px; font-size: 12px; color: #9aa3b2;
+                 text-transform: uppercase; letter-spacing: .06em; }
+  .sTable { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .sTable th { text-align: left; color: #6b727e; font-weight: 500; font-size: 11px;
+               text-transform: uppercase; letter-spacing: .05em; padding: 4px 8px; }
+  .sTable td { padding: 4px 8px; border-top: 1px solid #23262d; vertical-align: middle; }
+  .sTable input, .sTable select, .sRow input, .sRow select {
+      background: #191c22; border: 1px solid #2a2e36; border-radius: 5px;
+      color: #d4d7dd; font-size: 12px; padding: 3px 8px; }
+  .sBtn { background: #1c2a3a; color: #79b8ff; border: 1px solid #2c405a;
+          border-radius: 5px; font-size: 12px; padding: 3px 10px; cursor: pointer; }
+  .sBtn:hover { background: #223449; }
+  .sBtn.danger { background: #2a1c1c; color: #ff8a80; border-color: #5a2c2c; }
+  .sBtn.danger:hover { background: #3a2222; }
+  .sRow { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 10px; }
+  .sNote { color: #7d838e; font-size: 12px; margin-top: 6px; }
+  .sReveal { background: #101216; border: 1px solid #2b4a35; border-radius: 6px;
+             color: #4ecb71; font: 12px ui-monospace, Menlo, monospace;
+             padding: 8px 10px; margin-top: 8px; word-break: break-all; }
+  .sReveal[hidden] { display: none; }
 </style>
 </head>
 <body>
@@ -797,8 +893,10 @@ const char* kDashboardHtml = R"HTML(<!DOCTYPE html>
   <span class="sub" id="summary"></span>
   <span style="flex:1"></span>
   <span class="sub" id="who"></span>
+  <button id="gearBtn" hidden title="settings">&#9881;</button>
   <button id="logoutBtn" hidden>logout</button>
 </header>
+<div id="tabs" hidden></div>
 <div id="grid"></div>
 <div id="empty" hidden>no apps have reported yet &mdash; run
   <code>anchorbolt start &lt;app&gt; --server &lt;this url&gt;</code></div>
@@ -807,8 +905,47 @@ const char* kDashboardHtml = R"HTML(<!DOCTYPE html>
   <div id="loginBox">
     <h2>AnchorBolt</h2>
     <input id="loginTok" type="password" placeholder="operator token (op-...)" autocomplete="off">
+    <div id="loginOr">or</div>
+    <input id="loginCode" type="text" inputmode="numeric" maxlength="6"
+           placeholder="6-digit login code" autocomplete="off">
     <button id="loginBtn">Sign in</button>
     <div id="loginErr"></div>
+  </div>
+</div>
+
+<div id="settings" hidden>
+  <div id="sPanel">
+    <div class="dhead">
+      <h2 style="flex:1">Settings</h2>
+      <button id="sClose" title="close" style="background:none;border:none;color:#7d838e;font-size:22px;cursor:pointer;line-height:1">&times;</button>
+    </div>
+    <div class="sSection">
+      <h3>Apps &amp; groups</h3>
+      <table class="sTable"><thead><tr><th>app</th><th>group</th><th></th></tr></thead>
+        <tbody id="sApps"></tbody></table>
+    </div>
+    <div class="sSection">
+      <h3>Operators</h3>
+      <table class="sTable"><thead><tr><th>name</th><th>role</th><th>scope</th><th>created</th><th></th></tr></thead>
+        <tbody id="sOps"></tbody></table>
+      <div class="sRow">
+        <input id="sOpName" placeholder="new operator name">
+        <select id="sOpRole"><option value="viewer">viewer</option><option value="operator">operator</option><option value="admin">admin</option></select>
+        <input id="sOpScope" placeholder="scope (e.g. osaka,app:special) — blank = all">
+        <button class="sBtn" id="sOpAdd">Create</button>
+      </div>
+      <div class="sReveal" id="sOpToken" hidden></div>
+    </div>
+    <div class="sSection">
+      <h3>Agents (venue tokens)</h3>
+      <table class="sTable"><thead><tr><th>app-id</th><th>hash</th><th></th></tr></thead>
+        <tbody id="sAgents"></tbody></table>
+      <div class="sRow">
+        <input id="sPairApp" placeholder="app-id for a new pairing code">
+        <button class="sBtn" id="sPairBtn">Pairing code</button>
+      </div>
+      <div class="sReveal" id="sPairOut" hidden></div>
+    </div>
   </div>
 </div>
 
@@ -877,14 +1014,26 @@ function showLogin() {
 }
 
 async function doLogin() {
+  // One overlay, two credentials: a 6-digit code posts to the login-code path
+  // (mints a session), anything else is treated as an op-... token.
   const tok = document.getElementById('loginTok').value.trim();
-  if (!tok) return;
-  const r = await fetch('/api/login', { method: 'POST', body: JSON.stringify({ token: tok }) });
+  const code = document.getElementById('loginCode').value.trim();
+  let r;
+  if (/^\d{6}$/.test(code)) {
+    r = await fetch('/api/login/code', { method: 'POST', body: JSON.stringify({ code }) });
+  } else if (tok) {
+    r = await fetch('/api/login', { method: 'POST', body: JSON.stringify({ token: tok }) });
+  } else {
+    return;
+  }
   if (r.ok) location.reload();
-  else document.getElementById('loginErr').textContent = 'invalid token';
+  else document.getElementById('loginErr').textContent = 'invalid token or code';
 }
 document.getElementById('loginBtn').addEventListener('click', doLogin);
 document.getElementById('loginTok').addEventListener('keydown', e => {
+  if (e.key === 'Enter') doLogin();
+});
+document.getElementById('loginCode').addEventListener('keydown', e => {
   if (e.key === 'Enter') doLogin();
 });
 document.getElementById('logoutBtn').addEventListener('click', async () => {
@@ -895,16 +1044,21 @@ document.getElementById('logoutBtn').addEventListener('click', async () => {
 // The server enforces roles regardless; this only hides what a viewer
 // cannot use anyway.
 function applyRole(me) {
-  if (me.open) return;
-  myRole = me.role;
-  document.getElementById('who').textContent = me.name + ' (' + me.role + ')';
-  document.getElementById('logoutBtn').hidden = false;
-  if (me.role === 'viewer') {
-    for (const id of ['dRestart', 'dUpdate', 'dRollback', 'dAckBtn', 'dConsole']) {
-      const el = document.getElementById(id);
-      if (el) el.style.display = 'none';
+  // Open mode: admin already true, gear stays visible (server still enforces
+  // rank 3 on every admin endpoint regardless of what the UI shows).
+  if (!me.open) {
+    myRole = me.role;
+    document.getElementById('who').textContent = me.name + ' (' + me.role + ')';
+    document.getElementById('logoutBtn').hidden = false;
+    if (me.role === 'viewer') {
+      for (const id of ['dRestart', 'dUpdate', 'dRollback', 'dAckBtn', 'dConsole']) {
+        const el = document.getElementById(id);
+        if (el) el.style.display = 'none';
+      }
     }
   }
+  // The gear opens the settings page — admin only (or open mode).
+  if (me.open || me.role === 'admin') document.getElementById('gearBtn').hidden = false;
 }
 
 (async () => {
@@ -1577,6 +1731,7 @@ async function refresh() {
     if (!el) { el = card(app); grid.appendChild(el); }
 
     el.classList.toggle('stale', app.ageSec > STALE_SEC);
+    el.dataset.group = app.group || '';
     el.querySelector('.label').textContent = app.id;
     el.querySelector('.stats').textContent = statsLine(app);
     const badge = el.querySelector('.abadge');
@@ -1598,8 +1753,201 @@ async function refresh() {
   document.getElementById('summary').textContent =
     apps.length === 0 ? '' : `${ok}/${apps.length} healthy`;
 
+  renderTabs(apps);
+  applyTabFilter();
   renderDetail();
 }
+
+)HTML"
+R"HTML(// ---- wall tabs (client-side group filter, selection persisted) ----
+
+let activeTab = localStorage.getItem('abTab') || 'all';
+
+function groupsPresent(apps) {
+  const set = new Set();
+  let ungrouped = false;
+  for (const a of apps) { if (a.group) set.add(a.group); else ungrouped = true; }
+  return { groups: [...set].sort(), ungrouped };
+}
+
+// Tabs appear only when at least one group exists; "ungrouped" only when the
+// visible set actually mixes grouped and ungrouped apps.
+function renderTabs(apps) {
+  const bar = document.getElementById('tabs');
+  const { groups, ungrouped } = groupsPresent(apps);
+  if (groups.length === 0) { bar.hidden = true; bar.replaceChildren(); return; }
+  const names = ['all', ...groups];
+  if (ungrouped) names.push('ungrouped');
+  if (!names.includes(activeTab)) activeTab = 'all';
+  bar.hidden = false;
+  bar.replaceChildren(...names.map(name => {
+    const el = document.createElement('div');
+    el.className = 'tab' + (name === activeTab ? ' active' : '');
+    el.textContent = name;
+    el.addEventListener('click', () => {
+      activeTab = name;
+      localStorage.setItem('abTab', name);
+      renderTabs(lastApps);
+      applyTabFilter();
+    });
+    return el;
+  }));
+}
+
+function applyTabFilter() {
+  for (const el of document.querySelectorAll('#grid .card')) {
+    const g = el.dataset.group || '';
+    const show = activeTab === 'all'
+      || (activeTab === 'ungrouped' ? g === '' : g === activeTab);
+    el.style.display = show ? '' : 'none';
+  }
+}
+
+// ---- settings page (admin only; the server enforces rank 3 regardless) ----
+
+function byId(id) { return document.getElementById(id); }
+function stCell(text) { const e = document.createElement('td'); e.textContent = text; return e; }
+function stMsg(cols, msg) {
+  const tr = document.createElement('tr');
+  const c = document.createElement('td');
+  c.colSpan = cols; c.textContent = msg; c.style.color = '#6b727e';
+  tr.appendChild(c);
+  return tr;
+}
+function stReveal(id, text) { const el = byId(id); el.textContent = text; el.hidden = false; }
+async function stPost(path, body) {
+  return fetch(path, { method: 'POST', body: JSON.stringify(body) });
+}
+
+byId('gearBtn').addEventListener('click', openSettings);
+byId('sClose').addEventListener('click', () => byId('settings').hidden = true);
+byId('settings').addEventListener('click', e => {
+  if (e.target === byId('settings')) byId('settings').hidden = true;
+});
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') byId('settings').hidden = true;
+});
+
+async function openSettings() {
+  byId('settings').hidden = false;
+  byId('sOpToken').hidden = true;
+  byId('sPairOut').hidden = true;
+  loadSettingsApps();
+  loadSettingsOps();
+  loadSettingsAgents();
+}
+
+async function loadSettingsApps() {
+  const tb = byId('sApps');
+  let apps = lastApps;
+  try { apps = await (await fetch('/api/apps')).json(); } catch {}
+  if (!apps.length) { tb.replaceChildren(stMsg(3, 'no apps have reported yet')); return; }
+  tb.replaceChildren(...apps.map(a => {
+    const tr = document.createElement('tr');
+    const inp = document.createElement('input');
+    inp.value = a.group || ''; inp.placeholder = 'ungrouped'; inp.style.width = '150px';
+    const b = document.createElement('button');
+    b.className = 'sBtn'; b.textContent = 'Save';
+    b.addEventListener('click', async () => {
+      await stPost('/api/admin/group', { app: a.id, group: inp.value.trim() });
+      b.textContent = 'Saved'; setTimeout(() => b.textContent = 'Save', 1200);
+    });
+    const tdIn = document.createElement('td'); tdIn.appendChild(inp);
+    const tdB = document.createElement('td'); tdB.appendChild(b);
+    tr.append(stCell(a.id), tdIn, tdB);
+    return tr;
+  }));
+}
+
+async function loadSettingsOps() {
+  const tb = byId('sOps');
+  let ops = [];
+  try { ops = await (await fetch('/api/admin/operators')).json(); } catch {}
+  if (!ops.length) { tb.replaceChildren(stMsg(5, 'open mode — no operators registered')); return; }
+  tb.replaceChildren(...ops.map(o => {
+    const tr = document.createElement('tr');
+    const si = document.createElement('input');
+    si.value = (o.scope || []).join(','); si.placeholder = 'all'; si.style.width = '150px';
+    const sset = document.createElement('button');
+    sset.className = 'sBtn'; sset.textContent = 'Set'; sset.style.marginLeft = '4px';
+    sset.addEventListener('click', async () => {
+      await stPost('/api/admin/operator/scope', { name: o.name, scope: si.value.trim() });
+      sset.textContent = 'Set!'; setTimeout(() => sset.textContent = 'Set', 1200);
+    });
+    const tdS = document.createElement('td'); tdS.append(si, sset);
+    const lc = document.createElement('button');
+    lc.className = 'sBtn'; lc.textContent = 'Login code';
+    lc.addEventListener('click', async () => {
+      const r = await stPost('/api/admin/login-code', { name: o.name });
+      if (r.ok) { const j = await r.json();
+        stReveal('sOpToken', 'login code for ' + o.name + ': ' + j.code + '  (valid 10 min)'); }
+    });
+    const rv = document.createElement('button');
+    rv.className = 'sBtn danger'; rv.textContent = 'Revoke'; rv.style.marginLeft = '4px';
+    rv.addEventListener('click', async () => {
+      if (!confirm('Revoke operator "' + o.name + '"? Their sessions die immediately.')) return;
+      await stPost('/api/admin/operator/revoke', { name: o.name });
+      loadSettingsOps();
+    });
+    const tdX = document.createElement('td'); tdX.append(lc, rv);
+    tr.append(stCell(o.name), stCell(o.role), tdS, stCell(o.created || ''), tdX);
+    return tr;
+  }));
+}
+
+byId('sOpAdd').addEventListener('click', async () => {
+  const name = byId('sOpName').value.trim();
+  if (!name) return;
+  const r = await stPost('/api/admin/operator/new',
+    { name, role: byId('sOpRole').value, scope: byId('sOpScope').value.trim() });
+  if (r.ok) {
+    const j = await r.json();
+    stReveal('sOpToken', 'token for ' + j.name + ' (shown ONCE — copy it now):\n' + j.token);
+    byId('sOpName').value = ''; byId('sOpScope').value = '';
+    loadSettingsOps();
+  } else {
+    stReveal('sOpToken', 'error: ' + (await r.text()));
+  }
+});
+
+async function loadSettingsAgents() {
+  const tb = byId('sAgents');
+  let ag = [];
+  try { ag = await (await fetch('/api/admin/agents')).json(); } catch {}
+  if (!ag.length) { tb.replaceChildren(stMsg(3, 'open mode — no agent tokens registered')); return; }
+  tb.replaceChildren(...ag.map(a => {
+    const tr = document.createElement('tr');
+    const pc = document.createElement('button');
+    pc.className = 'sBtn'; pc.textContent = 'Pairing code';
+    pc.addEventListener('click', () => mintPairCode(a.id));
+    const rv = document.createElement('button');
+    rv.className = 'sBtn danger'; rv.textContent = 'Revoke'; rv.style.marginLeft = '4px';
+    rv.addEventListener('click', async () => {
+      if (!confirm('Revoke agent token for "' + a.id + '"?')) return;
+      await stPost('/api/admin/agent/revoke', { id: a.id });
+      loadSettingsAgents();
+    });
+    const tdX = document.createElement('td'); tdX.append(pc, rv);
+    tr.append(stCell(a.id), stCell((a.hashPrefix || '') + '...'), tdX);
+    return tr;
+  }));
+}
+
+async function mintPairCode(app) {
+  const r = await stPost('/api/admin/pair-code', { app });
+  if (r.ok) {
+    const j = await r.json();
+    stReveal('sPairOut', 'pairing code for ' + app + ': ' + j.code + '  (valid 10 min)\n'
+      + 'venue: anchorbolt start --pair ' + j.code + ' --server <this server url>');
+  } else {
+    stReveal('sPairOut', 'error: ' + (await r.text()));
+  }
+}
+
+byId('sPairBtn').addEventListener('click', () => {
+  const app = byId('sPairApp').value.trim();
+  if (app) { mintPairCode(app); byId('sPairApp').value = ''; }
+});
 
 refresh();
 setInterval(refresh, 3000);
@@ -1660,6 +2008,20 @@ int cmdServe(const vector<string>& args) {
         res.status = op ? 403 : 401;
         res.set_content(op ? "forbidden" : "unauthorized", "text/plain");
         return false;
+    };
+
+    // The operator behind this request (nullopt in open mode). Used for scope
+    // filtering; role gating stays with requireRole above.
+    auto currentOp = [dataDir, cookieToken](const httplib::Request& req)
+        -> optional<token::Operator> {
+        if (!token::operatorsEnabled(dataDir.string())) return nullopt;  // open mode
+        return token::verifyOperator(dataDir.string(), cookieToken(req));
+    };
+    // Per-app visibility: every per-app endpoint 404s an out-of-scope app so
+    // its existence never leaks to a narrowly-scoped operator. Open mode and
+    // unscoped/admin operators see everything.
+    auto appVisible = [dataDir, currentOp](const httplib::Request& req, const string& appId) {
+        return opSeesApp(currentOp(req), dataDir.string(), appId);
     };
 
     // WS hub: agents say hello {type, app, token}; replies to commands come
@@ -1777,12 +2139,13 @@ int cmdServe(const vector<string>& args) {
     svr.Post("/mcp", [dataDir, cookieToken](const httplib::Request& req, httplib::Response& res) {
         int rank = 3;
         string d = dataDir.string();
+        optional<token::Operator> op;  // nullopt = open mode / full visibility
         if (token::operatorsEnabled(d)) {
             string tok;
             string h = req.get_header_value("Authorization");
             if (h.rfind("Bearer ", 0) == 0) tok = h.substr(7);
             if (tok.empty()) tok = cookieToken(req);
-            auto op = token::verifyOperator(d, tok);
+            op = token::verifyOperator(d, tok);
             if (!op) {
                 res.status = 401;
                 res.set_content("unauthorized (Bearer operator token required)", "text/plain");
@@ -1814,7 +2177,7 @@ int cmdServe(const vector<string>& args) {
         } else if (method == "tools/call") {
             string name = rpc["params"].value("name", "");
             Json args = rpc["params"].value("arguments", Json::object());
-            reply["result"] = fleetToolCall(dataDir, name, args, rank);
+            reply["result"] = fleetToolCall(dataDir, name, args, rank, op);
         } else if (method == "ping") {
             reply["result"] = Json::object();
         } else {
@@ -1845,13 +2208,172 @@ int cmdServe(const vector<string>& args) {
                         "application/json");
     });
 
+    // ---- admin (rank 3): groups, operators, agents, codes -------------------
+    // Every admin endpoint reuses the Token.cpp registries so the CLI and the
+    // dashboard settings page mint/revoke through exactly the same code path.
+
+    // Scope arrives from the settings UI as free text (comma-separated) or as a
+    // JSON array; accept either and normalize to a string vector.
+    auto parseScope = [](const Json& v) -> vector<string> {
+        vector<string> out;
+        if (v.is_array()) {
+            for (auto& s : v) if (s.is_string() && !s.get<string>().empty()) out.push_back(s.get<string>());
+        } else if (v.is_string()) {
+            string cur;
+            for (char c : v.get<string>()) {
+                if (c == ',') { if (!cur.empty()) out.push_back(cur); cur.clear(); }
+                else if (c != ' ') cur.push_back(c);
+            }
+            if (!cur.empty()) out.push_back(cur);
+        }
+        return out;
+    };
+    auto parseBody = [](const httplib::Request& req, httplib::Response& res, Json& body) {
+        try { body = Json::parse(req.body); return true; }
+        catch (...) { res.status = 400; res.set_content("invalid JSON", "text/plain"); return false; }
+    };
+
+    // Assign an app to a group (empty group removes it).
+    svr.Post("/api/admin/group", [dataDir, requireRole, parseBody](const httplib::Request& req, httplib::Response& res) {
+        if (!requireRole(req, res, 3)) return;
+        Json body;
+        if (!parseBody(req, res, body)) return;
+        string app = body.value("app", "");
+        if (!validAppId(app)) { res.status = 400; res.set_content("invalid app id", "text/plain"); return; }
+        token::setGroup(dataDir.string(), app, body.value("group", ""));
+        res.set_content("ok", "text/plain");
+    });
+
+    svr.Get("/api/admin/operators", [dataDir, requireRole](const httplib::Request& req, httplib::Response& res) {
+        if (!requireRole(req, res, 3)) return;
+        res.set_content(dumpSafeS(token::listOperators(dataDir.string())), "application/json");
+    });
+
+    svr.Post("/api/admin/operator/new", [dataDir, requireRole, parseBody, parseScope](const httplib::Request& req, httplib::Response& res) {
+        if (!requireRole(req, res, 3)) return;
+        Json body;
+        if (!parseBody(req, res, body)) return;
+        string name = body.value("name", "");
+        string role = body.value("role", "");
+        if (name.empty()) { res.status = 400; res.set_content("name required", "text/plain"); return; }
+        string tok = token::mintOperator(dataDir.string(), name, role, parseScope(body.value("scope", Json())));
+        if (tok.empty()) { res.status = 400; res.set_content("invalid role (viewer|operator|admin)", "text/plain"); return; }
+        // The plaintext token is returned ONCE — the UI shows it and nowhere else.
+        res.set_content(dumpSafeS(Json({{"name", name}, {"token", tok}})), "application/json");
+    });
+
+    svr.Post("/api/admin/operator/revoke", [dataDir, requireRole, parseBody](const httplib::Request& req, httplib::Response& res) {
+        if (!requireRole(req, res, 3)) return;
+        Json body;
+        if (!parseBody(req, res, body)) return;
+        bool ok = token::revokeOperator(dataDir.string(), body.value("name", ""));
+        if (!ok) { res.status = 404; res.set_content("no such operator", "text/plain"); return; }
+        res.set_content("ok", "text/plain");
+    });
+
+    svr.Post("/api/admin/operator/scope", [dataDir, requireRole, parseBody, parseScope](const httplib::Request& req, httplib::Response& res) {
+        if (!requireRole(req, res, 3)) return;
+        Json body;
+        if (!parseBody(req, res, body)) return;
+        bool ok = token::setOperatorScope(dataDir.string(), body.value("name", ""), parseScope(body.value("scope", Json())));
+        if (!ok) { res.status = 404; res.set_content("no such operator", "text/plain"); return; }
+        res.set_content("ok", "text/plain");
+    });
+
+    svr.Get("/api/admin/agents", [dataDir, requireRole](const httplib::Request& req, httplib::Response& res) {
+        if (!requireRole(req, res, 3)) return;
+        res.set_content(dumpSafeS(token::listAgents(dataDir.string())), "application/json");
+    });
+
+    svr.Post("/api/admin/agent/revoke", [dataDir, requireRole, parseBody](const httplib::Request& req, httplib::Response& res) {
+        if (!requireRole(req, res, 3)) return;
+        Json body;
+        if (!parseBody(req, res, body)) return;
+        bool ok = token::revokeAgent(dataDir.string(), body.value("id", ""));
+        if (!ok) { res.status = 404; res.set_content("no such agent", "text/plain"); return; }
+        res.set_content("ok", "text/plain");
+    });
+
+    // Mint a single-use pairing code for a venue (app-id). The venue redeems it
+    // with `anchorbolt start --pair <code>` — no token ever gets copied by hand.
+    svr.Post("/api/admin/pair-code", [dataDir, requireRole, parseBody](const httplib::Request& req, httplib::Response& res) {
+        if (!requireRole(req, res, 3)) return;
+        Json body;
+        if (!parseBody(req, res, body)) return;
+        string app = body.value("app", "");
+        if (!validAppId(app)) { res.status = 400; res.set_content("invalid app id", "text/plain"); return; }
+        string code = token::mintCode(dataDir.string(), "pair", app, 600);
+        res.set_content(dumpSafeS(Json({{"code", code}, {"app", app}, {"expiresSec", 600}})), "application/json");
+    });
+
+    // Mint a single-use login code for an operator (dashboard sign-in without
+    // pasting the op-... token).
+    svr.Post("/api/admin/login-code", [dataDir, requireRole, parseBody](const httplib::Request& req, httplib::Response& res) {
+        if (!requireRole(req, res, 3)) return;
+        Json body;
+        if (!parseBody(req, res, body)) return;
+        string name = body.value("name", "");
+        // Only mint for an operator that actually exists.
+        bool exists = false;
+        for (auto& e : token::listOperators(dataDir.string())) if (e.value("name", "") == name) exists = true;
+        if (!exists) { res.status = 404; res.set_content("no such operator", "text/plain"); return; }
+        string code = token::mintCode(dataDir.string(), "login", name, 600);
+        res.set_content(dumpSafeS(Json({{"code", code}, {"name", name}, {"expiresSec", 600}})), "application/json");
+    });
+
+    // ---- code redemption (NO auth — the code itself is the credential) -------
+
+    // Venue pairing: redeem the code, mint an agent token for its app, hand
+    // both back. `anchorbolt start --pair` calls this before it does anything.
+    svr.Post("/api/pair", [dataDir, parseBody](const httplib::Request& req, httplib::Response& res) {
+        if (codeGuardBlocked()) { res.status = 429; res.set_content("too many attempts, try later", "text/plain"); return; }
+        Json body;
+        if (!parseBody(req, res, body)) return;
+        auto redeemed = token::redeemCode(dataDir.string(), body.value("code", ""));
+        if (!redeemed || redeemed->first != "pair") {
+            codeGuardFail();
+            res.status = 401;
+            res.set_content("invalid or expired code", "text/plain");
+            return;
+        }
+        string app = redeemed->second;
+        string tok = token::mintAgent(dataDir.string(), app);
+        if (tok.empty()) { res.status = 500; res.set_content("could not mint token", "text/plain"); return; }
+        logNotice("anchorbolt") << "paired venue '" << app << "' via code";
+        res.set_content(dumpSafeS(Json({{"app", app}, {"token", tok}})), "application/json");
+    });
+
+    // Operator login by code: redeem, mint a SESSION token (os-...), set the
+    // same abtoken cookie. The session resolves back to the operator on every
+    // request, so revoking the operator kills the session automatically.
+    svr.Post("/api/login/code", [dataDir, parseBody](const httplib::Request& req, httplib::Response& res) {
+        if (codeGuardBlocked()) { res.status = 429; res.set_content("too many attempts, try later", "text/plain"); return; }
+        Json body;
+        if (!parseBody(req, res, body)) return;
+        auto redeemed = token::redeemCode(dataDir.string(), body.value("code", ""));
+        if (!redeemed || redeemed->first != "login") {
+            codeGuardFail();
+            res.status = 401;
+            res.set_content("invalid or expired code", "text/plain");
+            return;
+        }
+        string name = redeemed->second;
+        string sess = token::mintSession(dataDir.string(), name);
+        if (sess.empty()) { res.status = 500; res.set_content("could not mint session", "text/plain"); return; }
+        auto op = token::verifyOperator(dataDir.string(), sess);  // resolve role for the reply
+        res.set_header("Set-Cookie", "abtoken=" + sess +
+                       "; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000");
+        res.set_content(dumpSafeS(Json({{"name", name}, {"role", op ? op->role : "viewer"}})), "application/json");
+    });
+
 
     // Dashboard -> agent command bridge. Blocks until the agent replies (or
     // 15s). Restart is handled by the supervisor itself; 'call' relays an MCP
     // tool call to the app (agent-side allowlist applies).
-    svr.Post(R"(/api/command/([^/]+))", [requireRole](const httplib::Request& req, httplib::Response& res) {
+    svr.Post(R"(/api/command/([^/]+))", [requireRole, appVisible](const httplib::Request& req, httplib::Response& res) {
         if (!requireRole(req, res, 2)) return;
         string id = req.matches[1];
+        if (!appVisible(req, id)) { res.status = 404; return; }
         Json body;
         try {
             body = Json::parse(req.body);
@@ -1967,10 +2489,11 @@ int cmdServe(const vector<string>& args) {
         res.set_content("ok", "text/plain");
     });
 
-    svr.Get(R"(/api/image/([^/]+)/([^/]+))", [requireRole](const httplib::Request& req, httplib::Response& res) {
+    svr.Get(R"(/api/image/([^/]+)/([^/]+))", [requireRole, appVisible](const httplib::Request& req, httplib::Response& res) {
         if (!requireRole(req, res, 1)) return;
         string id = req.matches[1];
         string name = req.matches[2];
+        if (!appVisible(req, id)) { res.status = 404; return; }
         lock_guard<mutex> lock(g_appsMutex);
         auto it = g_apps.find(id);
         if (it == g_apps.end()) { res.status = 404; return; }
@@ -2023,9 +2546,10 @@ int cmdServe(const vector<string>& args) {
     });
 
     // Log lines newer than ?after=<seq> (0 = everything buffered).
-    svr.Get(R"(/api/log/([^/]+))", [requireRole](const httplib::Request& req, httplib::Response& res) {
+    svr.Get(R"(/api/log/([^/]+))", [requireRole, appVisible](const httplib::Request& req, httplib::Response& res) {
         if (!requireRole(req, res, 1)) return;
         string id = req.matches[1];
+        if (!appVisible(req, id)) { res.status = 404; return; }
         uint64_t after = 0;
         if (req.has_param("after")) {
             try { after = stoull(req.get_param_value("after")); } catch (...) {}
@@ -2081,9 +2605,10 @@ int cmdServe(const vector<string>& args) {
     });
 
     // Alerts newer than ?after=<seq> (0 = everything buffered).
-    svr.Get(R"(/api/alert/([^/]+))", [requireRole](const httplib::Request& req, httplib::Response& res) {
+    svr.Get(R"(/api/alert/([^/]+))", [requireRole, appVisible](const httplib::Request& req, httplib::Response& res) {
         if (!requireRole(req, res, 1)) return;
         string id = req.matches[1];
+        if (!appVisible(req, id)) { res.status = 404; return; }
         uint64_t after = 0;
         if (req.has_param("after")) {
             try { after = stoull(req.get_param_value("after")); } catch (...) {}
@@ -2105,9 +2630,10 @@ int cmdServe(const vector<string>& args) {
 
     // Operator pressed Clear: acknowledged — the wall badge goes quiet. The
     // list itself (and the JSONL on disk) stays.
-    svr.Post(R"(/api/alert/([^/]+)/clear)", [requireRole](const httplib::Request& req, httplib::Response& res) {
+    svr.Post(R"(/api/alert/([^/]+)/clear)", [requireRole, appVisible](const httplib::Request& req, httplib::Response& res) {
         if (!requireRole(req, res, 2)) return;
         string id = req.matches[1];
+        if (!appVisible(req, id)) { res.status = 404; return; }
         lock_guard<mutex> lock(g_appsMutex);
         auto it = g_apps.find(id);
         if (it != g_apps.end()) it->second.unackedAlerts = 0;
@@ -2117,10 +2643,11 @@ int cmdServe(const vector<string>& args) {
     // Recent heartbeat history for the detail-view graphs: tail of today's
     // JSONL as a JSON array (raw line concatenation — every line is already
     // a JSON object). ~1200 entries = 1h at the default 3s poll.
-    svr.Get(R"(/api/history/([^/]+))", [dataDir, requireRole](const httplib::Request& req, httplib::Response& res) {
+    svr.Get(R"(/api/history/([^/]+))", [dataDir, requireRole, appVisible](const httplib::Request& req, httplib::Response& res) {
         if (!requireRole(req, res, 1)) return;
         string id = req.matches[1];
         if (!validAppId(id)) { res.status = 400; return; }
+        if (!appVisible(req, id)) { res.status = 404; return; }
         ifstream in(dataDir / id / ("heartbeat-" + getTimestampString("%Y-%m-%d") + ".jsonl"));
         deque<string> lines;
         string line;
@@ -2138,16 +2665,25 @@ int cmdServe(const vector<string>& args) {
         res.set_content(body, "application/json");
     });
 
-    svr.Get("/api/apps", [requireRole](const httplib::Request& req, httplib::Response& res) {
+    svr.Get("/api/apps", [requireRole, currentOp, dataDir](const httplib::Request& req, httplib::Response& res) {
         if (!requireRole(req, res, 1)) return;
+        // Resolve the operator once, then hand each app its group and filter to
+        // the in-scope set (open mode / unscoped operators see everything).
+        auto op = currentOp(req);
+        string d = dataDir.string();
+        Json groups = token::loadGroups(d);
         Json list = Json::array();
         auto now = chrono::steady_clock::now();
         lock_guard<mutex> lock(g_appsMutex);
         for (auto& [id, st] : g_apps) {
+            string group = (groups.contains(id) && groups[id].is_string())
+                               ? groups[id].get<string>() : "";
+            if (op && !token::inScope(*op, id, group)) continue;
             double age = chrono::duration<double>(now - st.lastSeen).count();
             Json images = Json::object();
             for (auto& [name, slot] : st.images) images[name] = slot.seq;
             list.push_back({{"id", id},
+                            {"group", group},
                             {"ageSec", age},
                             {"thumbSeq", st.thumbSeq},
                             {"images", images},
@@ -2158,9 +2694,10 @@ int cmdServe(const vector<string>& args) {
         res.set_content(list.dump(), "application/json");
     });
 
-    svr.Get(R"(/api/thumb/([^/]+))", [requireRole](const httplib::Request& req, httplib::Response& res) {
+    svr.Get(R"(/api/thumb/([^/]+))", [requireRole, appVisible](const httplib::Request& req, httplib::Response& res) {
         if (!requireRole(req, res, 1)) return;
         string id = req.matches[1];
+        if (!appVisible(req, id)) { res.status = 404; return; }
         lock_guard<mutex> lock(g_appsMutex);
         auto it = g_apps.find(id);
         if (it == g_apps.end() || it->second.thumb.empty()) {

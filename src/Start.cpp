@@ -67,7 +67,9 @@ struct StartOptions {
     int    graceSec    = 15;     // boot grace before the watchdog arms
     string serverUrl;            // fleet server base URL (empty = no push)
     string appId;                // id on the fleet server (default: binary name)
-    string token;                // agent token (--token > ANCHORBOLT_TOKEN > tokenFile)
+    string token;                // agent token (--token > ANCHORBOLT_TOKEN > tokenFile > pair file)
+    string pairCode;             // --pair <code>: redeem for id+token, then persist
+    string configPath;           // config file that was loaded (empty = none)
     int    thumbIntervalSec = 30;    // 0 = never push screenshots
     int    thumbWidth = 512;
     int    thumbQuality = 75;
@@ -965,6 +967,7 @@ bool parseArgs(const vector<string>& args, StartOptions& opt) {
             while (!tok.empty() && (tok.back() == '\r' || tok.back() == ' ')) tok.pop_back();
             opt.token = tok;
         }
+        else if (a == "--pair")     { auto v = next("--pair");     if (!v) return false; opt.pairCode = *v; }
         else if (a == "--ws-port")  { auto v = next("--ws-port");  if (!v) return false; opt.wsPort = stoi(*v); }
         else if (a == "--allow-control") { opt.allowControl = true; }
         else if (a == "--allow-update")  { opt.allowUpdate = true; }
@@ -1109,8 +1112,31 @@ bool loadConfig(const fs::path& path, StartOptions& opt) {
             return false;
         }
     }
+    opt.configPath = fs::absolute(path).string();
     logNotice("anchorbolt") << "config loaded: " << path.string();
     return true;
+}
+
+// Where the paired identity persists: next to the config file if one was
+// loaded, else in the platform log dir. Read back on later (non-pair) runs as
+// the lowest-priority token source, so a venue keeps its token across restarts.
+fs::path pairTokenFile(const StartOptions& opt, const fs::path& logDir) {
+    if (!opt.configPath.empty())
+        return fs::path(opt.configPath).parent_path() / "anchorbolt.token.json";
+    return logDir / "anchorbolt.token.json";
+}
+
+// Adopt a persisted {id, token} as a base: only fills fields nothing else set,
+// so config/env/flags all still win over it.
+void readPairTokenFile(const fs::path& file, StartOptions& opt) {
+    ifstream in(file);
+    if (!in) return;
+    Json j;
+    try { j = Json::parse(in); } catch (...) { return; }
+    if (opt.appId.empty() && j.contains("id") && j["id"].is_string())
+        opt.appId = j["id"].get<string>();
+    if (opt.token.empty() && j.contains("token") && j["token"].is_string())
+        opt.token = j["token"].get<string>();
 }
 
 // Platform-conventional log home (CWD-relative defaults break under
@@ -1418,9 +1444,48 @@ int cmdStart(const vector<string>& args) {
         if (cfg.empty() && fs::exists("anchorbolt.json")) cfg = "anchorbolt.json";
         if (!cfg.empty() && !loadConfig(cfg, opt)) return 1;
     }
+    // A previously-paired identity next to the config is the lowest-priority
+    // token source: adopt id/token only where nothing else set them, so config
+    // tokenFile, the env, and flags all still win. (The no-config location
+    // needs the log dir, so that case is read further down.)
+    if (!opt.configPath.empty())
+        readPairTokenFile(pairTokenFile(opt, {}), opt);
     // Env token sits between config (tokenFile) and the --token flag.
     if (const char* envTok = getenv("ANCHORBOLT_TOKEN")) opt.token = envTok;
     if (!parseArgs(args, opt)) return 1;
+    const bool pairArg = !opt.pairCode.empty();  // now that flags are parsed
+
+    // --pair <code>: before anything else, redeem the code at the fleet server
+    // for this venue's id + agent token. No tc-... string ever gets copied by
+    // hand — the operator pastes a 6-digit code they read off the dashboard.
+    if (!opt.pairCode.empty()) {
+        if (opt.serverUrl.empty()) {
+            cerr << "anchorbolt start: --pair needs --server <fleet url>" << endl;
+            return 1;
+        }
+        httplib::Client cli(opt.serverUrl);
+        cli.set_connection_timeout(5, 0);
+        cli.set_read_timeout(5, 0);
+        auto res = cli.Post("/api/pair", Json({{"code", opt.pairCode}}).dump(), "application/json");
+        if (!res || res->status != 200) {
+            cerr << "anchorbolt start: pairing failed"
+                 << (res ? " (HTTP " + to_string(res->status) + ": " + res->body + ")"
+                         : " (server " + opt.serverUrl + " unreachable)") << endl;
+            return 1;
+        }
+        Json pr;
+        try { pr = Json::parse(res->body); } catch (...) {
+            cerr << "anchorbolt start: pairing response was not JSON" << endl;
+            return 1;
+        }
+        opt.appId = pr.value("app", "");   // server-assigned id + token win this run
+        opt.token = pr.value("token", "");
+        if (opt.appId.empty() || opt.token.empty()) {
+            cerr << "anchorbolt start: pairing response missing app/token" << endl;
+            return 1;
+        }
+        logNotice("anchorbolt") << "paired as '" << opt.appId << "' via code";
+    }
 
     // Resolve what -p / config / the current directory points at: a binary,
     // a .app bundle, or a TrussC project. Absolute up front so restarts
@@ -1443,6 +1508,24 @@ int cmdStart(const vector<string>& args) {
     fs::path logDir = opt.logDir.empty() ? platformLogDir(opt.appId)
                                          : fs::absolute(opt.logDir);
     fs::create_directories(logDir);
+
+    // No-config runs keep the paired identity in the log dir; adopt its token
+    // now (lowest priority — only if nothing else, including --pair, set one).
+    if (opt.configPath.empty() && !pairArg)
+        readPairTokenFile(pairTokenFile(opt, logDir), opt);
+    // Just paired: persist id + token so the next plain run reuses them.
+    if (pairArg) {
+        fs::path pf = pairTokenFile(opt, logDir);
+        error_code ec;
+        fs::create_directories(pf.parent_path(), ec);
+        ofstream out(pf, ios::trunc);
+        if (out) {
+            out << Json({{"id", opt.appId}, {"token", opt.token}}).dump(2) << "\n";
+            logNotice("anchorbolt") << "paired identity saved to " << pf.string();
+        } else {
+            logWarning("anchorbolt") << "could not write paired identity to " << pf.string();
+        }
+    }
     string pruneDay = getTimestampString("%Y-%m-%d");
 
     // MCP port: scan up from the default so several supervisors coexist on
