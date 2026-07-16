@@ -7,7 +7,10 @@ remote update — `--allow-update` + pipeline + auto-rollback + git hash on
 the wall; sink engine — slack/discord/ntfy/uptime-kuma presets + generic
 templated webhook, at-least-once with per-sink queues; Windows start —
 real-hardware verified on a JP-locale box incl. remote update + rollback,
-CP932 dump crash fixed with dumpSafe, dual-stack serve.)
+CP932 dump crash fixed with dumpSafe, dual-stack serve; mcp::alert +
+dashboard event badge; operator tokens + login (viewer/operator/admin);
+fleet /mcp for AI; live view + remote control; app groups + scoped
+visibility + settings page + 6-digit pairing/login codes.)
 
 ## 1. Share URLs (deferred from operator tokens)
 
@@ -22,11 +25,6 @@ Remaining: mutating calls block on a server-side approval queue with TTL —
 notification links the human to an approve/deny page on the dashboard
 (same shape as a permission prompt; never lives in chat apps).
 
-## 3. Remote live view (v2)
-
-JPEG frames over the existing WS into `<img>`; remote ImGui panel as an
-HTML mirror (`tcx_imgui_get_widgets` → native HTML controls →
-`tcx_imgui_click` / `tcx_imgui_input`). Upgrade path: H.264 fMP4 over WS.
 
 ## Small stuff
 

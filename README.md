@@ -159,6 +159,24 @@ to by `tokenFile`, or in the `ANCHORBOLT_TOKEN` env var.
   Read-only tools (`tc_get_*`) relay freely; anything mutating requires
   the venue operator to have started the agent with `--allow-control`
   (updates: `--allow-update`)
+- **live view + remote control**: a Live button in the detail view streams
+  the app's screen (JPEG over the agent's WebSocket, ~10fps, only while a
+  browser watches — auto-stops after 10s idle). An operator can toggle
+  control to drive the app: clicks/drags map to app coordinates and
+  keystrokes forward as `tc_mouse_*` / `tc_key_press` (needs the operator
+  role AND the venue's `--allow-control`; the app opts in with
+  `mcp::registerDebuggerTools()`)
+- **groups, tabs & scoped visibility**: assign apps to groups (server-side,
+  in the settings page); the wall gets per-group tabs. Operators can carry
+  a `scope` (group names or `app:<id>`) so a client sees only their own
+  venues — out-of-scope apps 404 everywhere, including fleet /mcp
+- **settings page** (admin): manage app groups, operators (create with a
+  role + scope, revoke, token shown once) and agents from the dashboard
+- **6-digit codes**: single-use, 10-min codes for two flows — venue
+  pairing (`anchorbolt start --pair 483201` trades the code for an agent
+  token and saves it, so nobody copies `tc-...` strings) and operator
+  login (paste 6 digits instead of the `op-...` token; mints a browser
+  session that dies the moment the operator is revoked)
 
 Options: `--port` (HTTP port, default 54722 — "truss" typed on the QWERTY number row; ws = port+1) `--ws-port <n>` (command
 channel, default port+1) `--data <dir>`.
