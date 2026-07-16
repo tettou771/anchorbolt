@@ -174,7 +174,8 @@ to by `tokenFile`, or in the `ANCHORBOLT_TOKEN` env var.
   role + scope, revoke, token shown once) and agents from the dashboard
 - **6-digit codes**: single-use, 10-min codes for two flows — venue
   pairing (`anchorbolt start --pair 483201` trades the code for an agent
-  token and saves it, so nobody copies `tc-...` strings) and operator
+  token and saves it to the platform state dir at 0600 — keyed by binary
+  name, never inside a repo — so nobody copies `tc-...` strings) and operator
   login (paste 6 digits instead of the `op-...` token; mints a browser
   session that dies the moment the operator is revoked)
 
@@ -269,3 +270,34 @@ branch).
 trusscli update   # regenerate CMakeLists/CMakePresets (they are gitignored)
 trusscli build
 ```
+
+## Exposing the server (reverse proxy / Cloudflare tunnel)
+
+TLS terminates at the proxy; point it at the HTTP port (54722). The
+command channel is a **separate WebSocket hub** on `port+1` (54723) — the
+interactive features (Restart / Update buttons, live view, remote control,
+fleet `/mcp` `restart_app`/`app_call`) ride it. To reach it through a
+single hostname, route a path to the hub and tell the agent about it:
+
+```yaml
+# cloudflared ingress — same hostname, path split
+ingress:
+  - hostname: ops.example.com
+    path: /ws
+    service: ws://localhost:54723
+  - hostname: ops.example.com
+    service: http://localhost:54722
+```
+
+```bash
+# venue agent: HTTP over the hostname, WS over the /ws path
+anchorbolt start -p myApp --server https://ops.example.com \
+    --ws-url wss://ops.example.com/ws --allow-control
+```
+
+Monitoring alone (wall, logs, graphs, alerts, screenshot history, fleet
+`/mcp` read tools) needs only the HTTP route — `--ws-url` is required
+solely for the interactive/control features. **Before exposing publicly,
+register an operator token** (`token operator new ... --role admin`) or the
+dashboard and `/mcp` are wide open — in open mode `/mcp` grants everyone
+admin, which means remote restart to anyone with the URL.

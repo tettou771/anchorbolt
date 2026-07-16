@@ -74,6 +74,9 @@ struct StartOptions {
     int    thumbWidth = 512;
     int    thumbQuality = 75;
     int    wsPort = 0;           // command channel port (0 = server port + 1)
+    string wsUrl;                // explicit ws(s):// override (bypasses host:port+1
+                                 // derivation — needed behind a reverse proxy /
+                                 // Cloudflare tunnel that routes a PATH to the hub)
     bool   allowControl = false; // let the server relay MUTATING tools
     bool   allowUpdate = false;  // let the server trigger the update pipeline
     bool   updateCustom = false; // config overrode the pipeline (no smart skip)
@@ -668,22 +671,29 @@ class CommandChannel {
 public:
     CommandChannel(const StartOptions& opt, fs::path logDir)
         : opt_(opt), logDir_(std::move(logDir)) {
-        // ws://host:wsPort/ derived from the HTTP server URL.
-        string url = opt.serverUrl;
-        bool tls = url.rfind("https://", 0) == 0;
-        if (tls) url = url.substr(8);
-        else if (url.rfind("http://", 0) == 0) url = url.substr(7);
-        size_t slash = url.find('/');
-        if (slash != string::npos) url = url.substr(0, slash);
-        size_t colon = url.find(':');
-        string host = (colon == string::npos) ? url : url.substr(0, colon);
-        int wsPort = opt.wsPort;
-        if (wsPort == 0) {
-            int httpPort = tls ? 443 : 80;
-            if (colon != string::npos) httpPort = stoi(url.substr(colon + 1));
-            wsPort = httpPort + 1;
+        if (!opt.wsUrl.empty()) {
+            // Explicit override: a reverse proxy / Cloudflare tunnel routes a
+            // PATH (e.g. wss://host/ws) to the hub, so the host:port+1 guess
+            // below can't reach it. Use it verbatim.
+            url_ = opt.wsUrl;
+        } else {
+            // ws://host:wsPort/ derived from the HTTP server URL.
+            string url = opt.serverUrl;
+            bool tls = url.rfind("https://", 0) == 0;
+            if (tls) url = url.substr(8);
+            else if (url.rfind("http://", 0) == 0) url = url.substr(7);
+            size_t slash = url.find('/');
+            if (slash != string::npos) url = url.substr(0, slash);
+            size_t colon = url.find(':');
+            string host = (colon == string::npos) ? url : url.substr(0, colon);
+            int wsPort = opt.wsPort;
+            if (wsPort == 0) {
+                int httpPort = tls ? 443 : 80;
+                if (colon != string::npos) httpPort = stoi(url.substr(colon + 1));
+                wsPort = httpPort + 1;
+            }
+            url_ = (tls ? "wss://" : "ws://") + host + ":" + to_string(wsPort) + "/";
         }
-        url_ = (tls ? "wss://" : "ws://") + host + ":" + to_string(wsPort) + "/";
 
         openL_ = ws_.onOpen.listen([this]() {
             wsSend(Json({{"type", "hello"},
@@ -969,6 +979,7 @@ bool parseArgs(const vector<string>& args, StartOptions& opt) {
         }
         else if (a == "--pair")     { auto v = next("--pair");     if (!v) return false; opt.pairCode = *v; }
         else if (a == "--ws-port")  { auto v = next("--ws-port");  if (!v) return false; opt.wsPort = stoi(*v); }
+        else if (a == "--ws-url")   { auto v = next("--ws-url");   if (!v) return false; opt.wsUrl = *v; }
         else if (a == "--allow-control") { opt.allowControl = true; }
         else if (a == "--allow-update")  { opt.allowUpdate = true; }
         else if (a == "--thumb-interval") { auto v = next("--thumb-interval"); if (!v) return false; opt.thumbIntervalSec = stoi(*v); }
@@ -1076,6 +1087,7 @@ bool loadConfig(const fs::path& path, StartOptions& opt) {
     opt.serverUrl = c.value("server", opt.serverUrl);
     if (c.contains("port")) { opt.port = c["port"].get<int>(); opt.portExplicit = true; }
     opt.wsPort    = c.value("wsPort", opt.wsPort);
+    opt.wsUrl     = c.value("wsUrl", opt.wsUrl);
     opt.allowControl = c.value("allowControl", opt.allowControl);
     opt.allowUpdate  = c.value("allowUpdate", opt.allowUpdate);
     if (c.contains("update") && c["update"].is_array()) {
@@ -1117,13 +1129,21 @@ bool loadConfig(const fs::path& path, StartOptions& opt) {
     return true;
 }
 
-// Where the paired identity persists: next to the config file if one was
-// loaded, else in the platform log dir. Read back on later (non-pair) runs as
-// the lowest-priority token source, so a venue keeps its token across restarts.
-fs::path pairTokenFile(const StartOptions& opt, const fs::path& logDir) {
-    if (!opt.configPath.empty())
-        return fs::path(opt.configPath).parent_path() / "anchorbolt.token.json";
-    return logDir / "anchorbolt.token.json";
+// Where the paired identity persists: ALWAYS the platform-private state dir
+// (~/Library/Logs/anchorbolt/<key>, %LOCALAPPDATA%\anchorbolt\<key>, etc.),
+// never next to the config or the --log-dir — those can live inside a git
+// repo, and this file holds a token (the exact leak the config 'token' ban
+// guards against). The location is keyed by the BINARY NAME (stable across
+// the pairing run and later restarts); the server-assigned id lives INSIDE
+// the file. Read back on later (non-pair) runs as the lowest-priority token
+// source, so a venue keeps its token across restarts.
+fs::path platformLogDir(const string& appId);  // defined below
+
+fs::path pairTokenFile(const fs::path& runPath) {
+    string key = runPath.stem().string();
+    for (char& c : key)
+        if (!isalnum((unsigned char)c) && c != '-' && c != '_' && c != '.') c = '-';
+    return platformLogDir(key) / "anchorbolt.token.json";
 }
 
 // Adopt a persisted {id, token} as a base: only fills fields nothing else set,
@@ -1444,12 +1464,6 @@ int cmdStart(const vector<string>& args) {
         if (cfg.empty() && fs::exists("anchorbolt.json")) cfg = "anchorbolt.json";
         if (!cfg.empty() && !loadConfig(cfg, opt)) return 1;
     }
-    // A previously-paired identity next to the config is the lowest-priority
-    // token source: adopt id/token only where nothing else set them, so config
-    // tokenFile, the env, and flags all still win. (The no-config location
-    // needs the log dir, so that case is read further down.)
-    if (!opt.configPath.empty())
-        readPairTokenFile(pairTokenFile(opt, {}), opt);
     // Env token sits between config (tokenFile) and the --token flag.
     if (const char* envTok = getenv("ANCHORBOLT_TOKEN")) opt.token = envTok;
     if (!parseArgs(args, opt)) return 1;
@@ -1501,6 +1515,14 @@ int cmdStart(const vector<string>& args) {
     opt.runPath = runPath.string();
     if (opt.cwd.empty()) opt.cwd = runPath.parent_path().string();
     opt.projectDir = deriveProjectDir(runPath, opt.cwd);
+
+    // Adopt a previously-paired identity BEFORE the binary-name fallback, so a
+    // plain restart reuses the server-assigned id. Lowest priority: fills only
+    // id/token that nothing else (config, env, flags, --pair) already set. The
+    // file is keyed by the binary name, so we don't need the paired id to find
+    // it. Skipped on the pairing run itself (we just got a fresh identity).
+    if (!pairArg) readPairTokenFile(pairTokenFile(runPath), opt);
+
     if (opt.appId.empty()) opt.appId = runPath.stem().string();
     for (char& c : opt.appId) {
         if (!isalnum((unsigned char)c) && c != '-' && c != '_' && c != '.') c = '-';
@@ -1509,18 +1531,20 @@ int cmdStart(const vector<string>& args) {
                                          : fs::absolute(opt.logDir);
     fs::create_directories(logDir);
 
-    // No-config runs keep the paired identity in the log dir; adopt its token
-    // now (lowest priority — only if nothing else, including --pair, set one).
-    if (opt.configPath.empty() && !pairArg)
-        readPairTokenFile(pairTokenFile(opt, logDir), opt);
     // Just paired: persist id + token so the next plain run reuses them.
     if (pairArg) {
-        fs::path pf = pairTokenFile(opt, logDir);
+        fs::path pf = pairTokenFile(runPath);
         error_code ec;
         fs::create_directories(pf.parent_path(), ec);
-        ofstream out(pf, ios::trunc);
-        if (out) {
-            out << Json({{"id", opt.appId}, {"token", opt.token}}).dump(2) << "\n";
+        { ofstream out(pf, ios::trunc);
+          if (out) out << Json({{"id", opt.appId}, {"token", opt.token}}).dump(2) << "\n"; }
+        if (fs::exists(pf, ec)) {
+#ifndef _WIN32
+            // Owner read/write only — it holds a token. (Windows: %LOCALAPPDATA%
+            // is already a per-user directory, so ACL inheritance covers it.)
+            fs::permissions(pf, fs::perms::owner_read | fs::perms::owner_write,
+                            fs::perm_options::replace, ec);
+#endif
             logNotice("anchorbolt") << "paired identity saved to " << pf.string();
         } else {
             logWarning("anchorbolt") << "could not write paired identity to " << pf.string();
