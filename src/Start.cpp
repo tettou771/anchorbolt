@@ -27,6 +27,8 @@
 
 #ifndef _WIN32
 #include <sys/wait.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 #include <unistd.h>
 #endif
 #if defined(__APPLE__)
@@ -47,6 +49,7 @@ struct StartOptions {
     string logDir;               // empty = platform default (~/Library/Logs/anchorbolt/<id> etc.)
     int    logKeepDays = 30;     // prune logs older than this (0 = keep forever)
     int    port        = 47777;  // TRUSSC_MCP_PORT
+    bool   portExplicit = false; // --port / config given -> exact, no scanning
     int    watchdogTimeoutSec = 10;  // unresponsive this long -> restart (0 = process-exit only)
     int    graceSec    = 15;     // boot grace before the watchdog arms
     string serverUrl;            // fleet server base URL (empty = no push)
@@ -449,7 +452,7 @@ bool parseArgs(const vector<string>& args, StartOptions& opt) {
         };
         if      (a == "--cwd")      { auto v = next("--cwd");      if (!v) return false; opt.cwd = *v; }
         else if (a == "--log-dir")  { auto v = next("--log-dir");  if (!v) return false; opt.logDir = *v; }
-        else if (a == "--port")     { auto v = next("--port");     if (!v) return false; opt.port = stoi(*v); }
+        else if (a == "--port")     { auto v = next("--port");     if (!v) return false; opt.port = stoi(*v); opt.portExplicit = true; }
         else if (a == "--grace")    { auto v = next("--grace");    if (!v) return false; opt.graceSec = stoi(*v); }
         else if (a == "--watchdog-timeout") { auto v = next("--watchdog-timeout"); if (!v) return false; opt.watchdogTimeoutSec = stoi(*v); }
         else if (a == "--log-keep") { auto v = next("--log-keep"); if (!v) return false; opt.logKeepDays = stoi(*v); }
@@ -568,7 +571,7 @@ bool loadConfig(const fs::path& path, StartOptions& opt) {
     opt.cwd       = c.value("cwd", opt.cwd);
     opt.appId     = c.value("id", opt.appId);
     opt.serverUrl = c.value("server", opt.serverUrl);
-    opt.port      = c.value("port", opt.port);
+    if (c.contains("port")) { opt.port = c["port"].get<int>(); opt.portExplicit = true; }
     opt.wsPort    = c.value("wsPort", opt.wsPort);
     opt.allowControl = c.value("allowControl", opt.allowControl);
     opt.graceSec  = c.value("grace", opt.graceSec);
@@ -644,6 +647,55 @@ void pruneLogs(const fs::path& logDir, int keepDays) {
 }
 
 #ifndef _WIN32
+
+// Can we bind this port right now? Checks BOTH loopback stacks: the app's
+// server binds "localhost", which resolves to ::1 on some systems and
+// 127.0.0.1 on others — two apps once coexisted on one port by taking one
+// stack each, and health polls then reached a random one of them.
+// (SO_REUSEADDR matches how the app's own HTTP server binds, so TIME_WAIT
+// leftovers don't read as "busy".)
+bool portFree(int port) {
+    int yes = 1;
+
+    int s4 = socket(AF_INET, SOCK_STREAM, 0);
+    if (s4 >= 0) {
+        setsockopt(s4, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+        sockaddr_in a4{};
+        a4.sin_family = AF_INET;
+        a4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        a4.sin_port = htons((uint16_t)port);
+        bool ok = ::bind(s4, (sockaddr*)&a4, sizeof(a4)) == 0;
+        close(s4);
+        if (!ok) return false;
+    }
+
+    int s6 = socket(AF_INET6, SOCK_STREAM, 0);
+    if (s6 >= 0) {
+        setsockopt(s6, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+        setsockopt(s6, IPPROTO_IPV6, IPV6_V6ONLY, &yes, sizeof(yes));
+        sockaddr_in6 a6{};
+        a6.sin6_family = AF_INET6;
+        a6.sin6_addr = in6addr_loopback;
+        a6.sin6_port = htons((uint16_t)port);
+        bool ok = ::bind(s6, (sockaddr*)&a6, sizeof(a6)) == 0;
+        close(s6);
+        if (!ok) return false;
+    }
+    return true;
+}
+
+// Default port taken (another anchorbolt on this machine) -> scan upward so
+// a second bare `anchorbolt start` just works. An EXPLICIT --port is a
+// contract: fail loudly instead of silently moving.
+int choosePort(const StartOptions& opt) {
+    if (opt.portExplicit) {
+        return portFree(opt.port) ? opt.port : -1;
+    }
+    for (int p = opt.port; p < opt.port + 100; ++p) {
+        if (portFree(p)) return p;
+    }
+    return -1;
+}
 
 pid_t spawnApp(const StartOptions& opt, const string& logFile) {
     pid_t pid = fork();
@@ -724,6 +776,20 @@ int cmdStart(const vector<string>& args) {
     fs::create_directories(logDir);
     pruneLogs(logDir, opt.logKeepDays);
     string pruneDay = getTimestampString("%Y-%m-%d");
+
+    // MCP port: scan up from the default so several supervisors coexist on
+    // one machine; an explicit --port that's busy is a hard error.
+    int chosen = choosePort(opt);
+    if (chosen < 0) {
+        cerr << "anchorbolt start: mcp port " << opt.port
+             << (opt.portExplicit ? " is busy (explicit --port is used as-is; pick another)"
+                                  : "..+99 all busy") << endl;
+        return 1;
+    }
+    if (chosen != opt.port) {
+        logNotice("anchorbolt") << "mcp port " << chosen << " (" << opt.port << " busy)";
+    }
+    opt.port = chosen;
     optional<ServerPush> push;
     optional<CommandChannel> channel;
     if (!opt.serverUrl.empty()) {

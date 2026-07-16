@@ -23,9 +23,9 @@ Early / Phase 0. Working today (macOS / Linux):
 
 ```bash
 # venue machine — inside the TrussC project directory:
-anchorbolt start --server http://192.168.1.10:8787
+anchorbolt start --server http://192.168.1.10:54722
 
-# monitoring machine — dashboard at http://localhost:8787/
+# monitoring machine — dashboard at http://localhost:54722/
 anchorbolt serve
 ```
 
@@ -102,7 +102,7 @@ to by `tokenFile`, or in the `ANCHORBOLT_TOKEN` env var.
   (`tc_get_*`) relay freely; anything mutating requires the venue operator
   to have started the agent with `--allow-control`
 
-Options: `--port` (HTTP port, default 8787) `--ws-port <n>` (command
+Options: `--port` (HTTP port, default 54722 — "truss" typed on the QWERTY number row; ws = port+1) `--ws-port <n>` (command
 channel, default port+1) `--data <dir>`.
 
 ## Agent tokens

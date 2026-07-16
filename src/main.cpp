@@ -41,7 +41,7 @@ static void printHelp() {
         "  --log-dir <dir>    log destination (default: ~/Library/Logs/anchorbolt/<id> on\n"
         "                     macOS, $XDG_STATE_HOME/anchorbolt/<id> on Linux)\n"
         "  --log-keep <days>  delete our log files older than this (default 30; 0 = keep all)\n"
-        "  --server <url>     fleet server to push to (e.g. http://192.168.1.10:8787)\n"
+        "  --server <url>     fleet server to push to (e.g. http://192.168.1.10:54722)\n"
         "  --id <name>        app id on the fleet server (default: binary name)\n"
         "  --token <tok>      agent token minted by the server\n"
         "  --token-file <path>  read the token from a file (keeps it out of ps/plists)\n"
@@ -53,7 +53,7 @@ static void printHelp() {
         "  --thumb-quality <1-100> JPEG quality (default 75)\n"
         "\n"
         "SERVE OPTIONS\n"
-        "  --port <n>         HTTP port (default 8787)\n"
+        "  --port <n>         HTTP port (default 54722 — 'truss' on the number row)\n"
         "  --ws-port <n>      agent command-channel port (default: port + 1)\n"
         "  --data <dir>       storage directory for heartbeats/thumbnails\n"
         "                     (default ./anchorbolt-data)\n";

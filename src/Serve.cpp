@@ -39,7 +39,7 @@ namespace fs = std::filesystem;
 namespace {
 
 struct ServeOptions {
-    int    port    = 8787;
+    int    port    = 54722;   // "truss" typed on the QWERTY number row
     int    wsPort  = 0;      // 0 = port + 1
     string dataDir = "anchorbolt-data";
 };
