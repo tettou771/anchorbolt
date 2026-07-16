@@ -56,7 +56,11 @@ static void printHelp() {
         "  --port <n>         HTTP port (default 54722 — 'truss' on the number row)\n"
         "  --ws-port <n>      agent command-channel port (default: port + 1)\n"
         "  --data <dir>       storage directory for heartbeats/thumbnails\n"
-        "                     (default ./anchorbolt-data)\n";
+        "                     (default ./anchorbolt-data)\n"
+        "  --keep-days <n>    delete stored logs/heartbeats/images older than this\n"
+        "                     (default 90; 0 = keep forever). Independent of the\n"
+        "                     venue-side --log-keep. Thumbnails older than 24h are\n"
+        "                     additionally thinned to one per hour.\n";
 }
 
 int main(int argc, char* argv[]) {

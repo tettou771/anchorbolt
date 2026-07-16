@@ -21,6 +21,7 @@
 
 #include <future>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -39,9 +40,11 @@ namespace fs = std::filesystem;
 namespace {
 
 struct ServeOptions {
-    int    port    = 54722;   // "truss" typed on the QWERTY number row
-    int    wsPort  = 0;      // 0 = port + 1
-    string dataDir = "anchorbolt-data";
+    int    port     = 54722;  // "truss" typed on the QWERTY number row
+    int    wsPort   = 0;      // 0 = port + 1
+    string dataDir  = "anchorbolt-data";
+    int    keepDays = 90;     // server-side retention (0 = keep forever);
+                              // independent of any venue's local --log-keep
 };
 
 struct ImageSlot {
@@ -66,6 +69,7 @@ struct AppState {
     map<string, ImageSlot> images;                  // custom statusImage uploads
     deque<LogLine> logs;                            // ring buffer, newest last
     uint64_t nextLogSeq = 1;
+    map<string, pair<string, int64_t>> logSeen;     // src -> (file, acked end offset)
 };
 
 constexpr size_t kLogRingSize = 500;
@@ -127,6 +131,93 @@ struct AgentChannel {
 
 AgentChannel g_agents;
 
+// --- server-side retention ----------------------------------------------------
+// Independent policy from any venue's local --log-keep (deletions never
+// propagate in either direction; the server typically keeps LONGER than the
+// kiosk). All timestamps live in filenames, so pruning is pure string math —
+// no mtime, no parsing.
+
+// Format a past time with strftime (getTimestampString only does "now").
+string fmtTimePoint(chrono::system_clock::time_point t, const char* fmt) {
+    time_t tt = chrono::system_clock::to_time_t(t);
+    tm local{};
+#ifdef _WIN32
+    localtime_s(&local, &tt);
+#else
+    localtime_r(&tt, &local);
+#endif
+    char buf[40];
+    strftime(buf, sizeof(buf), fmt, &local);
+    return buf;
+}
+
+// Thumbnail/statusImage thinning in one JPEG directory (names are
+// YYYYMMDD-HHMMSS.jpg): the last 24h stays complete, older shots thin to the
+// first per hour, and past keepDays they go entirely.
+int thinJpegs(const fs::path& dir, const string& hourlyBefore, const string& dropBefore) {
+    error_code ec;
+    vector<string> names;
+    for (auto& e : fs::directory_iterator(dir, ec)) {
+        string n = e.path().filename().string();
+        if (n.size() == 19 && n.compare(15, 4, ".jpg") == 0) names.push_back(n);
+    }
+    sort(names.begin(), names.end());
+    int removed = 0;
+    string keptHour;
+    for (const auto& n : names) {
+        bool drop = false;
+        if (!dropBefore.empty() && n < dropBefore) {
+            drop = true;
+        } else if (n < hourlyBefore) {
+            string hour = n.substr(0, 11);  // YYYYMMDD-HH
+            if (hour == keptHour) drop = true;
+            else keptHour = hour;
+        }
+        if (drop && fs::remove(dir / n, ec)) ++removed;
+    }
+    return removed;
+}
+
+void pruneData(const fs::path& dataDir, int keepDays) {
+    auto now = chrono::system_clock::now();
+    string dropDate  = keepDays > 0
+        ? fmtTimePoint(now - chrono::hours(24) * keepDays, "%Y-%m-%d") : "";
+    string dropStamp = keepDays > 0
+        ? fmtTimePoint(now - chrono::hours(24) * keepDays, "%Y%m%d-%H%M%S") : "";
+    string hourlyBefore = fmtTimePoint(now - chrono::hours(24), "%Y%m%d-%H%M%S");
+
+    error_code ec;
+    int removed = 0;
+    for (auto& appDir : fs::directory_iterator(dataDir, ec)) {
+        error_code e2;
+        if (!appDir.is_directory(e2)) continue;  // skips tokens.json etc.
+        if (!dropDate.empty()) {
+            // Daily JSONL (heartbeat-YYYY-MM-DD.jsonl / log-YYYY-MM-DD.jsonl):
+            // compare the date embedded in the name against the cutoff.
+            for (auto& e : fs::directory_iterator(appDir.path(), e2)) {
+                string n = e.path().filename().string();
+                size_t ps = 0;
+                if (n.rfind("heartbeat-", 0) == 0) ps = 10;
+                else if (n.rfind("log-", 0) == 0) ps = 4;
+                else continue;
+                if (n.size() < ps + 10 + 6 || n.compare(n.size() - 6, 6, ".jsonl") != 0) continue;
+                if (n.compare(ps, 10, dropDate) < 0) {
+                    error_code e3;
+                    if (fs::remove(e.path(), e3)) ++removed;
+                }
+            }
+        }
+        removed += thinJpegs(appDir.path() / "thumbs", hourlyBefore, dropStamp);
+        for (auto& e : fs::directory_iterator(appDir.path() / "images", e2)) {
+            if (e.is_directory(e2)) removed += thinJpegs(e.path(), hourlyBefore, dropStamp);
+        }
+    }
+    if (removed > 0) {
+        logNotice("anchorbolt") << "retention: removed " << removed << " stored file(s)"
+                                << (keepDays > 0 ? " (keep " + to_string(keepDays) + " days)" : "");
+    }
+}
+
 // App ids become directory names — restrict to a safe charset.
 bool validAppId(const string& id) {
     if (id.empty() || id.size() > 64) return false;
@@ -149,6 +240,7 @@ bool parseArgs(const vector<string>& args, ServeOptions& opt) {
         if      (a == "--port")              { auto v = next("--port"); if (!v) return false; opt.port = stoi(*v); }
         else if (a == "--ws-port")           { auto v = next("--ws-port"); if (!v) return false; opt.wsPort = stoi(*v); }
         else if (a == "--data")              { auto v = next("--data"); if (!v) return false; opt.dataDir = *v; }
+        else if (a == "--keep-days")         { auto v = next("--keep-days"); if (!v) return false; opt.keepDays = stoi(*v); }
         else {
             cerr << "anchorbolt serve: unknown option '" << a << "'" << endl;
             return false;
@@ -1024,6 +1116,10 @@ int cmdServe(const vector<string>& args) {
 
     // Agent push: forwarded log lines (app log + supervisor events). Arrives
     // even while the app itself is down — the supervisor keeps reporting.
+    // A batch claims a byte range of one local daily file: {src, file, start,
+    // end, lines}. The agent freezes an unconfirmed batch and resends it
+    // verbatim (at-least-once), so a retry whose ack got lost re-arrives with
+    // the same (file, end) — confirmed here without appending twice.
     svr.Post(R"(/api/log/([^/]+))", [dataDir, authOk](const httplib::Request& req, httplib::Response& res) {
         string id = req.matches[1];
         if (!validAppId(id)) { res.status = 400; return; }
@@ -1035,20 +1131,29 @@ int cmdServe(const vector<string>& args) {
             res.status = 400;
             return;
         }
+        string src = body.value("src", "app");
+        string bfile = body.value("file", "");
+        int64_t bend = body.value("end", (int64_t)0);
         string now = getTimestampString("%H:%M:%S");
         fs::path dir = dataDir / id;
         error_code ec;
         fs::create_directories(dir, ec);
-        ofstream out(dir / ("log-" + getTimestampString("%Y-%m-%d") + ".jsonl"), ios::app);
         lock_guard<mutex> lock(g_appsMutex);
         auto& st = g_apps[id];
+        auto& seen = st.logSeen[src];
+        if (!bfile.empty() && seen.first == bfile && bend <= seen.second) {
+            res.set_content("ok (duplicate)", "text/plain");
+            return;
+        }
+        ofstream out(dir / ("log-" + getTimestampString("%Y-%m-%d") + ".jsonl"), ios::app);
         for (auto& l : body.value("lines", Json::array())) {
-            LogLine line{st.nextLogSeq++, now,
-                         l.value("src", "app"), l.value("text", "")};
+            if (!l.is_string()) continue;
+            LogLine line{st.nextLogSeq++, now, src, l.get<string>()};
             out << Json({{"at", line.at}, {"src", line.src}, {"text", line.text}}).dump() << "\n";
             st.logs.push_back(std::move(line));
             if (st.logs.size() > kLogRingSize) st.logs.pop_front();
         }
+        if (!bfile.empty()) seen = {bfile, bend};
         res.set_content("ok", "text/plain");
     });
 
@@ -1135,6 +1240,17 @@ int cmdServe(const vector<string>& args) {
         svr.stop();
     });
 
+    // Retention: prune stored data at startup and hourly after that
+    // (sliced sleep so shutdown stays snappy).
+    thread pruner([keepDays = opt.keepDays, dataDir]() {
+        while (!g_stop) {
+            pruneData(dataDir, keepDays);
+            for (int i = 0; i < 36000 && !g_stop; ++i) {
+                this_thread::sleep_for(chrono::milliseconds(100));
+            }
+        }
+    });
+
     logNotice("anchorbolt") << "fleet server on http://localhost:" << opt.port
                             << " (ws " << opt.wsPort << ", data " << dataDir.string()
                             << (token::enforcementEnabled(dataDir.string())
@@ -1143,6 +1259,7 @@ int cmdServe(const vector<string>& args) {
     bool stoppedBySignal = g_stop.load();
     g_stop = true;
     stopWatcher.join();
+    pruner.join();
     g_agents.hub.stop();
 
     if (!ok && !stoppedBySignal) {

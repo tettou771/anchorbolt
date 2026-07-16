@@ -22,6 +22,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <optional>
 #include <thread>
 
@@ -218,56 +219,18 @@ string machineMemNote() {
     return "machine mem avail " + fmtMB(m.availBytes) + " / " + fmtMB(m.totalBytes);
 }
 
-// Incremental reader for a log file that other code appends to. First poll
-// starts at the current end (history is not re-uploaded); day rollover hands
-// in a new path, which resets to the top of the (fresh) file.
-class LogTailer {
-public:
-    // Anchor at the current end of `path`: everything already in the file is
-    // history and won't be uploaded; everything appended after this call will.
-    // Call once at startup, BEFORE the session's own first lines are written.
-    void baseline(const fs::path& path) {
-        path_ = path;
-        error_code ec;
-        offset_ = (streamoff)fs::file_size(path, ec);
-        if (ec) offset_ = 0;
-        firstPoll_ = false;
-    }
+// --- log shipping (delivery cursor) ------------------------------------------
+// The local daily log files ARE the offline spool. A persisted cursor marks
+// how far the server has CONFIRMED receipt; it advances only on a 200, so
+// lines produced while the server was unreachable ship on reconnect — even
+// across anchorbolt or machine restarts. Semantics: at-least-once. The batch
+// in flight is frozen (a retry resends it byte-identical) and the server
+// dedups by (file, end offset), so a lost ack costs a duplicate, never a gap.
 
-    // Returns complete new lines appended since the last poll.
-    vector<string> poll(const fs::path& path) {
-        if (path != path_) {
-            path_ = path;
-            error_code ec;
-            offset_ = firstPoll_ ? (streamoff)fs::file_size(path, ec) : 0;
-            if (ec) offset_ = 0;
-            firstPoll_ = false;
-        }
-        vector<string> lines;
-        ifstream in(path_, ios::binary);
-        if (!in) return lines;
-        in.seekg(0, ios::end);
-        streamoff size = in.tellg();
-        if (size <= offset_) { if (size < offset_) offset_ = 0; return lines; }
-        in.seekg(offset_);
-        string chunk(size_t(size - offset_), '\0');
-        in.read(chunk.data(), (streamsize)chunk.size());
-        size_t consumed = 0, pos = 0;
-        while (true) {
-            size_t nl = chunk.find('\n', pos);
-            if (nl == string::npos) break;  // partial last line stays for next poll
-            if (nl > pos) lines.emplace_back(chunk, pos, nl - pos);
-            pos = nl + 1;
-            consumed = pos;
-        }
-        offset_ += (streamoff)consumed;
-        return lines;
-    }
-
-private:
-    fs::path path_;
-    streamoff offset_ = 0;
-    bool firstPoll_ = true;
+struct LogBatch {
+    string file;                 // daily file name, e.g. "app-2026-07-16.log"
+    int64_t start = 0, end = 0;  // byte range covered: [start, end)
+    vector<string> lines;
 };
 
 // Best-effort push to the fleet server. Failures never affect supervision;
@@ -302,13 +265,14 @@ public:
     }
 
     // src is "app" (the app's TRUSSC_LOG_FILE) or "sup" (supervisor events).
-    void logs(const string& src, const vector<string>& lines) {
-        if (lines.empty()) return;
-        Json arr = Json::array();
-        for (const auto& l : lines) arr.push_back({{"src", src}, {"text", l}});
-        auto res = cli_.Post("/api/log/" + appId_,
-                             Json({{"lines", arr}}).dump(), "application/json");
-        report(res && res->status == 200, "log");
+    // Returns delivery success — the shipper's cursor advances only on true.
+    bool logs(const string& src, const LogBatch& b) {
+        Json body = {{"src", src}, {"file", b.file},
+                     {"start", b.start}, {"end", b.end}, {"lines", b.lines}};
+        auto res = cli_.Post("/api/log/" + appId_, body.dump(), "application/json");
+        bool ok = res && res->status == 200;
+        report(ok, "log");
+        return ok;
     }
 
 private:
@@ -325,6 +289,145 @@ private:
     httplib::Client cli_;
     string appId_;
     bool reachable_ = true;  // assume up so the first failure logs
+};
+
+// One log source (prefix "app-" or "anchorbolt-"): reads complete lines from
+// the daily files in cursor order, rolling across days, and ships them via
+// ServerPush. Cursor persistence is the caller's job (lazily, so SD cards
+// aren't worn down by a write every cycle).
+class LogShipper {
+public:
+    LogShipper(string src, string prefix) : src_(std::move(src)), prefix_(std::move(prefix)) {}
+
+    // No saved cursor: anchor at the current end of the active file — history
+    // from before anchorbolt ever pushed is not uploaded. A saved cursor
+    // resumes exactly, including a previous session's unsent tail.
+    void init(const Json& saved, const fs::path& activeFile) {
+        if (saved.is_object() && saved.contains("file")) {
+            file_ = saved.value("file", "");
+            offset_ = saved.value("offset", (int64_t)0);
+        } else {
+            error_code ec;
+            file_ = activeFile.filename().string();
+            offset_ = (int64_t)fs::file_size(activeFile, ec);
+            if (ec) offset_ = 0;
+            dirty_ = true;
+        }
+    }
+
+    // Ship pending lines, bounded per call so a big backlog can't stall the
+    // supervision loop. Transport failure keeps the batch for the next cycle.
+    void ship(ServerPush& push, const fs::path& dir, const fs::path& activeFile) {
+        for (int i = 0; i < kMaxBatchesPerCycle; ++i) {
+            if (!inflight_) inflight_ = nextBatch(dir, activeFile.filename().string());
+            if (!inflight_) return;                    // drained
+            if (!push.logs(src_, *inflight_)) return;  // unreachable; retry as-is later
+            offset_ = inflight_->end;                  // confirmed — advance the cursor
+            dirty_ = true;
+            inflight_.reset();
+        }
+    }
+
+    Json cursorJson() const { return {{"file", file_}, {"offset", offset_}}; }
+    const string& file() const { return file_; }
+    bool dirty() const { return dirty_; }
+    void clearDirty() { dirty_ = false; }
+
+private:
+    static constexpr int     kMaxBatchesPerCycle = 20;
+    static constexpr int64_t kMaxBatchBytes      = 256 * 1024;
+    static constexpr size_t  kMaxBatchLines      = 500;
+
+    // Move the cursor to the oldest of our daily files newer than it (the
+    // date-stamped names sort chronologically). Pure bookkeeping: called only
+    // once every byte of the current file has been confirmed.
+    bool advanceFile(const fs::path& dir, const string& active) {
+        string best;
+        error_code ec;
+        for (auto& e : fs::directory_iterator(dir, ec)) {
+            string n = e.path().filename().string();
+            if (n.rfind(prefix_, 0) != 0 || n.size() < 4 ||
+                n.compare(n.size() - 4, 4, ".log") != 0) continue;
+            if (n <= file_) continue;
+            if (best.empty() || n < best) best = n;
+        }
+        if (best.empty()) {
+            if (active <= file_) return false;  // nothing newer yet
+            best = active;                      // active not on disk yet — jump
+        }
+        file_ = best;
+        offset_ = 0;
+        dirty_ = true;
+        return true;
+    }
+
+    optional<LogBatch> nextBatch(const fs::path& dir, const string& active) {
+        for (int hop = 0; hop < 64; ++hop) {  // bounded day-file rolls per call
+            if (file_.empty()) return nullopt;
+            bool isActive = (file_ == active);
+            error_code ec;
+            int64_t size = (int64_t)fs::file_size(dir / file_, ec);
+            if (ec) {                          // pruned or deleted underneath us
+                if (isActive || !advanceFile(dir, active)) return nullopt;
+                continue;
+            }
+            if (offset_ > size) { offset_ = 0; dirty_ = true; }  // truncated/replaced
+            if (offset_ == size) {
+                if (isActive || !advanceFile(dir, active)) return nullopt;
+                continue;
+            }
+            ifstream in(dir / file_, ios::binary);
+            if (!in) return nullopt;
+            string chunk((size_t)min(size - offset_, kMaxBatchBytes), '\0');
+            in.seekg(offset_);
+            in.read(chunk.data(), (streamsize)chunk.size());
+            chunk.resize((size_t)max<streamsize>(in.gcount(), 0));
+
+            LogBatch b;
+            b.file = file_;
+            b.start = offset_;
+            size_t consumed = 0, pos = 0;
+            while (b.lines.size() < kMaxBatchLines) {
+                size_t nl = chunk.find('\n', pos);
+                if (nl == string::npos) break;
+                if (nl > pos) b.lines.emplace_back(chunk, pos, nl - pos);
+                pos = nl + 1;
+                consumed = pos;
+            }
+            bool sawEof = offset_ + (int64_t)chunk.size() == size;
+            if (!isActive && sawEof && consumed < chunk.size() &&
+                b.lines.size() < kMaxBatchLines) {
+                // A finished file's trailing partial line will never gain its
+                // newline — ship it as-is instead of stranding it.
+                b.lines.emplace_back(chunk, consumed, chunk.size() - consumed);
+                consumed = chunk.size();
+            }
+            if (b.lines.empty() && consumed == 0 &&
+                (int64_t)chunk.size() == kMaxBatchBytes) {
+                // A single line larger than a whole batch: ship the raw slab
+                // rather than stall the cursor forever.
+                b.lines.emplace_back(chunk);
+                consumed = chunk.size();
+            }
+            if (b.lines.empty()) {
+                if (consumed > 0) {  // blank lines only — nothing to claim, skip
+                    offset_ += (int64_t)consumed;
+                    dirty_ = true;
+                    continue;
+                }
+                return nullopt;      // partial line on the active file; wait
+            }
+            b.end = b.start + (int64_t)consumed;
+            return b;
+        }
+        return nullopt;
+    }
+
+    string src_, prefix_;
+    string file_;          // cursor: daily file name...
+    int64_t offset_ = 0;   // ...and confirmed-delivered bytes within it
+    bool dirty_ = false;   // cursor changed since the last save
+    optional<LogBatch> inflight_;  // frozen until confirmed (exact resend)
 };
 
 // The agent's end of the command channel: one outbound WebSocket to the
@@ -621,7 +724,11 @@ fs::path platformLogDir(const string& appId) {
 
 // Delete our own daily files older than keepDays. Only touches names we
 // create (app-*.log / anchorbolt-*.log) — never anything else in the dir.
-void pruneLogs(const fs::path& logDir, int keepDays) {
+// `protect` maps a prefix to that shipper's cursor file: files not yet fully
+// delivered to the fleet server outlive keepDays until they ship (the local
+// files are the offline spool — pruning an unsent file would be a hard gap).
+void pruneLogs(const fs::path& logDir, int keepDays,
+               const map<string, string>& protect = {}) {
     if (keepDays <= 0) return;
     auto cutoff = chrono::system_clock::now() - chrono::hours(24 * keepDays);
     error_code ec;
@@ -632,6 +739,8 @@ void pruneLogs(const fs::path& logDir, int keepDays) {
         bool ours = (name.rfind("app-", 0) == 0 || name.rfind("anchorbolt-", 0) == 0) &&
                     name.find(".log") != string::npos;
         if (!ours) continue;
+        string prefix = name.rfind("app-", 0) == 0 ? "app-" : "anchorbolt-";
+        if (auto p = protect.find(prefix); p != protect.end() && name >= p->second) continue;
         auto ft = fs::last_write_time(e.path(), ec);
         if (ec) continue;
         auto sys = chrono::time_point_cast<chrono::system_clock::duration>(
@@ -774,7 +883,6 @@ int cmdStart(const vector<string>& args) {
     fs::path logDir = opt.logDir.empty() ? platformLogDir(opt.appId)
                                          : fs::absolute(opt.logDir);
     fs::create_directories(logDir);
-    pruneLogs(logDir, opt.logKeepDays);
     string pruneDay = getTimestampString("%Y-%m-%d");
 
     // MCP port: scan up from the default so several supervisors coexist on
@@ -803,19 +911,61 @@ int cmdStart(const vector<string>& args) {
     // INDEPENDENT of app health — while the app hangs, the supervisor's
     // "unresponsive / restarting" lines still reach the server, which is what
     // distinguishes "app down, being handled" from "machine gone" remotely.
-    LogTailer appTail, supTail;
+    // Each source keeps a delivery cursor (see LogShipper): what the server
+    // hasn't confirmed stays pending in the local files and ships later.
+    LogShipper appShip("app", "app-"), supShip("sup", "anchorbolt-");
+    fs::path cursorPath = logDir / "push-cursor.json";
     auto supLogPath = [&logDir]() {
         return logDir / ("anchorbolt-" + getTimestampString("%Y-%m-%d") + ".log");
     };
+    if (push) {
+        // Resume from the persisted cursor; first contact anchors both tails
+        // at the current end, BEFORE this session writes anything — the app's
+        // own startup lines (written between spawn and the first poll) must flow.
+        Json saved = Json::object();
+        if (ifstream in(cursorPath); in) {
+            try { saved = Json::parse(in); } catch (...) { saved = Json::object(); }
+        }
+        appShip.init(saved.contains("app") ? saved["app"] : Json(),
+                     logDir / ("app-" + getTimestampString("%Y-%m-%d") + ".log"));
+        supShip.init(saved.contains("sup") ? saved["sup"] : Json(), supLogPath());
+    }
+    auto saveCursorNow = [&]() {
+        Json j = {{"app", appShip.cursorJson()}, {"sup", supShip.cursorJson()}};
+        fs::path tmp = cursorPath;
+        tmp += ".tmp";
+        { ofstream out(tmp, ios::trunc); out << j.dump() << "\n"; }
+        error_code ec;
+        fs::rename(tmp, cursorPath, ec);  // atomic: never a half-written cursor
+        appShip.clearDirty();
+        supShip.clearDirty();
+    };
+    auto lastCursorSave = chrono::steady_clock::now();
     auto pushLogs = [&](const string& appLogFile) {
         if (!push) return;
-        push->logs("app", appTail.poll(appLogFile));
-        push->logs("sup", supTail.poll(supLogPath()));
+        appShip.ship(*push, logDir, appLogFile);
+        supShip.ship(*push, logDir, supLogPath());
+        // Cursor persistence is lazy (SD-card-friendly): losing the last
+        // flush in a crash re-sends at most ~60s of lines, and the server
+        // dedups those. Gaps are impossible either way.
+        auto now = chrono::steady_clock::now();
+        if ((appShip.dirty() || supShip.dirty()) &&
+            now - lastCursorSave >= chrono::seconds(60)) {
+            lastCursorSave = now;
+            saveCursorNow();
+        }
     };
-    // Anchor both tails now, before this session writes anything — the app's
-    // own startup lines (written between spawn and the first poll) must flow.
-    appTail.baseline(logDir / ("app-" + getTimestampString("%Y-%m-%d") + ".log"));
-    supTail.baseline(supLogPath());
+    // Prune AFTER the cursor is restored: files the server hasn't confirmed
+    // yet are protected from deletion regardless of age.
+    auto protectUnshipped = [&]() {
+        map<string, string> protect;
+        if (push) {
+            protect["app-"] = appShip.file();
+            protect["anchorbolt-"] = supShip.file();
+        }
+        return protect;
+    };
+    pruneLogs(logDir, opt.logKeepDays, protectUnshipped());
 
     signal(SIGINT, onSignal);
     signal(SIGTERM, onSignal);
@@ -882,7 +1032,7 @@ int cmdStart(const vector<string>& args) {
             string today = getTimestampString("%Y-%m-%d");
             if (today != pruneDay) {
                 pruneDay = today;
-                pruneLogs(logDir, opt.logKeepDays);
+                pruneLogs(logDir, opt.logKeepDays, protectUnshipped());
             }
 
             pushLogs(logFile);
@@ -1012,8 +1162,10 @@ int cmdStart(const vector<string>& args) {
 
     logNotice("anchorbolt") << "anchorbolt stopped (restarts: " << restarts << ")";
     eventLog(logDir, "anchorbolt stopped (restarts: " + to_string(restarts) + ")");
-    // Final flush so the shutdown events reach the server too.
+    // Final flush so the shutdown events reach the server too, then persist
+    // the cursor unconditionally — the lazy 60s cadence doesn't apply to exit.
     pushLogs((logDir / ("app-" + getTimestampString("%Y-%m-%d") + ".log")).string());
+    if (push && (appShip.dirty() || supShip.dirty())) saveCursorNow();
     if (channel) channel->shutdown();
     return 0;
 #endif

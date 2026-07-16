@@ -54,6 +54,12 @@ anchorbolt serve
   line. Log push is independent of app health, so while an app hangs the
   server still sees "unresponsive / restarting" — remotely distinguishable
   from a machine that went dark
+- **offline-proof log delivery**: the local daily files are the spool, and
+  a persisted cursor (`push-cursor.json`, flushed lazily — SD-card
+  friendly) advances only when the server confirms receipt. Hours of
+  venue-network outage, an anchorbolt restart, even a machine reboot — the
+  backlog ships on reconnect. At-least-once semantics: the server dedups
+  retries, and files not yet delivered are protected from local pruning
 
 Flags: see `anchorbolt --help`. Precedence: flags > `ANCHORBOLT_TOKEN` env >
 config file > defaults.
@@ -96,6 +102,10 @@ to by `tokenFile`, or in the `ANCHORBOLT_TOKEN` env var.
   `GET /api/history/<id>`, `GET /api/log/<id>?after=<seq>`
 - DB-free storage under `--data` (default `./anchorbolt-data`): daily
   heartbeat JSONL + timestamp-named JPEGs per app
+- retention (`--keep-days`, default 90, 0 = forever, independent of any
+  venue's local policy — deletions never propagate): stored JSONL and
+  images older than the cutoff are pruned hourly; thumbnails older than
+  24h are additionally thinned to one per hour
 - **remote control** (agent keeps one outbound WebSocket, NAT-friendly):
   the detail view shows a live/offline chip, a Restart button, and a tool
   console that relays MCP tool calls to the app. Read-only tools
