@@ -84,6 +84,9 @@ optional<Json> callRpc(httplib::Client& cli, const string& method) {
 
 // JSON-RPC tools/call against the app's local MCP endpoint.
 // nullopt = transport failure or malformed reply (both count as a miss).
+// Content blocks are folded back into one object: image tools return an MCP
+// image block + a text metadata block; those merge into the familiar
+// {data, mimeType, width, height} shape, so consumers don't care.
 optional<Json> callTool(httplib::Client& cli, const string& name,
                         const Json& arguments = Json::object()) {
     Json req = {{"jsonrpc", "2.0"},
@@ -93,8 +96,28 @@ optional<Json> callTool(httplib::Client& cli, const string& name,
     auto res = cli.Post("/mcp", req.dump(), "application/json");
     if (!res || res->status != 200) return nullopt;
     try {
-        Json reply = Json::parse(res->body);
-        return Json::parse(reply.at("result").at("content").at(0).at("text").get<string>());
+        Json content = Json::parse(res->body).at("result").at("content");
+        Json out = Json::object();
+        bool haveImage = false, haveText = false;
+        for (auto& block : content) {
+            string type = block.value("type", "");
+            if (type == "image") {
+                out["data"] = block.at("data");
+                out["mimeType"] = block.value("mimeType", "image/jpeg");
+                haveImage = true;
+            } else if (type == "text" && !haveText) {
+                haveText = true;
+                try {
+                    Json t = Json::parse(block.at("text").get<string>());
+                    if (t.is_object()) out.update(t);
+                    else if (!haveImage) return t;
+                } catch (...) {
+                    if (!haveImage) return nullopt;
+                }
+            }
+        }
+        if (!haveImage && !haveText) return nullopt;
+        return out;
     } catch (...) {
         return nullopt;
     }
