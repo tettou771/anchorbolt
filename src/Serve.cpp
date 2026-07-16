@@ -860,13 +860,21 @@ R"HTML(
   #settings[hidden] { display: none; }
   #sPanel { background: #1b1e24; border: 1px solid #323844; border-radius: 12px;
             width: min(820px, 100%); margin-bottom: 4vh; }
-  .sSection { padding: 16px 18px; border-top: 1px solid #23262d; }
-  .sSection h3 { margin: 0 0 10px; font-size: 12px; color: #9aa3b2;
-                 text-transform: uppercase; letter-spacing: .06em; }
-  .sTable { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .sTabs { display: flex; gap: 4px; margin: 0 12px; }
+  .sTab { background: none; border: 1px solid #2a2e36; color: #9aa3b2;
+          border-radius: 6px; font-size: 12px; padding: 3px 14px; cursor: pointer; }
+  .sTab:hover { color: #d4d7dd; }
+  .sTab.active { background: #1c2a3a; color: #79b8ff; border-color: #2c405a; }
+  .sPane { padding: 16px 18px; }
+  .sPane[hidden] { display: none; }
+  /* Fixed layout + colgroup widths keep header and body columns aligned
+     regardless of what an editable cell (a scope input + Set button) holds. */
+  .sTable { width: 100%; border-collapse: collapse; font-size: 13px; table-layout: fixed; }
   .sTable th { text-align: left; color: #6b727e; font-weight: 500; font-size: 11px;
                text-transform: uppercase; letter-spacing: .05em; padding: 4px 8px; }
-  .sTable td { padding: 4px 8px; border-top: 1px solid #23262d; vertical-align: middle; }
+  .sTable td { padding: 4px 8px; border-top: 1px solid #23262d; vertical-align: middle;
+               overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sTable td.acts { overflow: visible; white-space: normal; }
   .sTable input, .sTable select, .sRow input, .sRow select {
       background: #191c22; border: 1px solid #2a2e36; border-radius: 5px;
       color: #d4d7dd; font-size: 12px; padding: 3px 8px; }
@@ -909,18 +917,37 @@ R"HTML(
 <div id="settings" hidden>
   <div id="sPanel">
     <div class="dhead">
-      <h2 style="flex:1">Settings</h2>
+      <h2>Settings</h2>
+      <div class="sTabs">
+        <button class="sTab active" data-pane="pApps">Apps</button>
+        <button class="sTab" data-pane="pOps">Operators</button>
+      </div>
+      <span style="flex:1"></span>
       <button id="sClose" title="close" style="background:none;border:none;color:#7d838e;font-size:22px;cursor:pointer;line-height:1">&times;</button>
     </div>
-    <div class="sSection">
-      <h3>Apps &amp; groups</h3>
-      <table class="sTable"><thead><tr><th>app</th><th>group</th><th></th></tr></thead>
-        <tbody id="sApps"></tbody></table>
+
+    <div id="pApps" class="sPane">
+      <table class="sTable">
+        <colgroup><col style="width:34%"><col style="width:30%"><col style="width:16%"><col></colgroup>
+        <thead><tr><th>app</th><th>group</th><th>token</th><th></th></tr></thead>
+        <tbody id="sApps"></tbody>
+      </table>
+      <div class="sRow">
+        <input id="sPairApp" placeholder="app-id for a new pairing code">
+        <button class="sBtn" id="sPairBtn">Pairing code</button>
+      </div>
+      <div class="sNote">A pairing code lets a venue run
+        <code>anchorbolt start --pair &lt;code&gt;</code> to fetch its token — no
+        <code>tc-...</code> string is copied by hand.</div>
+      <div class="sReveal" id="sPairOut" hidden></div>
     </div>
-    <div class="sSection">
-      <h3>Operators</h3>
-      <table class="sTable"><thead><tr><th>name</th><th>role</th><th>scope</th><th>created</th><th></th></tr></thead>
-        <tbody id="sOps"></tbody></table>
+
+    <div id="pOps" class="sPane" hidden>
+      <table class="sTable">
+        <colgroup><col style="width:20%"><col style="width:13%"><col style="width:31%"><col style="width:14%"><col></colgroup>
+        <thead><tr><th>name</th><th>role</th><th>scope</th><th>created</th><th></th></tr></thead>
+        <tbody id="sOps"></tbody>
+      </table>
       <div class="sRow">
         <input id="sOpName" placeholder="new operator name">
         <select id="sOpRole"><option value="viewer">viewer</option><option value="operator">operator</option><option value="admin">admin</option></select>
@@ -928,16 +955,6 @@ R"HTML(
         <button class="sBtn" id="sOpAdd">Create</button>
       </div>
       <div class="sReveal" id="sOpToken" hidden></div>
-    </div>
-    <div class="sSection">
-      <h3>Agents (venue tokens)</h3>
-      <table class="sTable"><thead><tr><th>app-id</th><th>hash</th><th></th></tr></thead>
-        <tbody id="sAgents"></tbody></table>
-      <div class="sRow">
-        <input id="sPairApp" placeholder="app-id for a new pairing code">
-        <button class="sBtn" id="sPairBtn">Pairing code</button>
-      </div>
-      <div class="sReveal" id="sPairOut" hidden></div>
     </div>
   </div>
 </div>
@@ -1828,33 +1845,73 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Escape') byId('settings').hidden = true;
 });
 
+function showSettingsPane(pane) {
+  for (const t of document.querySelectorAll('.sTab'))
+    t.classList.toggle('active', t.dataset.pane === pane);
+  for (const id of ['pApps', 'pOps']) byId(id).hidden = (id !== pane);
+}
+for (const t of document.querySelectorAll('.sTab'))
+  t.addEventListener('click', () => showSettingsPane(t.dataset.pane));
+
 async function openSettings() {
   byId('settings').hidden = false;
   byId('sOpToken').hidden = true;
   byId('sPairOut').hidden = true;
+  showSettingsPane('pApps');
   loadSettingsApps();
   loadSettingsOps();
-  loadSettingsAgents();
 }
 
+// One "Apps" table over every app-id this server knows: the union of apps
+// that have reported and app-ids that hold an agent token (a venue can be
+// provisioned before it first connects). Each row carries its group and its
+// token status — "app" and "agent token" are the same identity, so they live
+// together instead of in two mismatched sections.
 async function loadSettingsApps() {
   const tb = byId('sApps');
-  let apps = lastApps;
+  let apps = [], agents = [];
   try { apps = await (await fetch('/api/apps')).json(); } catch {}
-  if (!apps.length) { tb.replaceChildren(stMsg(3, 'no apps have reported yet')); return; }
-  tb.replaceChildren(...apps.map(a => {
+  try { agents = await (await fetch('/api/admin/agents')).json(); } catch {}
+  const byIdMap = new Map();
+  for (const a of apps) byIdMap.set(a.id, { id: a.id, group: a.group || '', hash: null });
+  for (const g of agents) {
+    const e = byIdMap.get(g.id) || { id: g.id, group: '', hash: null };
+    e.hash = g.hashPrefix || '';
+    byIdMap.set(g.id, e);
+  }
+  const rows = [...byIdMap.values()].sort((x, y) => x.id < y.id ? -1 : 1);
+  if (!rows.length) { tb.replaceChildren(stMsg(4, 'no apps yet — mint a pairing code below')); return; }
+  tb.replaceChildren(...rows.map(a => {
     const tr = document.createElement('tr');
+    // group cell: input + Save
     const inp = document.createElement('input');
-    inp.value = a.group || ''; inp.placeholder = 'ungrouped'; inp.style.width = '150px';
-    const b = document.createElement('button');
-    b.className = 'sBtn'; b.textContent = 'Save';
-    b.addEventListener('click', async () => {
+    inp.value = a.group; inp.placeholder = 'ungrouped'; inp.style.width = '60%';
+    const save = document.createElement('button');
+    save.className = 'sBtn'; save.textContent = 'Save'; save.style.marginLeft = '4px';
+    save.addEventListener('click', async () => {
       await stPost('/api/admin/group', { app: a.id, group: inp.value.trim() });
-      b.textContent = 'Saved'; setTimeout(() => b.textContent = 'Save', 1200);
+      save.textContent = 'Saved'; setTimeout(() => save.textContent = 'Save', 1200);
     });
-    const tdIn = document.createElement('td'); tdIn.appendChild(inp);
-    const tdB = document.createElement('td'); tdB.appendChild(b);
-    tr.append(stCell(a.id), tdIn, tdB);
+    const tdG = document.createElement('td'); tdG.append(inp, save);
+    // token cell
+    const tdT = stCell(a.hash === null ? 'none' : a.hash + '...');
+    if (a.hash === null) tdT.style.color = '#6b727e';
+    // actions
+    const pc = document.createElement('button');
+    pc.className = 'sBtn'; pc.textContent = 'Pairing code';
+    pc.addEventListener('click', () => mintPairCode(a.id));
+    const tdX = document.createElement('td'); tdX.className = 'acts'; tdX.append(pc);
+    if (a.hash !== null) {
+      const rv = document.createElement('button');
+      rv.className = 'sBtn danger'; rv.textContent = 'Revoke'; rv.style.marginLeft = '4px';
+      rv.addEventListener('click', async () => {
+        if (!confirm('Revoke the token for "' + a.id + '"? It stops authenticating on its next push.')) return;
+        await stPost('/api/admin/agent/revoke', { id: a.id });
+        loadSettingsApps();
+      });
+      tdX.append(rv);
+    }
+    tr.append(stCell(a.id), tdG, tdT, tdX);
     return tr;
   }));
 }
@@ -1867,14 +1924,14 @@ async function loadSettingsOps() {
   tb.replaceChildren(...ops.map(o => {
     const tr = document.createElement('tr');
     const si = document.createElement('input');
-    si.value = (o.scope || []).join(','); si.placeholder = 'all'; si.style.width = '150px';
+    si.value = (o.scope || []).join(','); si.placeholder = 'all'; si.style.width = '62%';
     const sset = document.createElement('button');
     sset.className = 'sBtn'; sset.textContent = 'Set'; sset.style.marginLeft = '4px';
     sset.addEventListener('click', async () => {
       await stPost('/api/admin/operator/scope', { name: o.name, scope: si.value.trim() });
       sset.textContent = 'Set!'; setTimeout(() => sset.textContent = 'Set', 1200);
     });
-    const tdS = document.createElement('td'); tdS.append(si, sset);
+    const tdS = document.createElement('td'); tdS.className = 'acts'; tdS.append(si, sset);
     const lc = document.createElement('button');
     lc.className = 'sBtn'; lc.textContent = 'Login code';
     lc.addEventListener('click', async () => {
@@ -1889,7 +1946,7 @@ async function loadSettingsOps() {
       await stPost('/api/admin/operator/revoke', { name: o.name });
       loadSettingsOps();
     });
-    const tdX = document.createElement('td'); tdX.append(lc, rv);
+    const tdX = document.createElement('td'); tdX.className = 'acts'; tdX.append(lc, rv);
     tr.append(stCell(o.name), stCell(o.role), tdS, stCell(o.created || ''), tdX);
     return tr;
   }));
@@ -1910,35 +1967,13 @@ byId('sOpAdd').addEventListener('click', async () => {
   }
 });
 
-async function loadSettingsAgents() {
-  const tb = byId('sAgents');
-  let ag = [];
-  try { ag = await (await fetch('/api/admin/agents')).json(); } catch {}
-  if (!ag.length) { tb.replaceChildren(stMsg(3, 'open mode — no agent tokens registered')); return; }
-  tb.replaceChildren(...ag.map(a => {
-    const tr = document.createElement('tr');
-    const pc = document.createElement('button');
-    pc.className = 'sBtn'; pc.textContent = 'Pairing code';
-    pc.addEventListener('click', () => mintPairCode(a.id));
-    const rv = document.createElement('button');
-    rv.className = 'sBtn danger'; rv.textContent = 'Revoke'; rv.style.marginLeft = '4px';
-    rv.addEventListener('click', async () => {
-      if (!confirm('Revoke agent token for "' + a.id + '"?')) return;
-      await stPost('/api/admin/agent/revoke', { id: a.id });
-      loadSettingsAgents();
-    });
-    const tdX = document.createElement('td'); tdX.append(pc, rv);
-    tr.append(stCell(a.id), stCell((a.hashPrefix || '') + '...'), tdX);
-    return tr;
-  }));
-}
-
 async function mintPairCode(app) {
   const r = await stPost('/api/admin/pair-code', { app });
   if (r.ok) {
     const j = await r.json();
     stReveal('sPairOut', 'pairing code for ' + app + ': ' + j.code + '  (valid 10 min)\n'
       + 'venue: anchorbolt start --pair ' + j.code + ' --server <this server url>');
+    loadSettingsApps();   // a code provisions the app-id — show it in the table
   } else {
     stReveal('sPairOut', 'error: ' + (await r.text()));
   }
