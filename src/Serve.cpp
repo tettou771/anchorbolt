@@ -782,9 +782,12 @@ const char* kDashboardHtml = R"HTML(<!DOCTYPE html>
   #dLog .ll.sup  { color: #7ea6d9; }
   #dLog .ll .lt  { color: #565c66; margin-right: 8px; }
   #dLog .empty   { color: #4a4f59; padding: 12px; }
-  .liveChip { font-size: 11px; border-radius: 4px; padding: 1px 7px; flex: none;
-              background: #1a2f22; color: #4ecb71; border: 1px solid #2b4a35; }
-  .liveChip.off { background: #2a2224; color: #8d6a6e; border-color: #443338; }
+  /* Command-channel status: a plain dot (green = the agent is connected and
+     can take commands, gray = offline). A dot, not a "live" label, so it
+     doesn't read as a second copy of the Live button beside it. */
+  .liveDot { width: 9px; height: 9px; border-radius: 50%; flex: none;
+             background: #3fb950; }
+  .liveDot.off { background: #4a4f59; }
   #dRestart { background: #33251a; color: #e0a06a; border: 1px solid #55402c;
               border-radius: 6px; font-size: 12px; padding: 4px 12px;
               cursor: pointer; flex: none; }
@@ -965,7 +968,7 @@ R"HTML(
       <span class="dot" id="dDot"></span>
       <h2 id="dTitle"></h2>
       <span class="stats" id="dStats"></span>
-      <span class="liveChip off" id="dLive">offline</span>
+      <span class="liveDot off" id="dLive" title="agent offline"></span>
       <button id="dLiveBtn" title="live view + remote control">Live</button>
       <button id="dUpdate" disabled title="git pull + build + restart on the venue machine">Update</button>
       <button id="dRollback" disabled title="restore the previous binary">Roll back</button>
@@ -1270,8 +1273,8 @@ async function renderDetail() {
   document.getElementById('dDot').classList.toggle('bad', stale);
   document.getElementById('dTitle').textContent = app.id;
   const live = document.getElementById('dLive');
-  live.textContent = app.live ? 'live' : 'offline';
   live.classList.toggle('off', !app.live);
+  live.title = app.live ? 'agent online — remote control available' : 'agent offline';
   document.getElementById('dRestart').disabled = !app.live;
   document.getElementById('dUpdate').disabled = !app.live;
   document.getElementById('dRollback').disabled = !app.live;
