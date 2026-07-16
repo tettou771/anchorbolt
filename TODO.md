@@ -15,12 +15,12 @@ A share link = viewer-scoped token in URL form (+ optional password +
 expiry). Operator tokens/login shipped; admin mint/revoke UI in the
 dashboard (CLI-only today) and `reset-admin` recovery verb also pending.
 
-## 2. Fleet /mcp for AI
+## 2. Approval queue for AI-driven mutating calls
 
-Plain HTTP MCP server on serve: `search_logs`, `tail_logs`,
-`get_screenshot_history`, `restart_app`, plus `app_list_tools(app_id)` /
-`app_call(app_id, tool, args)` passthrough. Mutating calls go through a
-server-side approval queue (block + TTL + approve/deny page).
+Fleet /mcp shipped (read tools + passthrough + restart, role-gated).
+Remaining: mutating calls block on a server-side approval queue with TTL —
+notification links the human to an approve/deny page on the dashboard
+(same shape as a permission prompt; never lives in chat apps).
 
 ## 3. Remote live view (v2)
 

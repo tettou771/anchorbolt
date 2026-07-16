@@ -199,6 +199,27 @@ Clear require the operator role (and the venue-side --allow-control /
 --allow-update gates still apply on top). `token list` shows both classes.
 TLS remains the reverse proxy's job (Caddy, Cloudflare Tunnel).
 
+## Fleet MCP (AI operations)
+
+`POST /mcp` on the serve port is a full MCP server (same JSON-RPC-over-HTTP
+transport as TrussC apps), so an AI assistant can investigate "the Osaka
+piece crashed last night" end-to-end:
+
+```bash
+claude mcp add --transport http anchorbolt http://localhost:54722/mcp \
+    --header "Authorization: Bearer op-..."   # an operator token
+```
+
+Tools: `list_apps`, `search_logs`, `tail_logs`, `get_events`,
+`get_health_history`, `list_screenshots`, `get_screenshot` (returns a real
+image block — the AI sees the installation), `restart_app`,
+`app_list_tools` / `app_call` (passthrough to each app's own MCP tools —
+tool names stay unchanged, the `app` argument addresses the venue; the two
+fixed proxies avoid a tools/list explosion across venues). Roles apply:
+viewers get the read-only tools, `restart_app` and mutating `app_call`
+need operator — and the venue-side `--allow-control` gate still applies
+on top. Open mode (no operators) leaves /mcp open too.
+
 ## Custom app status
 
 Apps can publish their own monitoring data with one line per value — the

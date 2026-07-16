@@ -253,6 +253,307 @@ bool parseArgs(const vector<string>& args, ServeOptions& opt) {
     return true;
 }
 
+
+
+// Same U+FFFD-replacing dump as the agent side: stored log text can carry
+// invalid UTF-8 (localized toolchains), and a search result must not crash
+// the fleet server.
+string dumpSafeS(const Json& j) {
+    return j.dump(-1, ' ', false, Json::error_handler_t::replace);
+}
+// --- fleet MCP server ---------------------------------------------------------
+// POST /mcp: the fleet server is itself an MCP server (same JSON-RPC-over-
+// HTTP transport as TrussC apps), so an AI assistant can investigate "the
+// Osaka piece crashed last night" end-to-end: search logs, pull screenshot
+// history, check health series, and — with the operator role — restart the
+// app or call its own MCP tools through the WS passthrough. Auth: Bearer
+// operator token (viewer = read-only tools, operator+ = restart/app_call);
+// open mode when no operators are registered.
+
+Json mcpText(const string& s) {
+    return Json{{"content", Json::array({Json{{"type", "text"}, {"text", s}}})}};
+}
+
+Json mcpJson(const Json& j) {
+    return mcpText(j.dump(2));
+}
+
+Json mcpError(const string& msg) {
+    Json r = mcpText(msg);
+    r["isError"] = true;
+    return r;
+}
+
+Json mcpImage(const vector<unsigned char>& jpg, const Json& meta) {
+    return Json{{"content", Json::array({
+        Json{{"type", "image"}, {"data", toBase64(jpg)}, {"mimeType", "image/jpeg"}},
+        Json{{"type", "text"}, {"text", meta.dump()}}})}};
+}
+
+// Newest-first list of an app's daily JSONL files with the given prefix.
+vector<fs::path> dailyFiles(const fs::path& dataDir, const string& app, const string& prefix) {
+    vector<fs::path> out;
+    error_code ec;
+    for (auto& e : fs::directory_iterator(dataDir / app, ec)) {
+        string n = e.path().filename().string();
+        if (n.rfind(prefix, 0) == 0 && n.size() > 6 &&
+            n.compare(n.size() - 6, 6, ".jsonl") == 0) {
+            out.push_back(e.path());
+        }
+    }
+    sort(out.begin(), out.end(), std::greater<>());
+    return out;
+}
+
+Json fleetToolsList() {
+    auto tool = [](const char* name, const char* desc, Json props, Json required) {
+        return Json{{"name", name}, {"description", desc},
+                    {"inputSchema", Json{{"type", "object"},
+                                         {"properties", props},
+                                         {"required", required}}}};
+    };
+    Json appArg = Json{{"app", {{"type", "string"}, {"description", "App id as shown by list_apps"}}}};
+    Json tools = Json::array();
+    tools.push_back(tool("list_apps",
+        "All apps this fleet server knows: id, live (agent WS connected), seconds since last heartbeat, unacked incident count, and the latest health snapshot (fps, uptime, memory, git commit).",
+        Json::object(), Json::array()));
+    tools.push_back(tool("search_logs",
+        "Case-insensitive substring search over an app's stored log lines (app log + supervisor events), newest day first. Great for 'what happened last night': try queries like ERROR, unresponsive, restarting, [update].",
+        Json{{"app", appArg["app"]},
+             {"query", {{"type", "string"}, {"description", "Substring to match (case-insensitive). Empty matches everything."}}},
+             {"days", {{"type", "integer"}, {"description", "How many recent days of files to scan (default 7)"}}},
+             {"limit", {{"type", "integer"}, {"description", "Max matching lines returned (default 100)"}}}},
+        Json::array({"app"})));
+    tools.push_back(tool("tail_logs",
+        "The last N stored log lines for an app (app log + supervisor events interleaved as received).",
+        Json{{"app", appArg["app"]},
+             {"lines", {{"type", "integer"}, {"description", "Line count (default 50)"}}}},
+        Json::array({"app"})));
+    tools.push_back(tool("get_events",
+        "Recent supervisor/app events for an app (restart/up/down/update/stop/alert) from the event store, newest first — the same list the dashboard shows.",
+        Json{{"app", appArg["app"]},
+             {"limit", {{"type", "integer"}, {"description", "Max events (default 50)"}}}},
+        Json::array({"app"})));
+    tools.push_back(tool("get_health_history",
+        "Recent heartbeat entries for an app (timestamped health snapshots: fps, rssBytes, machine memory, custom status values). Thinned to at most `entries` evenly spaced samples from today's records.",
+        Json{{"app", appArg["app"]},
+             {"entries", {{"type", "integer"}, {"description", "Max samples returned (default 60)"}}}},
+        Json::array({"app"})));
+    tools.push_back(tool("list_screenshots",
+        "Stored thumbnail timestamps for an app (names are YYYYMMDD-HHMMSS). Recent 24h is complete; older thins to one per hour.",
+        Json{{"app", appArg["app"]},
+             {"day", {{"type", "string"}, {"description", "Filter to one day, YYYYMMDD (default: all)"}}}},
+        Json::array({"app"})));
+    tools.push_back(tool("get_screenshot",
+        "A stored thumbnail as an image. Omit `at` for the latest; pass a name from list_screenshots (or a prefix like 20260716-03) to see what the installation looked like at that moment.",
+        Json{{"app", appArg["app"]},
+             {"at", {{"type", "string"}, {"description", "Timestamp name or prefix (default: latest)"}}}},
+        Json::array({"app"})));
+    tools.push_back(tool("restart_app",
+        "Restart the app via its supervisor (operator role). Same path as the dashboard Restart button.",
+        Json{{"app", appArg["app"]}}, Json::array({"app"})));
+    tools.push_back(tool("app_list_tools",
+        "List the app's OWN MCP tools via the live agent passthrough (tc_* standard tools plus any custom ones the app registered).",
+        Json{{"app", appArg["app"]}}, Json::array({"app"})));
+    tools.push_back(tool("app_call",
+        "Call one of the app's own MCP tools through the agent passthrough. Read-only tc_get_* tools relay freely; anything mutating needs the operator role here AND --allow-control on the venue side. Image results come back as images.",
+        Json{{"app", appArg["app"]},
+             {"tool", {{"type", "string"}, {"description", "Tool name from app_list_tools"}}},
+             {"args", {{"type", "object"}, {"description", "Tool arguments (optional)"}}}},
+        Json::array({"app", "tool"})));
+    return Json{{"tools", tools}};
+}
+
+// rank: caller's role rank (3 in open mode). Returns an MCP result object.
+Json fleetToolCall(const fs::path& dataDir, const string& name, const Json& args, int rank) {
+    auto appArg = [&]() { return args.value("app", ""); };
+
+    if (name == "list_apps") {
+        Json list = Json::array();
+        auto now = chrono::steady_clock::now();
+        lock_guard<mutex> lock(g_appsMutex);
+        for (auto& [id, st] : g_apps) {
+            Json h = st.health;
+            Json e = {{"id", id},
+                      {"live", g_agents.live(id)},
+                      {"lastSeenSec", (int)chrono::duration<double>(now - st.lastSeen).count()},
+                      {"unackedAlerts", st.unackedAlerts}};
+            for (auto key : {"fps", "uptimeSec", "rssBytes", "git", "version"}) {
+                if (h.contains(key)) e[key] = h[key];
+            }
+            list.push_back(e);
+        }
+        return mcpJson(list);
+    }
+
+    string app = appArg();
+    if (!validAppId(app)) return mcpError("missing or invalid 'app' (see list_apps)");
+
+    if (name == "search_logs" || name == "tail_logs") {
+        bool tailMode = (name == "tail_logs");
+        string query = args.value("query", "");
+        transform(query.begin(), query.end(), query.begin(), ::tolower);
+        int days  = tailMode ? 1 : max(1, args.value("days", 7));
+        int limit = tailMode ? max(1, args.value("lines", 50)) : max(1, args.value("limit", 100));
+        vector<string> hits;
+        auto files = dailyFiles(dataDir, app, "log-");
+        for (size_t fi = 0; fi < files.size() && (int)fi < days && (int)hits.size() < limit; ++fi) {
+            // Collect per file (oldest line first), then take from the END so
+            // "newest first across days" works without loading everything.
+            string date = files[fi].filename().string().substr(4, 10);
+            vector<string> lines;
+            ifstream in(files[fi]);
+            string line;
+            while (getline(in, line)) {
+                Json j;
+                try { j = Json::parse(line); } catch (...) { continue; }
+                string text = j.value("text", "");
+                if (!query.empty()) {
+                    string lower = text;
+                    transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+                    if (lower.find(query) == string::npos) continue;
+                }
+                lines.push_back(date + " " + j.value("at", "") + " [" + j.value("src", "app") + "] " + text);
+            }
+            for (auto it = lines.rbegin(); it != lines.rend() && (int)hits.size() < limit; ++it) {
+                hits.push_back(*it);
+            }
+        }
+        if (hits.empty()) return mcpText(tailMode ? "no stored log lines" : "no matches");
+        string out;
+        for (auto& h : hits) out += h + "\n";
+        return mcpText(out);
+    }
+
+    if (name == "get_events") {
+        int limit = max(1, args.value("limit", 50));
+        vector<string> out;
+        auto files = dailyFiles(dataDir, app, "alert-");
+        for (size_t fi = 0; fi < files.size() && (int)out.size() < limit; ++fi) {
+            vector<string> lines;
+            ifstream in(files[fi]);
+            string line;
+            while (getline(in, line)) {
+                Json j;
+                try { j = Json::parse(line); } catch (...) { continue; }
+                lines.push_back(j.value("at", "") + " [" + j.value("event", "alert") + "] " + j.value("text", ""));
+            }
+            for (auto it = lines.rbegin(); it != lines.rend() && (int)out.size() < limit; ++it) {
+                out.push_back(*it);
+            }
+        }
+        if (out.empty()) return mcpText("no events recorded");
+        string text;
+        for (auto& l : out) text += l + "\n";
+        return mcpText(text);
+    }
+
+    if (name == "get_health_history") {
+        int entries = max(1, args.value("entries", 60));
+        auto files = dailyFiles(dataDir, app, "heartbeat-");
+        if (files.empty()) return mcpText("no heartbeats recorded");
+        vector<Json> all;
+        ifstream in(files[0]);
+        string line;
+        while (getline(in, line)) {
+            try { all.push_back(Json::parse(line)); } catch (...) {}
+        }
+        if (all.empty()) return mcpText("no heartbeats recorded");
+        Json out = Json::array();
+        size_t step = max<size_t>(1, all.size() / entries);
+        for (size_t i = 0; i < all.size(); i += step) out.push_back(all[i]);
+        if (out.back() != all.back()) out.push_back(all.back());
+        return mcpJson(out);
+    }
+
+    if (name == "list_screenshots") {
+        string day = args.value("day", "");
+        vector<string> names;
+        error_code ec;
+        for (auto& e : fs::directory_iterator(dataDir / app / "thumbs", ec)) {
+            string n = e.path().filename().string();
+            if (n.size() == 19 && n.compare(15, 4, ".jpg") == 0) {
+                string stamp = n.substr(0, 15);
+                if (day.empty() || stamp.rfind(day, 0) == 0) names.push_back(stamp);
+            }
+        }
+        sort(names.begin(), names.end());
+        if (names.empty()) return mcpText("no screenshots stored");
+        string out;
+        for (auto& n : names) out += n + "\n";
+        return mcpText(out);
+    }
+
+    if (name == "get_screenshot") {
+        string at = args.value("at", "");
+        vector<string> names;
+        error_code ec;
+        for (auto& e : fs::directory_iterator(dataDir / app / "thumbs", ec)) {
+            string n = e.path().filename().string();
+            if (n.size() == 19 && n.compare(15, 4, ".jpg") == 0) names.push_back(n);
+        }
+        sort(names.begin(), names.end());
+        if (names.empty()) return mcpError("no screenshots stored for '" + app + "'");
+        string pick;
+        if (at.empty()) {
+            pick = names.back();
+        } else {
+            // newest name at or before/matching the prefix; else the closest after
+            for (auto& n : names) {
+                if (n.substr(0, at.size()) <= at) pick = n;
+            }
+            if (pick.empty()) pick = names.front();
+        }
+        ifstream in(dataDir / app / "thumbs" / pick, ios::binary);
+        vector<unsigned char> jpg((istreambuf_iterator<char>(in)), istreambuf_iterator<char>());
+        if (jpg.empty()) return mcpError("could not read " + pick);
+        return mcpImage(jpg, Json{{"app", app}, {"at", pick.substr(0, 15)}});
+    }
+
+    if (name == "restart_app") {
+        if (rank < 2) return mcpError("restart_app needs the operator role");
+        Json r = g_agents.command(app, Json{{"action", "restart"}});
+        return r.value("ok", false) ? mcpJson(r["result"])
+                                    : mcpError(r.value("error", "restart failed"));
+    }
+
+    if (name == "app_list_tools") {
+        Json r = g_agents.command(app, Json{{"action", "list_tools"}});
+        return r.value("ok", false) ? mcpJson(r["result"])
+                                    : mcpError(r.value("error", "agent not reachable"));
+    }
+
+    if (name == "app_call") {
+        string toolName = args.value("tool", "");
+        if (toolName.empty()) return mcpError("'tool' is required (see app_list_tools)");
+        // Read-only passthrough for viewers; anything else needs operator here
+        // (the venue's --allow-control gate still applies on the agent side).
+        if (toolName.rfind("tc_get_", 0) != 0 && rank < 2) {
+            return mcpError("'" + toolName + "' is not read-only; it needs the operator role");
+        }
+        Json r = g_agents.command(app, Json{{"action", "call"},
+                                            {"tool", toolName},
+                                            {"args", args.value("args", Json::object())}});
+        if (!r.value("ok", false)) return mcpError(r.value("error", "tool call failed"));
+        Json result = r["result"];
+        // The agent folds app image blocks into {data, mimeType, ...}; unfold
+        // back into a real image block so the AI sees the picture.
+        if (result.is_object() && result.contains("data") && result.contains("mimeType") &&
+            result["data"].is_string()) {
+            Json meta = Json::object();
+            for (auto key : {"width", "height"}) {
+                if (result.contains(key)) meta[key] = result[key];
+            }
+            return Json{{"content", Json::array({
+                Json{{"type", "image"}, {"data", result["data"]}, {"mimeType", result["mimeType"]}},
+                Json{{"type", "text"}, {"text", meta.dump()}}})}};
+        }
+        return mcpJson(result);
+    }
+
+    return mcpError("unknown tool '" + name + "'");
+}
+
 // Dashboard: one self-contained page, no external assets. Polls /api/apps and
 // refreshes each card's thumbnail whenever its upload sequence changes.
 // Clicking a card opens a detail view: live thumbnail, app-published status
@@ -1244,6 +1545,59 @@ int cmdServe(const vector<string>& args) {
                        "; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000");
         res.set_content(Json({{"name", op->name}, {"role", op->role}}).dump(),
                         "application/json");
+    });
+
+
+    // The fleet server is itself an MCP server. Auth: Bearer operator token
+    // (Authorization header — MCP clients can send headers; the dashboard
+    // cookie also works). Open mode admits everyone at admin rank.
+    svr.Post("/mcp", [dataDir, cookieToken](const httplib::Request& req, httplib::Response& res) {
+        int rank = 3;
+        string d = dataDir.string();
+        if (token::operatorsEnabled(d)) {
+            string tok;
+            string h = req.get_header_value("Authorization");
+            if (h.rfind("Bearer ", 0) == 0) tok = h.substr(7);
+            if (tok.empty()) tok = cookieToken(req);
+            auto op = token::verifyOperator(d, tok);
+            if (!op) {
+                res.status = 401;
+                res.set_content("unauthorized (Bearer operator token required)", "text/plain");
+                return;
+            }
+            rank = token::roleRank(op->role);
+        }
+        Json rpc;
+        try {
+            rpc = Json::parse(req.body);
+        } catch (...) {
+            res.status = 400;
+            res.set_content("invalid JSON-RPC", "text/plain");
+            return;
+        }
+        string method = rpc.value("method", "");
+        if (method.rfind("notifications/", 0) == 0) {
+            res.status = 202;   // fire-and-forget per MCP-over-HTTP
+            return;
+        }
+        Json reply = {{"jsonrpc", "2.0"}};
+        if (rpc.contains("id")) reply["id"] = rpc["id"];
+        if (method == "initialize") {
+            reply["result"] = {{"protocolVersion", rpc["params"].value("protocolVersion", "2024-11-05")},
+                               {"capabilities", {{"tools", Json::object()}}},
+                               {"serverInfo", {{"name", "anchorbolt"}, {"version", "0.0.1"}}}};
+        } else if (method == "tools/list") {
+            reply["result"] = fleetToolsList();
+        } else if (method == "tools/call") {
+            string name = rpc["params"].value("name", "");
+            Json args = rpc["params"].value("arguments", Json::object());
+            reply["result"] = fleetToolCall(dataDir, name, args, rank);
+        } else if (method == "ping") {
+            reply["result"] = Json::object();
+        } else {
+            reply["error"] = {{"code", -32601}, {"message", "method not found: " + method}};
+        }
+        res.set_content(dumpSafeS(reply), "application/json");
     });
 
     svr.Post("/api/logout", [](const httplib::Request&, httplib::Response& res) {
