@@ -40,5 +40,4 @@ HTML mirror (`tcx_imgui_get_widgets` → native HTML controls →
 ## Small stuff
 
 - serve restart empties the log panel ring — preload tail from disk JSONL
-- stray "[NOTICE] TCP server stopped" atexit noise on CLI error paths
 - `tc::fromBase64` is a candidate for TrussC core (currently vendored here)
