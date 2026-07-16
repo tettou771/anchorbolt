@@ -39,6 +39,35 @@ namespace fs = std::filesystem;
 
 namespace {
 
+// Decode standard base64 (agents ship live frames as base64 text — see the
+// note in the WS onMessage frame handler for why text, not binary). Skips
+// padding and whitespace. Mirrors fromBase64() in Start.cpp; core has toBase64
+// but no decoder.
+vector<unsigned char> fromBase64(const string& s) {
+    auto val = [](char c) -> int {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        return -1;
+    };
+    vector<unsigned char> out;
+    out.reserve(s.size() * 3 / 4);
+    int buf = 0, bits = 0;
+    for (char c : s) {
+        int v = val(c);
+        if (v < 0) continue;
+        buf = (buf << 6) | v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back((unsigned char)((buf >> bits) & 0xFF));
+        }
+    }
+    return out;
+}
+
 struct ServeOptions {
     int    port     = 54722;  // "truss" typed on the QWERTY number row
     int    wsPort   = 0;      // 0 = port + 1
@@ -73,6 +102,14 @@ struct AppState {
     deque<LogLine> alerts;                          // app-raised operator alerts
     uint64_t nextAlertSeq = 1;
     int unackedAlerts = 0;                          // wall badge; Clear resets
+
+    // Live view: latest frame pushed by the agent, plus lifecycle bookkeeping.
+    // The stream is driven implicitly by GET /api/live polling — no explicit
+    // start/stop from the browser.
+    vector<unsigned char> liveFrame;                // latest JPEG (decoded)
+    uint64_t liveSeq = 0;                           // bumped per frame (X-Live-Seq)
+    chrono::steady_clock::time_point liveAt{};      // when it arrived (staleness)
+    chrono::steady_clock::time_point lastLiveStart{}; // last live_start we sent
 };
 
 constexpr size_t kLogRingSize = 500;
@@ -730,6 +767,28 @@ const char* kDashboardHtml = R"HTML(<!DOCTYPE html>
              word-break: break-all; }
   #dResult:empty { display: none; }
   #dResult.err { color: #ff8a80; }
+  #dLiveBtn { background: #1c2a3a; color: #79b8ff; border: 1px solid #2c405a;
+              border-radius: 6px; font-size: 12px; padding: 4px 12px;
+              cursor: pointer; flex: none; }
+  #dLiveBtn:hover { background: #223449; }
+  #dLiveBtn.on { background: #2c405a; color: #cfe6ff; }
+  #dLiveWrap[hidden] { display: none; }
+  #dLiveBar { display: flex; align-items: center; gap: 10px; margin-bottom: 8px;
+              font-size: 12px; color: #9aa3b2; }
+  #dLiveStatus { flex: 1; color: #7d838e; }
+  #dCtlToggle { display: inline-flex; align-items: center; gap: 5px;
+                color: #e0a06a; cursor: pointer; user-select: none; }
+  #dCtlToggle[hidden] { display: none; }
+  #dLiveClose { background: none; color: #7d838e; border: 1px solid #323844;
+                border-radius: 5px; font-size: 12px; padding: 3px 10px; cursor: pointer; }
+  #dLiveClose:hover { color: #d4d7dd; }
+  #dLiveStage { position: relative; aspect-ratio: 16 / 10; background: #0e0f12;
+                border-radius: 8px; overflow: hidden; max-height: 460px;
+                display: flex; align-items: center; justify-content: center; }
+  #dLiveImg { max-width: 100%; max-height: 100%; object-fit: contain;
+              outline: none; display: block; }
+  #dLiveStage.ctl #dLiveImg { cursor: crosshair; }
+  #dLiveStage.ctl { outline: 2px solid #55402c; outline-offset: -2px; }
 </style>
 </head>
 <body>
@@ -760,12 +819,22 @@ const char* kDashboardHtml = R"HTML(<!DOCTYPE html>
       <h2 id="dTitle"></h2>
       <span class="stats" id="dStats"></span>
       <span class="liveChip off" id="dLive">offline</span>
+      <button id="dLiveBtn" title="live view + remote control">Live</button>
       <button id="dUpdate" disabled title="git pull + build + restart on the venue machine">Update</button>
       <button id="dRollback" disabled title="restore the previous binary">Roll back</button>
       <button id="dRestart" disabled>Restart</button>
       <button id="dClose" title="close">&times;</button>
     </div>
     <div class="dbody">
+      <div id="dLiveWrap" hidden>
+        <div id="dLiveBar">
+          <span class="glabel">live view</span>
+          <label id="dCtlToggle" hidden><input type="checkbox" id="dCtl"> control</label>
+          <span id="dLiveStatus">waiting for stream...</span>
+          <button id="dLiveClose">close</button>
+        </div>
+        <div id="dLiveStage"><img id="dLiveImg" alt="" draggable="false" tabindex="0"></div>
+      </div>
       <div id="dThumbWrap"><img hidden></div>
       <div id="dValues"></div>
       <div id="dEvWrap" hidden>
@@ -895,12 +964,14 @@ function openDetail(id) {
   document.getElementById('dLog').replaceChildren(
     Object.assign(document.createElement('div'), {className: 'empty', textContent: 'no log lines yet'}));
   document.getElementById('dResult').textContent = '';
+  stopLiveView();                     // a fresh app starts with live view closed
   document.getElementById('detail').hidden = false;
   loadTools(id);
   renderDetail();
 }
 
 function closeDetail() {
+  stopLiveView();
   detailId = null;
   document.getElementById('detail').hidden = true;
 }
@@ -1228,6 +1299,137 @@ document.getElementById('dRun').addEventListener('click', async () => {
 });
 
 )HTML"
+R"HTML(// ---- live view + remote control ----
+
+let liveOn = false;
+let liveTimer = null;
+
+document.getElementById('dLiveBtn').addEventListener('click', () => {
+  if (liveOn) stopLiveView(); else startLiveView();
+});
+document.getElementById('dLiveClose').addEventListener('click', stopLiveView);
+
+function startLiveView() {
+  if (!detailId) return;
+  liveOn = true;
+  document.getElementById('dLiveBtn').classList.add('on');
+  document.getElementById('dLiveWrap').hidden = false;
+  document.getElementById('dLiveStatus').textContent = 'waiting for stream...';
+  // Control is operator/admin only; myRole===null means open mode (allowed).
+  document.getElementById('dCtlToggle').hidden = (myRole === 'viewer');
+  document.getElementById('dCtl').checked = false;
+  document.getElementById('dLiveStage').classList.remove('ctl');
+  pollLiveFrame();
+}
+
+function stopLiveView() {
+  liveOn = false;
+  if (liveTimer) { clearTimeout(liveTimer); liveTimer = null; }
+  document.getElementById('dLiveBtn').classList.remove('on');
+  document.getElementById('dLiveWrap').hidden = true;
+  liveDown = null;
+  const img = document.getElementById('dLiveImg');
+  img.onload = img.onerror = null;
+  img.removeAttribute('src');
+}
+
+// Swap src each tick; schedule the next swap only on load/error so a slow
+// frame can't pile up requests. The agent auto-stops 10s after these polls
+// cease, so leaving the view IS the stop signal.
+function pollLiveFrame() {
+  if (!liveOn || !detailId) return;
+  const img = document.getElementById('dLiveImg');
+  img.onload = () => {
+    document.getElementById('dLiveStatus').textContent = 'streaming';
+    scheduleLive();
+  };
+  img.onerror = () => { scheduleLive(); };   // 404 until the first frame lands
+  img.src = '/api/live/' + encodeURIComponent(detailId) + '?s=' + Date.now();
+}
+function scheduleLive() {
+  if (liveOn) liveTimer = setTimeout(pollLiveFrame, 110);   // ~9 fps
+}
+
+function ctlOn() { return document.getElementById('dCtl').checked; }
+
+document.getElementById('dCtl').addEventListener('change', e => {
+  document.getElementById('dLiveStage').classList.toggle('ctl', e.target.checked);
+  if (e.target.checked) document.getElementById('dLiveImg').focus();
+});
+
+// Map a pointer event on the frame to the app's real pixel coords. The frame
+// is downscaled for bandwidth, so scale by the app's true window size from
+// health (falls back to the image's natural size).
+function liveToApp(e) {
+  const img = document.getElementById('dLiveImg');
+  const app = lastApps.find(a => a.id === detailId);
+  const h = (app && app.health) || {};
+  const aw = h.width || img.naturalWidth || img.clientWidth || 1;
+  const ah = h.height || img.naturalHeight || img.clientHeight || 1;
+  const r = img.getBoundingClientRect();
+  const x = Math.max(0, Math.min(aw - 1, Math.round((e.clientX - r.left) / r.width * aw)));
+  const y = Math.max(0, Math.min(ah - 1, Math.round((e.clientY - r.top) / r.height * ah)));
+  return { x, y };
+}
+
+let liveDown = null;   // in-progress press: { start, sx, sy, pressSent }
+const liveImg = document.getElementById('dLiveImg');
+
+liveImg.addEventListener('mousedown', e => {
+  if (!ctlOn()) return;
+  e.preventDefault();
+  liveDown = { start: liveToApp(e), sx: e.clientX, sy: e.clientY, pressSent: false };
+});
+// Track on window so a drag that leaves the frame still completes.
+window.addEventListener('mousemove', e => {
+  if (!liveDown) return;
+  if (!liveDown.pressSent) {
+    // Click vs drag: only once the pointer travels a few px is it a drag
+    // (press at the origin, then move); a still press+release stays a click.
+    if (Math.abs(e.clientX - liveDown.sx) < 3 && Math.abs(e.clientY - liveDown.sy) < 3) return;
+    liveDown.pressSent = true;
+    sendCommand(detailId, { action: 'call', tool: 'tc_mouse_press',
+                            args: { x: liveDown.start.x, y: liveDown.start.y } });
+  }
+  const p = liveToApp(e);
+  sendCommand(detailId, { action: 'call', tool: 'tc_mouse_move', args: { x: p.x, y: p.y } });
+});
+window.addEventListener('mouseup', e => {
+  if (!liveDown) return;
+  const down = liveDown;
+  liveDown = null;
+  if (down.pressSent) {
+    const p = liveToApp(e);
+    sendCommand(detailId, { action: 'call', tool: 'tc_mouse_release', args: { x: p.x, y: p.y } });
+  } else {
+    sendCommand(detailId, { action: 'call', tool: 'tc_mouse_click',
+                            args: { x: down.start.x, y: down.start.y } });
+  }
+});
+
+// Keyboard passthrough as sokol keycodes — only while control is on and the
+// frame has focus. stopPropagation keeps Escape etc. from leaking to the
+// dashboard's own shortcuts.
+const SOKOL_KEY = { 'ArrowRight': 262, 'ArrowLeft': 263, 'ArrowDown': 264, 'ArrowUp': 265,
+                    ' ': 32, 'Spacebar': 32, 'Enter': 257, 'Escape': 256 };
+function sokolKey(e) {
+  if (e.key in SOKOL_KEY) return SOKOL_KEY[e.key];
+  if (e.key.length === 1) {
+    const c = e.key.toUpperCase().charCodeAt(0);
+    if ((c >= 65 && c <= 90) || (c >= 48 && c <= 57)) return c;   // A-Z, 0-9
+  }
+  return null;
+}
+liveImg.addEventListener('keydown', e => {
+  if (!ctlOn()) return;
+  const code = sokolKey(e);
+  if (code == null) return;
+  e.preventDefault();
+  e.stopPropagation();
+  sendCommand(detailId, { action: 'call', tool: 'tc_key_press', args: { key: code } });
+});
+
+)HTML"
 R"HTML(// ---- event list (supervisor + app alerts) ----
 
 let evCursor = 0;
@@ -1503,6 +1705,27 @@ int cmdServe(const vector<string>& args) {
             m.erase("type");
             m.erase("id");
             prom->set_value(m);
+        } else if (type == "frame") {
+            // Live view frame: base64 JPEG. Text (not a binary WS frame)
+            // because WsHub only decodes text and the agent's WS client emits a
+            // TEXT opcode even for binary payloads — base64 keeps it honest and
+            // costs nothing extra (the screenshot tool already produced base64).
+            string data = m.value("data", "");
+            if (data.empty()) return;
+            string app;
+            {
+                lock_guard<mutex> lock(g_agents.mutex_);
+                auto it = g_agents.byClient.find(clientId);
+                if (it == g_agents.byClient.end()) return;
+                app = it->second;
+            }
+            auto jpg = fromBase64(data);
+            if (jpg.empty()) return;
+            lock_guard<mutex> lock(g_appsMutex);
+            auto& st = g_apps[app];
+            st.liveFrame = std::move(jpg);
+            st.liveSeq++;
+            st.liveAt = chrono::steady_clock::now();
         }
     };
     g_agents.hub.onClosed = [](int clientId) {
@@ -1946,6 +2169,48 @@ int cmdServe(const vector<string>& args) {
             return;
         }
         res.set_content((const char*)it->second.thumb.data(), it->second.thumb.size(), "image/jpeg");
+    });
+
+    // Live view: latest frame as image/jpeg, and — with zero explicit
+    // lifecycle — the driver for the stream itself. Each poll that finds no
+    // recent live_start (>5s) fires one at the agent, so the browser polling
+    // this endpoint IS what keeps the agent streaming; stop polling and the
+    // agent's own 10s idle timeout tears it down. 404 when no fresh frame yet
+    // (the very first poll after arming is expected to 404).
+    svr.Get(R"(/api/live/([^/]+))", [requireRole](const httplib::Request& req, httplib::Response& res) {
+        if (!requireRole(req, res, 1)) return;
+        string id = req.matches[1];
+        auto now = chrono::steady_clock::now();
+        vector<unsigned char> frame;
+        uint64_t seq = 0;
+        bool needStart = false, known = false;
+        {
+            lock_guard<mutex> lock(g_appsMutex);
+            auto it = g_apps.find(id);
+            if (it != g_apps.end()) {
+                known = true;
+                auto& st = it->second;
+                if (now - st.lastLiveStart > chrono::seconds(5)) {
+                    st.lastLiveStart = now;
+                    needStart = true;
+                }
+                if (!st.liveFrame.empty() && now - st.liveAt <= chrono::seconds(5)) {
+                    frame = st.liveFrame;   // copy out; don't hold the lock over the send
+                    seq = st.liveSeq;
+                }
+            }
+        }
+        // Re-arm outside g_appsMutex — command() takes g_agents.mutex_ and
+        // blocks on the agent's reply (live_start answers immediately; the 3s
+        // is only a safety cap).
+        if (needStart && known) g_agents.command(id, Json{{"action", "live_start"}}, 3);
+        if (frame.empty()) {
+            res.status = 404;
+            res.set_content("no live frame", "text/plain");
+            return;
+        }
+        res.set_header("X-Live-Seq", to_string(seq));
+        res.set_content((const char*)frame.data(), frame.size(), "image/jpeg");
     });
 
     signal(SIGINT, onSignal);

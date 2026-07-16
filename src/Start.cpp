@@ -684,9 +684,9 @@ public:
         url_ = (tls ? "wss://" : "ws://") + host + ":" + to_string(wsPort) + "/";
 
         openL_ = ws_.onOpen.listen([this]() {
-            ws_.send(Json({{"type", "hello"},
-                           {"app", opt_.appId},
-                           {"token", opt_.token}}).dump());
+            wsSend(Json({{"type", "hello"},
+                         {"app", opt_.appId},
+                         {"token", opt_.token}}).dump());
             logNotice("anchorbolt") << "command channel connected (" << url_ << ")";
         });
         msgL_ = ws_.onMessage.listen([this](tcx::websocket::WebSocketEventArgs& e) {
@@ -704,9 +704,101 @@ public:
         }
     }
 
-    void shutdown() { ws_.disconnect(); }
+    void shutdown() {
+        stopLive("shutdown");
+        ws_.disconnect();
+    }
+
+    // The live thread outlives individual commands; make sure it is joined
+    // before the WebSocket and options it touches are torn down.
+    ~CommandChannel() {
+        liveRunning_ = false;
+        if (liveThread_.joinable()) liveThread_.join();
+    }
 
 private:
+    // All frame/reply/hello sends funnel through here: the live thread and the
+    // WS receive thread can both write concurrently, and WebSocketClient::send
+    // is not internally serialized. dumpSafe'd JSON only (invalid UTF-8 in a
+    // reply string would otherwise throw).
+    void wsSend(const string& text) {
+        lock_guard<mutex> lk(sendMutex_);
+        ws_.send(text);
+    }
+
+    static int64_t nowNs() {
+        return chrono::duration_cast<chrono::nanoseconds>(
+                   chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    // Spin up the live screenshot streamer (idempotent). A repeat live_start
+    // while already streaming only refreshes params + the keepalive stamp —
+    // the server re-sends live_start every few seconds as a heartbeat.
+    void startLive() {
+        if (liveRunning_.exchange(true)) return;   // already streaming
+        if (liveThread_.joinable()) liveThread_.join();  // reap a finished run
+        eventLog(logDir_, "live stream started (fps " + to_string(liveFps_.load()) +
+                          ", width " + to_string(liveWidth_.load()) +
+                          ", quality " + to_string(liveQuality_.load()) + ")");
+        logNotice("anchorbolt") << "live stream started";
+        liveThread_ = thread([this]() { liveLoop(); });
+    }
+
+    // Stop streaming and join. Safe to call when not streaming (reaps a thread
+    // that already self-exited on idle without double-logging the stop).
+    void stopLive(const string& reason) {
+        bool was = liveRunning_.exchange(false);
+        if (liveThread_.joinable()) liveThread_.join();
+        if (was) {
+            eventLog(logDir_, "live stream stopped (" + reason + ")");
+            logNotice("anchorbolt") << "live stream stopped (" << reason << ")";
+        }
+    }
+
+    // Poll the app's screenshot tool at the requested fps on a dedicated
+    // connection and push each JPEG frame over the command WebSocket. Base64
+    // TEXT frames, not binary: WsHub (serve) only decodes text, and
+    // WebSocketClient::send(vector) actually emits a TEXT opcode regardless —
+    // so raw binary would arrive mislabeled. The screenshot tool already hands
+    // us base64, so we forward it verbatim (no decode/re-encode). Failed polls
+    // (app restarting/dead) just skip a frame; this never touches the
+    // supervision loop's client.
+    void liveLoop() {
+        httplib::Client cli("localhost", opt_.port);
+        cli.set_connection_timeout(2, 0);
+        cli.set_read_timeout(3, 0);
+        bool idle = false;
+        while (liveRunning_ && !g_stop) {
+            auto frameStart = chrono::steady_clock::now();
+            // Auto-stop: the browser's polling keeps live_start flowing; 10s of
+            // silence means nobody is watching.
+            if (nowNs() - liveKeepaliveNs_.load() > 10LL * 1000 * 1000 * 1000) {
+                idle = true;
+                break;
+            }
+            int fps = std::clamp(liveFps_.load(), 1, 15);
+            Json args = {{"format", "jpg"},
+                         {"width", liveWidth_.load()},
+                         {"quality", liveQuality_.load()}};
+            if (auto t = callTool(cli, "tc_get_screenshot", args)) {
+                if (t->contains("data") && (*t)["data"].is_string()) {
+                    wsSend(dumpSafe(Json{{"type", "frame"}, {"data", (*t)["data"]}}));
+                }
+            }
+            // Pace to the target fps, sleeping in slices so stop stays snappy.
+            auto until = frameStart + chrono::duration_cast<chrono::steady_clock::duration>(
+                                          chrono::duration<double>(1.0 / fps));
+            while (liveRunning_ && !g_stop && chrono::steady_clock::now() < until) {
+                this_thread::sleep_for(chrono::milliseconds(10));
+            }
+        }
+        liveRunning_ = false;
+        if (idle) {
+            eventLog(logDir_, "live stream stopped (idle timeout)");
+            logNotice("anchorbolt") << "live stream stopped (idle timeout)";
+        }
+    }
+
     void handleMessage(const string& text) {
         Json m;
         try {
@@ -807,11 +899,25 @@ private:
                     reply["error"] = "tool call failed or app unresponsive";
                 }
             }
+        } else if (action == "live_start") {
+            // Keepalive + params for the live screenshot stream. Read-only
+            // (screenshots only), so it never needs --allow-control.
+            liveFps_     = std::clamp(m.value("fps", 10), 1, 15);
+            liveWidth_   = std::clamp(m.value("width", 960), 320, 1920);
+            liveQuality_ = std::clamp(m.value("quality", 60), 20, 90);
+            liveKeepaliveNs_ = nowNs();
+            startLive();
+            reply["ok"] = true;
+            reply["result"] = {{"message", "live streaming"}};
+        } else if (action == "live_stop") {
+            stopLive("stopped by request");
+            reply["ok"] = true;
+            reply["result"] = {{"message", "live stopped"}};
         } else {
             reply["ok"] = false;
             reply["error"] = "unknown action";
         }
-        ws_.send(dumpSafe(reply));
+        wsSend(dumpSafe(reply));
     }
 
     StartOptions opt_;
@@ -819,6 +925,13 @@ private:
     string url_;
     tcx::websocket::WebSocketClient ws_;
     EventListener openL_, msgL_, closeL_;
+
+    // Live view: a dedicated screenshot streamer over the same WebSocket.
+    mutex sendMutex_;                    // serializes all ws_.send() callers
+    thread liveThread_;
+    atomic<bool> liveRunning_{false};
+    atomic<int> liveFps_{10}, liveWidth_{960}, liveQuality_{60};
+    atomic<int64_t> liveKeepaliveNs_{0}; // last live_start; drives the 10s auto-stop
 };
 
 bool parseArgs(const vector<string>& args, StartOptions& opt) {
