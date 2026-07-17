@@ -1370,7 +1370,9 @@ document.getElementById('detail').addEventListener('click', e => {
   if (e.target === document.getElementById('detail')) closeDetail();
 });
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDetail(); });
-
+)HTML"
+// MSVC の文字列リテラル上限(16380バイト)対策でここで一旦分割。隣接リテラルは連結される
+R"HTML(
 function fmtVal(v) {
   if (Math.abs(v - Math.round(v)) < 1e-9) return String(Math.round(v));
   const a = Math.abs(v);
