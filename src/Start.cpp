@@ -68,7 +68,11 @@ struct StartOptions {
     int    port        = 47777;  // TRUSSC_MCP_PORT
     bool   portExplicit = false; // --port / config given -> exact, no scanning
     int    watchdogTimeoutSec = 10;  // unresponsive this long -> restart (0 = process-exit only)
-    int    graceSec    = 15;     // boot grace before the watchdog arms
+    int    graceSec    = 120;    // boot grace before the hang-watchdog arms —
+                                 // generous by default: venue apps often boot
+                                 // slowly (model load, external-API handshake).
+                                 // Only defers the hang kill; a crash/exit still
+                                 // restarts instantly.
     string serverUrl;            // fleet server base URL (empty = no push)
     string appId;                // id on the fleet server (default: binary name)
     string token;                // agent token (--token > ANCHORBOLT_TOKEN > tokenFile > pair file)
