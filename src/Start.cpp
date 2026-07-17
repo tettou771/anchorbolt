@@ -1599,7 +1599,54 @@ void closeProc(Proc&) {}
 
 } // namespace
 
+// A commented anchorbolt.json to start from: write it out, tweak the app path
+// and server url, and run. The config parser allows // comments, so this
+// round-trips as-is. No "token"/"id" keys — the token is a secret (pair once,
+// or use tokenFile) and the id is assigned by the server.
+static void printConfigTemplate() {
+    cout <<
+        "{\n"
+        "  // The app to supervise: a TrussC project dir, a .app bundle, or a binary.\n"
+        "  \"app\": \"./bin/myApp.app/Contents/MacOS/myApp\",\n"
+        "  // Extra arguments handed to the app on launch.\n"
+        "  \"args\": [\"--fullscreen\"],\n"
+        "\n"
+        "  // --- fleet (drop this whole block for local-only auto-restart) ---\n"
+        "  // Fleet server to push heartbeats / logs / thumbnails to.\n"
+        "  \"server\": \"https://ops.example.com\",\n"
+        "  // The agent token is NOT stored here (it would leak via git). Pair once with\n"
+        "  //   anchorbolt start --pair <6-digit-code>\n"
+        "  // and the id+token persist privately (0600) outside the repo. Or point at a\n"
+        "  // gitignored file that holds the token:\n"
+        "  // \"tokenFile\": \"anchorbolt.token\",\n"
+        "\n"
+        "  // Command channel over a reverse proxy / tunnel: only needed if the WS hub\n"
+        "  // isn't reachable at <server-host>:<port+1>. https servers default to the\n"
+        "  // wss://<host>/ws convention, so usually you can omit this.\n"
+        "  // \"wsUrl\": \"wss://ops.example.com/ws\",\n"
+        "\n"
+        "  // Let the dashboard drive input / restart / custom tools (default: read-only).\n"
+        "  \"allowControl\": false,\n"
+        "  // Let the dashboard run the remote git-pull + rebuild pipeline (default: off).\n"
+        "  \"allowUpdate\": false,\n"
+        "\n"
+        "  // Restart the app if it stops answering the health check for this long, in\n"
+        "  // seconds (0 = only restart when the process actually exits).\n"
+        "  \"watchdogTimeout\": 10,\n"
+        "\n"
+        "  // Webhook notifications. Keep secret URLs in urlFile/urlEnv, never inline.\n"
+        "  \"sinks\": [\n"
+        "    // { \"preset\": \"slack\", \"urlFile\": \"slack.url\" },\n"
+        "    // { \"preset\": \"ntfy\",  \"url\": \"https://ntfy.sh/my-venue-alerts\" }\n"
+        "  ]\n"
+        "}\n";
+}
+
 int cmdStart(const vector<string>& args) {
+    for (auto& a : args) {
+        if (a == "--generate-config") { printConfigTemplate(); return 0; }
+        if (a == "--") break;   // everything after -- is the app's own args
+    }
 #ifdef _WIN32
     // Raw port probes may run before any library socket use.
     WSADATA wsa;

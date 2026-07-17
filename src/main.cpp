@@ -10,13 +10,42 @@
 #include "Serve.h"
 #include "Token.h"
 
+#include <algorithm>
 #include <iostream>
 #include <string>
 #include <vector>
 
 using namespace std;
 
-static void printHelp() {
+// Short help by default; the full reference is behind --help --verbose so the
+// everyday flags aren't buried under watchdog/thumbnail/sink/update tuning.
+static void printHelp(bool verbose) {
+    if (!verbose) {
+        cout <<
+            "AnchorBolt - TrussC installation ops tool (command: anchorbolt)\n"
+            "\n"
+            "USAGE\n"
+            "  anchorbolt start [-p <path>] [options]   supervise an app on this machine (venue)\n"
+            "  anchorbolt serve [options]               fleet server: dashboard + ingest + control\n"
+            "  anchorbolt token agent|operator ...      mint/revoke tokens (server side)\n"
+            "\n"
+            "COMMON START OPTIONS\n"
+            "  -p <path>          app to supervise: project dir, .app bundle, or binary (default: cwd)\n"
+            "  --server <url>     fleet server to join. Needs a token: the first run prompts for a\n"
+            "                     6-digit pairing code (or pass --pair <code> / --token <tc-...>).\n"
+            "                     The id is server-assigned — there is no --id.\n"
+            "  --allow-control    allow remote input / restart / tool calls (default: read-only)\n"
+            "  --config <file>    JSON config, comments allowed (auto-loads ./anchorbolt.json)\n"
+            "  --generate-config  print a commented config template to stdout and exit\n"
+            "\n"
+            "COMMON SERVE OPTIONS\n"
+            "  --data <dir>       storage directory (default ./anchorbolt-data)\n"
+            "  --port <n>         HTTP port (default 54722)\n"
+            "\n"
+            "Run 'anchorbolt --help --verbose' for every option (watchdog, thumbnails,\n"
+            "remote update, command-channel routing over a tunnel, webhook sinks, ...).\n";
+        return;
+    }
     cout <<
         "AnchorBolt - TrussC installation ops tool (command: anchorbolt)\n"
         "\n"
@@ -30,8 +59,10 @@ static void printHelp() {
         "  anchorbolt token list                     mint/revoke tokens (server side)\n"
         "\n"
         "START OPTIONS  (flags > ANCHORBOLT_TOKEN env > config file > defaults)\n"
+        "  -p <path>          app to supervise: project dir, .app bundle, or binary (default: cwd)\n"
+        "  --generate-config  print a commented config template to stdout and exit\n"
         "  --config <file>    JSON config, comments allowed (auto-loads ./anchorbolt.json).\n"
-        "                     Keys: app, args, id, cwd, server, port, wsPort, allowControl,\n"
+        "                     Keys: app, args, cwd, server, port, wsPort, allowControl,\n"
         "                     allowUpdate, update, wsUrl, grace, watchdogTimeout,\n"
         "                     log{dir,keepDays}, thumb{interval,width,quality}, tokenFile,\n"
         "                     sinks (webhook notifications, see below). A 'token' key is\n"
@@ -93,12 +124,15 @@ int main(int argc, char* argv[]) {
     vector<string> args(argv + 1, argv + argc);
 
     if (args.empty()) {
-        printHelp();
+        printHelp(false);
         return 1;
     }
     const string& cmd = args[0];
-    if (cmd == "-h" || cmd == "--help" || cmd == "help") {
-        printHelp();
+    if (cmd == "-h" || cmd == "--help" || cmd == "help" || cmd == "--help-all") {
+        bool verbose = cmd == "--help-all" ||
+                       any_of(args.begin(), args.end(),
+                              [](const string& a) { return a == "--verbose" || a == "-v"; });
+        printHelp(verbose);
         return 0;
     }
     if (cmd == "-v" || cmd == "--version" || cmd == "version") {
@@ -116,6 +150,6 @@ int main(int argc, char* argv[]) {
     }
 
     cerr << "anchorbolt: unknown command '" << cmd << "'\n" << endl;
-    printHelp();
+    printHelp(false);
     return 1;
 }
