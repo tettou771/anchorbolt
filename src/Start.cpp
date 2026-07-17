@@ -42,6 +42,8 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
+#include <sys/file.h>
+#include <fcntl.h>
 #endif
 #if defined(__APPLE__)
 #include <mach/mach.h>
@@ -1280,15 +1282,75 @@ bool portFree(int port) {
 
 #endif
 
+// Port reservation across concurrent supervisors on ONE machine. A bind-probe
+// alone races: several `anchorbolt start` launched together each probe 47777,
+// all see it free (no app has bound yet), all inject the same MCP port, and
+// health polls then hit the wrong app (pid mismatch -> restart storm). An OS
+// advisory lock on a per-port lockfile serializes the choice: the first
+// supervisor to lock a port owns it for its whole lifetime (the lock releases
+// on process exit / fd close), so the next one deterministically moves on.
+struct PortLock {
+#ifdef _WIN32
+    HANDLE h = INVALID_HANDLE_VALUE;
+#else
+    int fd = -1;
+#endif
+};
+std::vector<PortLock> g_portLocks;  // held for the process lifetime
+
+bool reservePort(int port) {
+    fs::path lf = fs::temp_directory_path() /
+                  ("anchorbolt-port-" + std::to_string(port) + ".lock");
+#ifdef _WIN32
+    HANDLE h = CreateFileA(lf.string().c_str(), GENERIC_READ | GENERIC_WRITE,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return true;  // can't lock -> don't block use
+    OVERLAPPED ov{};
+    if (!LockFileEx(h, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                    0, 1, 0, &ov)) {
+        CloseHandle(h);
+        return false;  // another supervisor holds this port
+    }
+    g_portLocks.push_back({h});
+    return true;
+#else
+    int fd = ::open(lf.c_str(), O_RDWR | O_CREAT, 0644);
+    if (fd < 0) return true;  // can't lock -> don't block use
+    if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        ::close(fd);
+        return false;  // EWOULDBLOCK: another supervisor holds this port
+    }
+    g_portLocks.push_back({fd});
+    return true;
+#endif
+}
+
+void releaseLastPortLock() {
+    if (g_portLocks.empty()) return;
+#ifdef _WIN32
+    if (g_portLocks.back().h != INVALID_HANDLE_VALUE) CloseHandle(g_portLocks.back().h);
+#else
+    if (g_portLocks.back().fd >= 0) ::close(g_portLocks.back().fd);
+#endif
+    g_portLocks.pop_back();
+}
+
 // Default port taken (another anchorbolt on this machine) -> scan upward so
 // a second bare `anchorbolt start` just works. An EXPLICIT --port is a
-// contract: fail loudly instead of silently moving.
+// contract: fail loudly instead of silently moving. reservePort() serializes
+// concurrent supervisors; portFree() then rules out a non-anchorbolt process.
 int choosePort(const StartOptions& opt) {
     if (opt.portExplicit) {
-        return portFree(opt.port) ? opt.port : -1;
+        if (!reservePort(opt.port)) return -1;      // another supervisor owns it
+        if (portFree(opt.port)) return opt.port;
+        releaseLastPortLock();                      // a foreign process has it
+        return -1;
     }
     for (int p = opt.port; p < opt.port + 100; ++p) {
+        if (!reservePort(p)) continue;              // owned by another supervisor
         if (portFree(p)) return p;
+        releaseLastPortLock();                      // foreign process; give it back
     }
     return -1;
 }
