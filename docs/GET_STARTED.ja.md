@@ -5,8 +5,8 @@
 このガイドは、30秒のローカルお試しから実運用デプロイまでを、一歩ずつ進めていきます。すべてのコマンドはコピー＆ペーストで実行でき、必要が満たされたところで止めて構いません。
 
 - [1. ローカルで試す（30秒）](#1-ローカルで試す30秒)
-- [2. 別のマシンから監視する](#2-別のマシンから監視する)
-- [3. 公開する前に鍵をかける](#3-公開する前に鍵をかける)
+- [2. ダッシュボードを足す](#2-ダッシュボードを足す)
+- [3. 公開する前にダッシュボードに鍵をかける](#3-公開する前にダッシュボードに鍵をかける)
 - [4. 会場をグループ化し、クライアントの表示範囲を絞る](#4-会場をグループ化しクライアントの表示範囲を絞る)
 - [5. 通知を受け取る（Slack、ntfy など）](#5-通知を受け取るslackntfy-など)
 - [6. トンネル越しのリモートコントロール](#6-トンネル越しのリモートコントロール)
@@ -19,67 +19,63 @@
 
 ## 1. ローカルで試す（30秒）
 
-1台のマシンで2つのターミナルを使います。まずダッシュボード：
+アプリ——プロジェクトディレクトリ、`.app` バンドル、あるいは素のバイナリ——を AnchorBolt に指定すると、それを監視します：
 
 ```bash
-anchorbolt serve
-# → fleet server on http://localhost:54722
+anchorbolt start -p myApp
 ```
 
-続いて、アプリとそのダッシュボードを指定してスーパーバイザーを起動します：
+アプリを落としてみましょう（ウィンドウを閉じるか `kill -9` で）。数秒のうちに AnchorBolt が再起動します。これがコアループです：**設定ゼロで自動再起動**——サーバーもアカウントも不要で、アプリは一行も変わっていません。ログはプラットフォーム慣例のログディレクトリにローカル収集されます。
 
-```bash
-anchorbolt start -p myApp --server http://localhost:54722
-```
-
-**http://localhost:54722/** を開くと、あなたのアプリがライブサムネイル付きでウォールに現れます。アプリを落としてみましょう（ウィンドウを閉じるか `kill -9` で）。数秒のうちに AnchorBolt がアプリを再起動し、ウォールの稼働時間がリセットされます。これがコアループのすべてで、しかもあなたのアプリは一行も変わっていません。
-
-![会場が1つだけのウォール](images/wall-single.png)
-
-> **ローカルだけで使いたい？** 会場マシンでの自動再起動だけが目的なら、`--server` を外してください——ダッシュボードは不要です。ログはそれでもローカルに収集されます。
+以降はこの上にダッシュボード、リモートコントロール、通知を重ねていきます。必要なものだけ足してください。
 
 ---
 
-## 2. 別のマシンから監視する
+## 2. ダッシュボードを足す
 
-サーバー（自宅のマシンや VPS）で `anchorbolt serve` を動かし、各会場の `start` をそこへ向けます：
+到達できるマシン（同じマシン、自宅サーバー、VPS）で `anchorbolt serve` を動かします：
 
 ```bash
-# on the server
 anchorbolt serve --data ./anchorbolt-data
-
-# on each venue machine
-anchorbolt start -p myApp --server http://192.168.1.10:54722 --id osaka-entrance
+# → fleet server on http://localhost:54722
 ```
 
-`--id` はウォールに表示される名前です（省略するとバイナリ名になります）。各会場はハートビート、30秒ごとのサムネイル、そしてログを送信します。カードをクリックすると**詳細ビュー**が開きます：より大きなライブサムネイル、fps／メモリのグラフ、イベント履歴、そして検索可能なログパネル。
+fleet への参加にはトークンが要ります——open mode は無いので、URL を知っているだけでは誰も入れません。この会場用に1つ発行します（id はここ＝サーバー側で決まります。会場が自分で名乗ることはありません）：
+
+```bash
+anchorbolt token agent new osaka-entrance --data ./anchorbolt-data
+# → tc-... が一度だけ表示される
+```
+
+そして会場をサーバーに向けます。トークンは一度渡せば、次回以降は再利用されます：
+
+```bash
+anchorbolt start -p myApp --server http://192.168.1.10:54722 --token tc-...
+```
+
+id はトークンから決まります——`--id` はありません。ターミナルでなら `--token` すら省けます：初回はトークンか6桁のペアリングコード（ステップ7）を尋ね、それを記憶するので、次回は `--server` だけで済みます。
+
+**http://localhost:54722/** を開くと、会場がライブサムネイル付きでウォールに現れ、ハートビート、30秒ごとのサムネイル、ログを送信します。カードをクリックすると**詳細ビュー**が開きます：より大きなサムネイル、fps／メモリのグラフ、イベント履歴、検索可能なログパネル。
+
+![会場が1つだけのウォール](images/wall-single.png)
 
 ![詳細ビュー — グラフとログ](images/detail.png)
 
 ---
 
-## 3. 公開する前に鍵をかける
+## 3. 公開する前にダッシュボードに鍵をかける
 
-**ダッシュボードをインターネットに公開する前に、これを必ず行ってください。** オペレーターが1人も登録されていない状態では、ダッシュボードは開放されています——AI エンドポイントも同様で、つまり URL を知っている人なら誰でも会場を再起動できてしまいます。まず自分用の admin を作成しましょう：
+会場側はすでにロックされています：fleet にはトークンが要る（ステップ2）ので、トークン無しに偽のデータを POST したり接続したりはできません。もう一方の扉が**ダッシュボード**です——オペレーターが1人も登録されていないと開放状態で、AI エンドポイントも同様、つまり URL を知っている人なら誰でも全会場を閲覧・再起動できてしまいます。インターネットに公開する前に、まず自分用の admin を作成しましょう：
 
 ```bash
 # on the server
 anchorbolt token operator new toru --role admin --data ./anchorbolt-data
-# → prints op-... once. Paste it into the dashboard login.
+# → op-... が一度だけ表示される。ダッシュボードのログインに貼り付ける。
 ```
 
 これ以降、ダッシュボードはログインを求めます。その `op-...` トークン（または6桁のログインコード——ステップ7を参照）を貼り付ければログインできます。
 
 ![ログイン画面](images/login.png)
-
-必要に応じて、会場側にも認証を求めることができます。そうすれば、偽のデータを POST されることを防げます：
-
-```bash
-anchorbolt token agent new osaka-entrance --data ./anchorbolt-data
-# → prints tc-... once. Give it to the venue:
-anchorbolt start -p myApp --server https://ops.example.com \
-    --id osaka-entrance --token tc-...
-```
 
 ロールは3種類：**viewer**（読み取り専用）、**operator**（＋再起動／アップデート／コントロール）、そして **admin**（＋設定ページのすべて）。いずれも歯車アイコン →**Operators** タブから管理できます。
 
@@ -115,7 +111,6 @@ anchorbolt token operator new gallery-client --role viewer --scope tokyo
 // anchorbolt.json on the venue machine
 {
   "app": "./bin/myApp.app/Contents/MacOS/myApp",
-  "id": "osaka-entrance",
   "server": "https://ops.example.com",
   "sinks": [
     { "preset": "slack", "urlFile": "slack.url" },
@@ -156,18 +151,19 @@ ingress:
     service: http://localhost:54722
 ```
 
-**会場側** — WS パスの場所をエージェントに伝え、コントロールを有効化します：
+**会場側** — コントロールを有効化するだけ：
 
 ```bash
-anchorbolt start -p myApp --server https://ops.example.com \
-    --ws-url wss://ops.example.com/ws --allow-control
+anchorbolt start -p myApp --server https://ops.example.com --allow-control
 ```
+
+`https://` のサーバーは「前段に TLS 終端プロキシが居る」ことを意味するので、会場は規約に従いハブを `wss://<同じホスト>/ws` で探します——上の ingress と一致します。会場ごとの WS フラグは不要です。（変則的なパスのプロキシだけ `--ws-url wss://host/other` を明示。）
 
 これで詳細ビューに **Live** ボタンが現れます。クリックすると画面を見られ、**control** をオンにすればアプリを操作できます——クリック、ドラッグ、キー入力がそのままアプリへ届きます。
 
 ![リモートコントロール付きのライブビュー](images/live.png)
 
-リモートコントロールには、operator ロール（サーバー側）と `--allow-control`（会場側）の*両方*が必要で、さらにアプリが `mcp::registerDebuggerTools()` でオプトインしていなければなりません。監視だけなら HTTP のルートだけで足ります——`--ws-url` はインタラクティブな機能のためだけのものです。
+リモートコントロールには、operator ロール（サーバー側）と `--allow-control`（会場側）の*両方*が必要で、さらにアプリが `mcp::registerDebuggerTools()` でオプトインしていなければなりません。監視だけなら HTTP のルートだけで足ります。
 
 > リモートアップデートも同じ形です：`--allow-update` を追加すると、詳細ビューの **Update** ボタンが、アプリを動かしたまま会場マシン上で `git pull` ＋リビルドを実行し、成功したときだけ切り替えます。
 
@@ -181,27 +177,27 @@ anchorbolt start -p myApp --server https://ops.example.com \
 anchorbolt start -p myApp --server https://ops.example.com --pair 483201
 ```
 
-このコード（有効期限10分、使い切り）は会場の本物のトークンと引き換えられ、そのトークンはマシン上に非公開で保存されます——だから次回以降の実行では `--pair` も `--token` も要りません。同じ仕組みが**ログインコード**にもなります：オペレーター用に1つ発行すれば、長いトークンを貼り付ける代わりに、6桁を入力するだけでサインインできます。
+このコード（有効期限10分、使い切り）は会場の本物のトークンと引き換えられ、そのトークンはマシン上に非公開で保存されます——だから次回以降の実行では `--pair` も `--token` も要りません。ターミナルでなら `--pair` すら省けます：`--server` だけで起動すると AnchorBolt がコードを尋ねてきます。同じ仕組みが**ログインコード**にもなります：オペレーター用に1つ発行すれば、長いトークンを貼り付ける代わりに、6桁を入力するだけでサインインできます。
 
 ---
 
 ## 8. サービスとして常駐させる
 
-恒久的なインストールでは、すべてを設定ファイルにまとめ、OS に起動させます。`anchorbolt.json` の隣で `anchorbolt start` を実行すると、自動でそれを読み込みます：
+恒久的なインストールでは、すべてを設定ファイルにまとめ、OS に起動させます。`anchorbolt start --generate-config` でコメント付きのテンプレートを出力できます。`anchorbolt.json` の隣で `anchorbolt start` を実行すると、自動でそれを読み込みます：
 
 ```jsonc
 {
   "app": "./bin/myApp.app/Contents/MacOS/myApp",
   "args": ["--fullscreen"],
-  "id": "osaka-entrance",
   "server": "https://ops.example.com",
-  "wsUrl": "wss://ops.example.com/ws",
   "tokenFile": "osaka.token",
   "allowControl": true,
   "watchdogTimeout": 10,
   "sinks": [ { "preset": "slack", "urlFile": "slack.url" } ]
 }
 ```
+
+`id` キーはありません——id はトークンから決まります。`tokenFile` は `tc-...` トークンを収めた gitignore 済みファイルを指します。あるいは一度ペアリング（ステップ7）すれば省略できます。
 
 ログはデフォルトでプラットフォーム慣例の場所に出力されます（macOS では `~/Library/Logs/anchorbolt/<id>/`、Linux では `$XDG_STATE_HOME/anchorbolt/<id>/`、Windows では `%LOCALAPPDATA%\anchorbolt\<id>\`）——これは launchd/systemd 下で作業ディレクトリが `/` になっても問題ありません。`anchorbolt start` を launchd の plist か systemd のユニットで包めば完成です。AnchorBolt がアプリの面倒を見て、launchd/systemd が AnchorBolt の面倒を見ます。
 

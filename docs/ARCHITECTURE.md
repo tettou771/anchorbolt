@@ -169,11 +169,12 @@ it. That runs over a WebSocket:
   onto this and blocks on the matching reply (15s timeout).
 
 Behind a reverse proxy or tunnel that exposes a single hostname, the venue can't
-reach `host:port+1`. Set **`--ws-url wss://host/ws`** on the agent to point it
-at a path instead, and route that path to the hub in your proxy. The hub ignores
-the path in its handshake, so no server-side change is needed. Without a
-`--ws-url` (or a reachable port+1), monitoring still works fully — only the
-interactive features are unavailable.
+reach `host:port+1`. An `https://` server URL signals a TLS-terminating proxy in
+front, so the venue derives the hub as **`wss://<host>/ws`** by convention —
+route that path to the hub in your proxy (the hub ignores the path in its
+handshake, so no server-side change is needed). A non-standard proxy path needs
+an explicit **`--ws-url`**. Either way, monitoring works fully over the HTTP
+route alone — only the interactive features use the hub.
 
 ---
 
@@ -226,17 +227,24 @@ Control requires **both** the operator role (server side) and `--allow-control`
 ## Authentication
 
 Two token classes, both minted on the server, shown once, stored only as
-SHA-256 hashes. An empty registry = **open mode** for that class, so the
-zero-config path keeps working on a trusted LAN.
+SHA-256 hashes.
 
 **Agent tokens** (`tokens.json`, `{app-id: hash}`) — a venue's publish-only
-identity. With any registered, every ingest request and WebSocket hello must
-authenticate. A leaked agent token's blast radius is that one venue's fake data.
+identity. There is **no open mode**: every ingest request and WebSocket hello
+must authenticate, so a fleet is closed by default and knowing the URL alone
+grants nothing. The id is bound to the token at mint time; a venue derives its
+id from the token (`POST /api/whoami`, a hash reverse-lookup) rather than
+declaring one — so there is no `--id`, and a leaked agent token's blast radius
+is just that one venue's fake data, never impersonation of another id. A
+venue with no `--server` skips all of this (local-only supervision needs no
+token).
 
 **Operator tokens** (`operators.json`, `{name: {role, hash, created, scope}}`) —
 humans (and AIs) at the dashboard. Roles: **viewer** (read-only), **operator**
 (+ restart / update / control / alert-clear), **admin** (+ the settings page).
-With any operator registered, the dashboard requires login. The token rides an
+This class *does* have an open mode: with no operator registered the dashboard
+is open (the bootstrap path, so you can reach the settings page to mint the
+first admin). With any operator registered, the dashboard requires login. The token rides an
 **HttpOnly cookie** (so `<img>` thumbnails authenticate too, which an
 `Authorization` header can't do), re-verified against the hash on every request —
 so revoking an operator locks them out on their next poll, no session table to
