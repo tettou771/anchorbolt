@@ -1227,25 +1227,12 @@ bool redeemPairCode(const string& serverUrl, const string& code,
 
 bool stdinIsTty() {
 #ifdef _WIN32
-    HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
-    if (h == INVALID_HANDLE_VALUE || h == nullptr) return false;
-    DWORD type = GetFileType(h);
-    if (type == FILE_TYPE_CHAR) return true;  // real Win32 console (cmd/PowerShell)
-    // MSYS2 / Cygwin / git-bash (mintty) emulate a pty over a NAMED PIPE, which
-    // GetFileType reports as a pipe and _isatty() calls non-interactive. Detect it
-    // by the pipe name: \msys-<hex>-ptyN-... or \cygwin-<hex>-ptyN-...
-    if (type == FILE_TYPE_PIPE) {
-        alignas(FILE_NAME_INFO) char buf[sizeof(FILE_NAME_INFO) + 1024 * sizeof(wchar_t)] = {0};
-        auto* fni = reinterpret_cast<FILE_NAME_INFO*>(buf);
-        if (GetFileInformationByHandleEx(h, FileNameInfo, fni, sizeof(buf))) {
-            std::wstring name(fni->FileName, fni->FileNameLength / sizeof(wchar_t));
-            bool pty = name.find(L"-pty") != std::wstring::npos;
-            if (pty && (name.find(L"msys-") != std::wstring::npos ||
-                        name.find(L"cygwin-") != std::wstring::npos))
-                return true;
-        }
-    }
-    return false;
+    // Only a real Win32 console (cmd.exe / PowerShell) counts as interactive.
+    // git-bash/mintty pipes stdin to native programs over an MSYS pty, where a
+    // blocking getline can't consume typed lines (the classic "needs winpty"
+    // case) — treating it as a TTY only produces a hang, so we deliberately
+    // report non-interactive there and the caller prints the --pair hint.
+    return _isatty(_fileno(stdin)) != 0;
 #else
     return isatty(STDIN_FILENO) != 0;
 #endif
