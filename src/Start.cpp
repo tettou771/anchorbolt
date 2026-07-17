@@ -85,8 +85,10 @@ struct StartOptions {
     string wsUrl;                // explicit ws(s):// override (bypasses host:port+1
                                  // derivation — needed behind a reverse proxy /
                                  // Cloudflare tunnel that routes a PATH to the hub)
-    bool   allowControl = false; // let the server relay MUTATING tools
-    bool   allowUpdate = false;  // let the server trigger the update pipeline
+    bool   denyUpdate = false;   // opt out of remote update/rollback on this venue
+                                 // (default: allowed for operators). Control needs
+                                 // no flag — a tool exists only if the app
+                                 // registered it (registerDebuggerTools).
     bool   updateCustom = false; // config overrode the pipeline (no smart skip)
     vector<SinkConfig> sinks;    // outbound notifications (config "sinks" array)
     vector<string> updateCmds = {// remote-update pipeline, run in projectDir;
@@ -848,11 +850,11 @@ private:
             reply["ok"] = true;
             reply["result"] = {{"message", "restart initiated"}};
         } else if (action == "update") {
-            // Remote code execution by definition — the venue operator's
-            // explicit --allow-update is the gate, like --allow-control.
-            if (!opt_.allowUpdate) {
+            // Allowed by default (server-side operator role is the gate); a venue
+            // that must never be remotely updated opts out with --deny-update.
+            if (opt_.denyUpdate) {
                 reply["ok"] = false;
-                reply["error"] = "blocked by supervisor: start with --allow-update to permit remote updates";
+                reply["error"] = "blocked by supervisor: this venue was started with --deny-update";
             } else if (g_updateRunning) {
                 reply["ok"] = false;
                 reply["error"] = "an update is already running";
@@ -865,9 +867,9 @@ private:
         } else if (action == "rollback") {
             fs::path prev = opt_.runPath + ".prev";
             error_code ec;
-            if (!opt_.allowUpdate) {
+            if (opt_.denyUpdate) {
                 reply["ok"] = false;
-                reply["error"] = "blocked by supervisor: start with --allow-update to permit rollback";
+                reply["error"] = "blocked by supervisor: this venue was started with --deny-update";
             } else if (g_updateRunning) {
                 reply["ok"] = false;
                 reply["error"] = "an update is running; wait for it to finish";
@@ -911,15 +913,12 @@ private:
                 }
             } else {
                 string tool = m.value("tool", "");
-                // Read-only tools relay freely; anything that can mutate the
-                // app (input injection, node writes, custom tools, tc_quit)
-                // requires the venue operator's explicit --allow-control.
-                bool readOnly = tool.rfind("tc_get_", 0) == 0;
-                if (!readOnly && !opt_.allowControl) {
-                    reply["ok"] = false;
-                    reply["error"] = "blocked by supervisor: '" + tool +
-                                     "' is not read-only (start with --allow-control to permit)";
-                } else if (auto r = callTool(cli, tool, m.value("args", Json::object()))) {
+                // No supervisor gate on the tool surface: a mutating tool exists
+                // only if the app registered it (input injection comes from
+                // registerDebuggerTools), so the app's own MCP surface IS the
+                // control opt-in. The server side already restricts this to the
+                // operator role.
+                if (auto r = callTool(cli, tool, m.value("args", Json::object()))) {
                     reply["ok"] = true;
                     reply["result"] = *r;
                 } else {
@@ -929,7 +928,7 @@ private:
             }
         } else if (action == "live_start") {
             // Keepalive + params for the live screenshot stream. Read-only
-            // (screenshots only), so it never needs --allow-control.
+            // (screenshots only) — watching never involves the app's tools.
             liveFps_     = std::clamp(m.value("fps", 10), 1, 15);
             liveWidth_   = std::clamp(m.value("width", 960), 320, 1920);
             liveQuality_ = std::clamp(m.value("quality", 60), 20, 90);
@@ -995,8 +994,7 @@ bool parseArgs(const vector<string>& args, StartOptions& opt) {
         else if (a == "--pair")     { auto v = next("--pair");     if (!v) return false; opt.pairCode = *v; }
         else if (a == "--ws-port")  { auto v = next("--ws-port");  if (!v) return false; opt.wsPort = stoi(*v); }
         else if (a == "--ws-url")   { auto v = next("--ws-url");   if (!v) return false; opt.wsUrl = *v; }
-        else if (a == "--allow-control") { opt.allowControl = true; }
-        else if (a == "--allow-update")  { opt.allowUpdate = true; }
+        else if (a == "--deny-update")   { opt.denyUpdate = true; }
         else if (a == "--thumb-interval") { auto v = next("--thumb-interval"); if (!v) return false; opt.thumbIntervalSec = stoi(*v); }
         else if (a == "--thumb-width")    { auto v = next("--thumb-width");    if (!v) return false; opt.thumbWidth = stoi(*v); }
         else if (a == "--thumb-quality")  { auto v = next("--thumb-quality");  if (!v) return false; opt.thumbQuality = stoi(*v); }
@@ -1104,8 +1102,7 @@ bool loadConfig(const fs::path& path, StartOptions& opt) {
     if (c.contains("port")) { opt.port = c["port"].get<int>(); opt.portExplicit = true; }
     opt.wsPort    = c.value("wsPort", opt.wsPort);
     opt.wsUrl     = c.value("wsUrl", opt.wsUrl);
-    opt.allowControl = c.value("allowControl", opt.allowControl);
-    opt.allowUpdate  = c.value("allowUpdate", opt.allowUpdate);
+    opt.denyUpdate   = c.value("denyUpdate", opt.denyUpdate);
     if (c.contains("update") && c["update"].is_array()) {
         opt.updateCmds.clear();
         for (auto& u : c["update"]) opt.updateCmds.push_back(u.get<string>());
@@ -1640,10 +1637,11 @@ static void printConfigTemplate() {
         "  // wss://<host>/ws convention, so usually you can omit this.\n"
         "  // \"wsUrl\": \"wss://ops.example.com/ws\",\n"
         "\n"
-        "  // Let the dashboard drive input / restart / custom tools (default: read-only).\n"
-        "  \"allowControl\": false,\n"
-        "  // Let the dashboard run the remote git-pull + rebuild pipeline (default: off).\n"
-        "  \"allowUpdate\": false,\n"
+        "  // Remote control (input injection) needs no flag: it works only if the app\n"
+        "  // registered debugger tools (mcp::registerDebuggerTools). Remote update\n"
+        "  // (git pull + rebuild) is allowed by default for operators; set denyUpdate\n"
+        "  // true to refuse it on this venue.\n"
+        "  // \"denyUpdate\": false,\n"
         "\n"
         "  // Restart the app if it stops answering the health check for this long, in\n"
         "  // seconds (0 = only restart when the process actually exits).\n"
@@ -1823,8 +1821,7 @@ int cmdStart(const vector<string>& args) {
         channel.emplace(opt, logDir);
         logNotice("anchorbolt") << "pushing to fleet server " << opt.serverUrl
                                 << " as '" << opt.appId << "'"
-                                << (opt.allowControl ? " (REMOTE CONTROL ENABLED)" : "")
-                                << (opt.allowUpdate ? " (REMOTE UPDATE ENABLED)" : "");
+                                << (opt.denyUpdate ? " (remote update DENIED)" : "");
     }
     // Log forwarding: app log + supervisor events. Pushed every poll cycle
     // INDEPENDENT of app health — while the app hangs, the supervisor's
@@ -1937,6 +1934,7 @@ int cmdStart(const vector<string>& args) {
         bool statusChecked = false;   // tools/list probed for optional conventions
         bool hasStatus = false;
         bool hasAlerts = false;
+        bool hasControlTools = false; // app exposes input injection (=> control ok)
         // Why this run ended. The "restart" event fires at the actual respawn
         // (not at detection): when an OS shutdown kills the app before us,
         // g_stop arrives during the pre-respawn pause and no phantom incident
@@ -2041,6 +2039,8 @@ int cmdStart(const vector<string>& args) {
                             string n = t.value("name", "");
                             if (n == "tc_get_status") hasStatus = true;
                             if (n == "tc_get_alerts") hasAlerts = true;
+                            // Input-injection tools => the app opted into control.
+                            if (n == "tc_mouse_move" || n == "tc_key_press") hasControlTools = true;
                         }
                     }
                 }
@@ -2059,6 +2059,9 @@ int cmdStart(const vector<string>& args) {
                     MachineMem mm = machineMem();
                     hb["machine"] = {{"memTotalBytes", mm.totalBytes},
                                      {"memAvailBytes", mm.availBytes}};
+                    // Capabilities the dashboard uses to show only live controls:
+                    // control iff the app exposes input tools, update iff not denied.
+                    hb["caps"] = {{"control", hasControlTools}, {"update", !opt.denyUpdate}};
                     if (!appGit.empty()) hb["git"] = appGit;
                     if (hasStatus) {
                         if (auto s = callTool(cli, "tc_get_status")) {

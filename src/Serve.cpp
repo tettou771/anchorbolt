@@ -434,7 +434,7 @@ Json fleetToolsList() {
         "List the app's OWN MCP tools via the live agent passthrough (tc_* standard tools plus any custom ones the app registered).",
         Json{{"app", appArg["app"]}}, Json::array({"app"})));
     tools.push_back(tool("app_call",
-        "Call one of the app's own MCP tools through the agent passthrough. Read-only tc_get_* tools relay freely; anything mutating needs the operator role here AND --allow-control on the venue side. Image results come back as images.",
+        "Call one of the app's own MCP tools through the agent passthrough. Read-only tc_get_* tools relay freely; mutating tools need the operator role and only exist if the app registered them (e.g. registerDebuggerTools for input injection). Image results come back as images.",
         Json{{"app", appArg["app"]},
              {"tool", {{"type", "string"}, {"description", "Tool name from app_list_tools"}}},
              {"args", {{"type", "object"}, {"description", "Tool arguments (optional)"}}}},
@@ -612,8 +612,8 @@ Json fleetToolCall(const fs::path& dataDir, const string& name, const Json& args
     if (name == "app_call") {
         string toolName = args.value("tool", "");
         if (toolName.empty()) return mcpError("'tool' is required (see app_list_tools)");
-        // Read-only passthrough for viewers; anything else needs operator here
-        // (the venue's --allow-control gate still applies on the agent side).
+        // Read-only passthrough for viewers; anything else needs operator here.
+        // On the venue, a mutating tool exists only if the app registered it.
         if (toolName.rfind("tc_get_", 0) != 0 && rank < 2) {
             return mcpError("'" + toolName + "' is not read-only; it needs the operator role");
         }
@@ -1285,9 +1285,14 @@ async function renderDetail() {
   document.getElementById('dDot').classList.toggle('bad', stale);
   document.getElementById('dTitle').textContent = app.id;
   // The action buttons ride the command channel, so they only make sense when
-  // the agent's WS is connected. Hide the whole row when it's offline rather
-  // than showing dead controls (the title dot already reports health).
-  document.getElementById('dBtns').hidden = !app.live;
+  // the agent's WS is connected and the operator can act. Update/Rollback show
+  // only if the venue allows update (it advertises this); Restart is always
+  // there for an operator. Viewers get no action row.
+  const caps = (app.health && app.health.caps) || {};
+  const canOperate = myRole !== 'viewer';   // null (open mode) / operator / admin
+  document.getElementById('dBtns').hidden = !app.live || !canOperate;
+  document.getElementById('dUpdate').hidden = !caps.update;
+  document.getElementById('dRollback').hidden = !caps.update;
   const h = app.health || {};
   const extra = [];
   if (h.git) extra.push('@' + h.git);
@@ -1484,8 +1489,12 @@ function startLiveView() {
   document.getElementById('dLiveBtn').classList.add('on');
   document.getElementById('dLiveWrap').hidden = false;
   document.getElementById('dLiveStatus').textContent = 'waiting for stream...';
-  // Control is operator/admin only; myRole===null means open mode (allowed).
-  document.getElementById('dCtlToggle').hidden = (myRole === 'viewer');
+  // Control needs the operator role AND an app that exposes input tools (the
+  // venue advertises caps.control). myRole===null is open mode (allowed).
+  const ctlApp = lastApps.find(a => a.id === detailId);
+  const canControl = myRole !== 'viewer' &&
+                     !!(ctlApp && (ctlApp.health || {}).caps && ctlApp.health.caps.control);
+  document.getElementById('dCtlToggle').hidden = !canControl;
   document.getElementById('dCtl').checked = false;
   document.getElementById('dLiveStage').classList.remove('ctl');
   pollLiveFrame();
