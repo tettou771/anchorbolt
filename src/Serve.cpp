@@ -1220,16 +1220,30 @@ let dThumbSeq = -1;
 
 // ---- screenshot scrubber ----
 let thumbLive = true;    // false while a past frame is pinned by the slider
-let thumbTimes = [];     // YYYYMMDD-HHMMSS of stored frames for the current day
+let thumbTimes = [];     // YYYYMMDD-HHMMSS of stored frames for the shown day
+let scrubDate = '';      // '' = today (slider's max = live); else a past day (all static)
 let scrubPlay = null;
 
-async function loadThumbTimes(id) {
+// date '' = today (newest = live); a YYYY-MM-DD past day is all historical.
+async function loadThumbTimes(id, date = '') {
+  scrubDate = date;
   thumbTimes = [];
-  try { thumbTimes = (await (await fetch('/api/thumbtimes/' + encodeURIComponent(id))).json()).times || []; } catch {}
+  const q = date ? '?date=' + encodeURIComponent(date) : '';
+  try { thumbTimes = (await (await fetch('/api/thumbtimes/' + encodeURIComponent(id) + q)).json()).times || []; } catch {}
   const sc = document.getElementById('dScrub');
   sc.max = Math.max(0, thumbTimes.length - 1);
-  sc.value = sc.max;                                  // start at the newest = live
-  document.getElementById('dScrubWrap').hidden = thumbTimes.length < 2;
+  sc.value = sc.max;
+  document.getElementById('dScrubWrap').hidden = thumbTimes.length < 1;
+  if (date) {                              // a past day has no live end — pin its last frame
+    thumbLive = false;
+    if (thumbTimes.length) {
+      const img = document.querySelector('#dThumbWrap img');
+      img.src = '/api/thumb/' + encodeURIComponent(id) + '?ts=' + thumbTimes[thumbTimes.length - 1];
+      img.hidden = false;
+    }
+  } else {
+    thumbLive = true;
+  }
   updateScrubLabel();
 }
 
@@ -1238,7 +1252,8 @@ function updateScrubLabel() {
   const atEnd = +sc.value >= +sc.max;
   const ts = thumbTimes[+sc.value];
   document.getElementById('dScrubTime').textContent =
-    atEnd || !ts ? 'live' : ts.slice(9, 11) + ':' + ts.slice(11, 13);
+    (!scrubDate && (atEnd || !ts)) ? 'live'
+      : (ts ? ts.slice(9, 11) + ':' + ts.slice(11, 13) : '—');
 }
 
 function stopScrubPlay() {
@@ -1251,10 +1266,10 @@ document.getElementById('dScrub').addEventListener('input', () => {
   const sc = document.getElementById('dScrub');
   const idx = +sc.value;
   const img = document.querySelector('#dThumbWrap img');
-  if (idx >= +sc.max) {                               // back to live
+  if (!scrubDate && idx >= +sc.max) {                 // today's newest = live
     thumbLive = true;
     dThumbSeq = -1;                                    // force a live refresh next poll
-  } else {
+  } else if (thumbTimes[idx]) {
     thumbLive = false;
     img.src = '/api/thumb/' + encodeURIComponent(detailId) + '?ts=' + thumbTimes[idx];
     img.hidden = false;
@@ -1951,6 +1966,10 @@ document.getElementById('dLogDate').addEventListener('change', async e => {
   const date = e.target.value;
   const box = document.getElementById('dLog');
   box.replaceChildren();
+  // The date drives the screenshot scrubber too: pick a past day and both the
+  // log and the day's screenshots follow it; 'live' returns to today.
+  stopScrubPlay();
+  loadThumbTimes(detailId, date);
   if (!date) {                    // back to live
     logLiveMode = true;
     logCursor = 0;
