@@ -991,7 +991,7 @@ R"HTML(
       <div id="dEvWrap" hidden>
         <div id="dEvHead">
           <span class="glabel">events</span>
-          <button id="dAckBtn" title="acknowledge — clears the wall badge">Clear</button>
+          <button id="dAckBtn" title="clear the event list and the wall badge (the on-disk log is kept)">Clear</button>
         </div>
         <div id="dEvents"></div>
       </div>
@@ -1086,6 +1086,7 @@ function fmtUptime(s) {
 }
 
 function statsLine(app) {
+  if (!app.reported) return 'waiting for first report';
   const h = app.health || {};
   const parts = [];
   if (h.fps !== undefined) parts.push(h.fps.toFixed(0) + ' fps');
@@ -1097,6 +1098,7 @@ function statsLine(app) {
 
 // Wall cards show only uptime + freshness; fps/size live in the detail view.
 function wallStats(app) {
+  if (!app.reported) return 'waiting for first report';
   const h = app.health || {};
   const parts = [];
   if (h.uptimeSec !== undefined) parts.push('up ' + fmtUptime(h.uptimeSec));
@@ -1648,6 +1650,9 @@ document.getElementById('dAckBtn').addEventListener('click', async () => {
   try {
     await fetch('/api/alert/' + encodeURIComponent(detailId) + '/clear', { method: 'POST' });
   } catch {}
+  // Empty the visible list too — the server dropped it, so it won't stream back.
+  document.getElementById('dEvents').replaceChildren();
+  document.getElementById('dEvWrap').hidden = true;
 });
 
 // ---- log panel ----
@@ -1777,7 +1782,7 @@ async function refresh() {
   for (const el of [...grid.children]) {
     if (!alive.has(el.id)) el.remove();
   }
-  const ok = apps.filter(a => a.ageSec <= STALE_SEC).length;
+  const ok = apps.filter(a => a.reported && a.ageSec <= STALE_SEC).length;
   document.getElementById('summary').textContent =
     apps.length === 0 ? '' : `${ok}/${apps.length} healthy`;
 
@@ -2686,15 +2691,19 @@ int cmdServe(const vector<string>& args) {
         res.set_content(Json({{"next", next}, {"alerts", lines}}).dump(), "application/json");
     });
 
-    // Operator pressed Clear: acknowledged — the wall badge goes quiet. The
-    // list itself (and the JSONL on disk) stays.
+    // Operator pressed Clear: acknowledged — the wall badge goes quiet and the
+    // in-memory event list is dismissed (so it stays empty on reopen too). The
+    // durable JSONL on disk is untouched — that's the audit trail.
     svr.Post(R"(/api/alert/([^/]+)/clear)", [requireRole, appVisible](const httplib::Request& req, httplib::Response& res) {
         if (!requireRole(req, res, 2)) return;
         string id = req.matches[1];
         if (!appVisible(req, id)) { res.status = 404; return; }
         lock_guard<mutex> lock(g_appsMutex);
         auto it = g_apps.find(id);
-        if (it != g_apps.end()) it->second.unackedAlerts = 0;
+        if (it != g_apps.end()) {
+            it->second.unackedAlerts = 0;
+            it->second.alerts.clear();
+        }
         res.set_content("ok", "text/plain");
     });
 
@@ -2737,11 +2746,16 @@ int cmdServe(const vector<string>& args) {
             string group = (groups.contains(id) && groups[id].is_string())
                                ? groups[id].get<string>() : "";
             if (op && !token::inScope(*op, id, group)) continue;
-            double age = chrono::duration<double>(now - st.lastSeen).count();
+            // A provisioned venue (agent token / WS connect) can be in the map
+            // before its first heartbeat; lastSeen is still zero then, so report
+            // it as unreported rather than "last seen <uptime> ago".
+            bool reported = st.lastSeen != chrono::steady_clock::time_point{};
+            double age = reported ? chrono::duration<double>(now - st.lastSeen).count() : 0.0;
             Json images = Json::object();
             for (auto& [name, slot] : st.images) images[name] = slot.seq;
             list.push_back({{"id", id},
                             {"group", group},
+                            {"reported", reported},
                             {"ageSec", age},
                             {"thumbSeq", st.thumbSeq},
                             {"images", images},
