@@ -837,6 +837,14 @@ const char* kDashboardHtml = R"HTML(<!DOCTYPE html>
                 position: relative; overflow: hidden; max-height: 380px; }
   #dThumbWrap img { position: absolute; inset: 0; width: 100%; height: 100%;
                     object-fit: contain; }
+  #dScrubWrap { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+  #dScrubWrap[hidden] { display: none; }
+  #dScrub { flex: 1; accent-color: #58a6ff; cursor: pointer; }
+  #dScrubPlay { background: #191c22; color: #9aa3b2; border: 1px solid #2a2e36;
+                border-radius: 5px; font-size: 11px; padding: 2px 9px; cursor: pointer; flex: none; }
+  #dScrubPlay:hover { color: #d4d7dd; }
+  #dScrubTime { font: 11px ui-monospace, Menlo, monospace; color: #7d838e;
+                flex: none; min-width: 34px; text-align: right; }
   #dValues { display: flex; flex-wrap: wrap; gap: 8px; }
   #dValues:empty { display: none; }
   .chip { background: #242832; border: 1px solid #323844; border-radius: 6px;
@@ -1084,6 +1092,11 @@ R"HTML(
         <div id="dLiveStage"><img id="dLiveImg" alt="" draggable="false" tabindex="0"></div>
       </div>
       <div id="dThumbWrap"><img hidden></div>
+      <div id="dScrubWrap" hidden>
+        <button id="dScrubPlay" title="play a timelapse of the day">&#9654;</button>
+        <input id="dScrub" type="range" min="0" max="0" value="0">
+        <span id="dScrubTime">live</span>
+      </div>
       <div id="dValues"></div>
       <div id="dEvWrap" hidden>
         <div id="dEvHead">
@@ -1183,6 +1196,63 @@ let lastApps = [];
 let detailId = null;
 let dThumbSeq = -1;
 
+// ---- screenshot scrubber ----
+let thumbLive = true;    // false while a past frame is pinned by the slider
+let thumbTimes = [];     // YYYYMMDD-HHMMSS of stored frames for the current day
+let scrubPlay = null;
+
+async function loadThumbTimes(id) {
+  thumbTimes = [];
+  try { thumbTimes = (await (await fetch('/api/thumbtimes/' + encodeURIComponent(id))).json()).times || []; } catch {}
+  const sc = document.getElementById('dScrub');
+  sc.max = Math.max(0, thumbTimes.length - 1);
+  sc.value = sc.max;                                  // start at the newest = live
+  document.getElementById('dScrubWrap').hidden = thumbTimes.length < 2;
+  updateScrubLabel();
+}
+
+function updateScrubLabel() {
+  const sc = document.getElementById('dScrub');
+  const atEnd = +sc.value >= +sc.max;
+  const ts = thumbTimes[+sc.value];
+  document.getElementById('dScrubTime').textContent =
+    atEnd || !ts ? 'live' : ts.slice(9, 11) + ':' + ts.slice(11, 13);
+}
+
+function stopScrubPlay() {
+  if (scrubPlay) { clearInterval(scrubPlay); scrubPlay = null; }
+  const b = document.getElementById('dScrubPlay');
+  if (b) b.innerHTML = '&#9654;';
+}
+
+document.getElementById('dScrub').addEventListener('input', () => {
+  const sc = document.getElementById('dScrub');
+  const idx = +sc.value;
+  const img = document.querySelector('#dThumbWrap img');
+  if (idx >= +sc.max) {                               // back to live
+    thumbLive = true;
+    dThumbSeq = -1;                                    // force a live refresh next poll
+  } else {
+    thumbLive = false;
+    img.src = '/api/thumb/' + encodeURIComponent(detailId) + '?ts=' + thumbTimes[idx];
+    img.hidden = false;
+  }
+  updateScrubLabel();
+});
+
+document.getElementById('dScrubPlay').addEventListener('click', () => {
+  if (scrubPlay) { stopScrubPlay(); return; }
+  if (thumbTimes.length < 2) return;
+  document.getElementById('dScrubPlay').innerHTML = '&#10073;&#10073;';   // pause glyph
+  scrubPlay = setInterval(() => {
+    const sc = document.getElementById('dScrub');
+    let v = +sc.value + 1;
+    if (v > +sc.max) v = 0;                            // loop the day
+    sc.value = v;
+    sc.dispatchEvent(new Event('input'));
+  }, 200);                                             // ~5 fps timelapse
+});
+
 function fmtUptime(s) {
   s = Math.floor(s);
   const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60);
@@ -1235,6 +1305,10 @@ function openDetail(id) {
   logLiveMode = true;
   document.getElementById('dLogDate').value = '';
   loadLogDays(id);
+  thumbLive = true;
+  stopScrubPlay();
+  document.getElementById('dScrubWrap').hidden = true;
+  loadThumbTimes(id);
   document.getElementById('dLogErr').classList.remove('on');
   document.getElementById('dEvWrap').hidden = true;
   document.getElementById('dEvents').replaceChildren();
@@ -1250,6 +1324,7 @@ function openDetail(id) {
 
 function closeDetail() {
   stopLiveView();
+  stopScrubPlay();
   detailId = null;
   document.getElementById('detail').hidden = true;
 }
@@ -1409,8 +1484,8 @@ async function renderDetail() {
   document.getElementById('dStats').textContent =
     [statsLine(app), ...extra].filter(Boolean).join(' · ');
 
-  // Live thumbnail (same seq mechanism as the wall)
-  if (app.thumbSeq > 0 && dThumbSeq !== app.thumbSeq) {
+  // Live thumbnail (same seq mechanism as the wall) — paused while scrubbing.
+  if (thumbLive && app.thumbSeq > 0 && dThumbSeq !== app.thumbSeq) {
     dThumbSeq = app.thumbSeq;
     const img = document.querySelector('#dThumbWrap img');
     img.src = '/api/thumb/' + encodeURIComponent(app.id) + '?s=' + app.thumbSeq;
@@ -3028,10 +3103,46 @@ int cmdServe(const vector<string>& args) {
         res.set_content(list.dump(), "application/json");
     });
 
-    svr.Get(R"(/api/thumb/([^/]+))", [requireRole, appVisible](const httplib::Request& req, httplib::Response& res) {
+    // Timestamps (YYYYMMDD-HHMMSS) of the stored thumbnails for a day, ascending
+    // — feeds the detail view's screenshot scrubber. Default date = today.
+    svr.Get(R"(/api/thumbtimes/([^/]+))", [requireRole, appVisible, dataDir](const httplib::Request& req, httplib::Response& res) {
         if (!requireRole(req, res, 1)) return;
         string id = req.matches[1];
         if (!appVisible(req, id)) { res.status = 404; return; }
+        string date = req.has_param("date") ? req.get_param_value("date")
+                                            : fmtTimePoint(chrono::system_clock::now(), "%Y-%m-%d");
+        string ymd;                                    // YYYYMMDD
+        for (char c : date) if (c != '-') ymd += c;
+        error_code ec;
+        vector<string> times;
+        for (auto& e : fs::directory_iterator(dataDir / id / "thumbs", ec)) {
+            string n = e.path().filename().string();   // YYYYMMDD-HHMMSS.jpg
+            if (n.size() == 19 && n.compare(n.size() - 4, 4, ".jpg") == 0 &&
+                n.compare(0, 8, ymd) == 0)
+                times.push_back(n.substr(0, 15));
+        }
+        sort(times.begin(), times.end());
+        res.set_content(Json({{"times", times}}).dump(), "application/json");
+    });
+
+    svr.Get(R"(/api/thumb/([^/]+))", [requireRole, appVisible, dataDir](const httplib::Request& req, httplib::Response& res) {
+        if (!requireRole(req, res, 1)) return;
+        string id = req.matches[1];
+        if (!appVisible(req, id)) { res.status = 404; return; }
+        // ?ts=YYYYMMDD-HHMMSS serves a stored historical frame straight from disk
+        // (validated to that exact shape so it can't escape the thumbs dir).
+        if (req.has_param("ts")) {
+            string ts = req.get_param_value("ts");
+            bool ok = ts.size() == 15 && ts[8] == '-';
+            for (size_t i = 0; i < ts.size(); ++i)
+                if (i != 8 && !isdigit((unsigned char)ts[i])) ok = false;
+            if (!ok) { res.status = 400; res.set_content("bad ts", "text/plain"); return; }
+            ifstream in(dataDir / id / "thumbs" / (ts + ".jpg"), ios::binary);
+            if (!in) { res.status = 404; res.set_content("no such frame", "text/plain"); return; }
+            string data((istreambuf_iterator<char>(in)), istreambuf_iterator<char>());
+            res.set_content(data, "image/jpeg");
+            return;
+        }
         lock_guard<mutex> lock(g_appsMutex);
         auto it = g_apps.find(id);
         if (it == g_apps.end() || it->second.thumb.empty()) {
