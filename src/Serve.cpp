@@ -423,6 +423,59 @@ vector<fs::path> dailyFiles(const fs::path& dataDir, const string& app, const st
     return out;
 }
 
+// Minimal in-memory ZIP writer (STORE / no compression). The payload is logs +
+// already-compressed JPEGs, so deflate would buy almost nothing and a real zip
+// library would be a heavy dependency — a stored archive opens on every OS.
+struct ZipWriter {
+    string buf;
+    struct Ent { string name; uint32_t crc, size, offset; };
+    vector<Ent> ents;
+    static uint32_t crc32(const string& s) {
+        static uint32_t T[256];
+        static bool init = false;
+        if (!init) {
+            for (uint32_t i = 0; i < 256; i++) {
+                uint32_t c = i;
+                for (int k = 0; k < 8; k++) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+                T[i] = c;
+            }
+            init = true;
+        }
+        uint32_t c = 0xFFFFFFFFu;
+        for (unsigned char ch : s) c = T[(c ^ ch) & 0xFF] ^ (c >> 8);
+        return c ^ 0xFFFFFFFFu;
+    }
+    static void put16(string& b, uint16_t v) { b += char(v & 0xFF); b += char((v >> 8) & 0xFF); }
+    static void put32(string& b, uint32_t v) {
+        b += char(v & 0xFF); b += char((v >> 8) & 0xFF);
+        b += char((v >> 16) & 0xFF); b += char((v >> 24) & 0xFF);
+    }
+    void add(const string& name, const string& data) {
+        Ent e{name, crc32(data), (uint32_t)data.size(), (uint32_t)buf.size()};
+        put32(buf, 0x04034b50); put16(buf, 20); put16(buf, 0); put16(buf, 0);  // ver, flags, store
+        put16(buf, 0); put16(buf, 0x21);                                       // dummy time/date (1980-01-01)
+        put32(buf, e.crc); put32(buf, e.size); put32(buf, e.size);
+        put16(buf, (uint16_t)name.size()); put16(buf, 0);
+        buf += name; buf += data;
+        ents.push_back(std::move(e));
+    }
+    string finish() {
+        uint32_t cdStart = (uint32_t)buf.size();
+        for (auto& e : ents) {
+            put32(buf, 0x02014b50); put16(buf, 20); put16(buf, 20); put16(buf, 0); put16(buf, 0);
+            put16(buf, 0); put16(buf, 0x21); put32(buf, e.crc); put32(buf, e.size); put32(buf, e.size);
+            put16(buf, (uint16_t)e.name.size()); put16(buf, 0); put16(buf, 0);  // name, extra, comment len
+            put16(buf, 0); put16(buf, 0); put32(buf, 0);                        // disk, internal, external attrs
+            put32(buf, e.offset); buf += e.name;
+        }
+        uint32_t cdSize = (uint32_t)buf.size() - cdStart;
+        put32(buf, 0x06054b50); put16(buf, 0); put16(buf, 0);
+        put16(buf, (uint16_t)ents.size()); put16(buf, (uint16_t)ents.size());
+        put32(buf, cdSize); put32(buf, cdStart); put16(buf, 0);
+        return buf;
+    }
+};
+
 Json fleetToolsList() {
     auto tool = [](const char* name, const char* desc, Json props, Json required) {
         return Json{{"name", name}, {"description", desc},
@@ -817,6 +870,10 @@ const char* kDashboardHtml = R"HTML(<!DOCTYPE html>
              border-radius: 5px; font-size: 12px; padding: 3px 10px;
              cursor: pointer; flex: none; }
   #dLogErr.on { background: #4a1d1d; color: #ff8a80; border-color: #7a3030; }
+  #dLogHead select { background: #191c22; color: #9aa3b2; border: 1px solid #2a2e36;
+                     border-radius: 5px; font-size: 12px; padding: 3px 6px;
+                     cursor: pointer; flex: none; max-width: 130px; }
+  #dLogHead select:hover { color: #d4d7dd; }
   #dLog { height: 260px; overflow-y: auto; padding: 6px 0;
           font: 11px/1.55 ui-monospace, "SF Mono", Menlo, monospace; }
   #dLog .ll { padding: 0 12px; white-space: pre-wrap; word-break: break-all;
@@ -1040,8 +1097,15 @@ R"HTML(
       <div id="dLogWrap">
         <div id="dLogHead">
           <span class="glabel">log</span>
+          <select id="dLogDate" title="view a past day"><option value="">live</option></select>
           <input id="dLogFilter" type="text" placeholder="filter...">
           <button id="dLogErr" title="show only ERROR / FATAL lines">errors</button>
+          <select id="dLogDl" title="download logs as a text file">
+            <option value="">⬇ download…</option>
+            <option value="today">today</option>
+            <option value="month">last 30 days</option>
+            <option value="all">everything</option>
+          </select>
         </div>
         <div id="dLog"><div class="empty">no log lines yet</div></div>
       </div>
@@ -1168,6 +1232,9 @@ function openDetail(id) {
   logCursor = 0;
   evCursor = 0;
   logErrOnly = false;
+  logLiveMode = true;
+  document.getElementById('dLogDate').value = '';
+  loadLogDays(id);
   document.getElementById('dLogErr').classList.remove('on');
   document.getElementById('dEvWrap').hidden = true;
   document.getElementById('dEvents').replaceChildren();
@@ -1756,15 +1823,63 @@ document.getElementById('dLogErr').addEventListener('click', () => {
   applyLogFilter();
 });
 
+let logLiveMode = true;   // false while viewing a past day (no live streaming)
+
 async function pollLog(id) {
+  if (!logLiveMode) return;   // a historical day is pinned; don't append live lines
   let r;
   try {
     r = await (await fetch('/api/log/' + encodeURIComponent(id) + '?after=' + logCursor)).json();
   } catch { return; }
-  if (detailId !== id) return;
+  if (detailId !== id || !logLiveMode) return;
   logCursor = r.next;
   appendLogLines(r.lines);
 }
+
+// Populate the date picker with the days that have stored logs.
+async function loadLogDays(id) {
+  const sel = document.getElementById('dLogDate');
+  sel.replaceChildren(Object.assign(document.createElement('option'), {value: '', textContent: 'live'}));
+  let dates = [];
+  try { dates = (await (await fetch('/api/logdays/' + encodeURIComponent(id))).json()).dates || []; } catch {}
+  const today = new Date().toISOString().slice(0, 10);
+  for (const d of dates) {
+    if (d === today) continue;   // today is the live view
+    sel.appendChild(Object.assign(document.createElement('option'), {value: d, textContent: d}));
+  }
+}
+
+// Switch between the live ring and a static past day.
+document.getElementById('dLogDate').addEventListener('change', async e => {
+  const date = e.target.value;
+  const box = document.getElementById('dLog');
+  box.replaceChildren();
+  if (!date) {                    // back to live
+    logLiveMode = true;
+    logCursor = 0;
+    return;                       // the poll cycle refills from the ring
+  }
+  logLiveMode = false;
+  try {
+    const r = await (await fetch('/api/log/' + encodeURIComponent(detailId) +
+                                 '?date=' + encodeURIComponent(date))).json();
+    appendLogLines(r.lines);
+    if (r.truncated) appendLogLines([{at: '', src: 'sup', text: '(older lines truncated)'}]);
+  } catch {}
+});
+
+// Download logs + images for a range as a zip.
+document.getElementById('dLogDl').addEventListener('change', e => {
+  const range = e.target.value;
+  e.target.value = '';
+  if (!range || !detailId) return;
+  const a = document.createElement('a');
+  a.href = '/api/logdownload/' + encodeURIComponent(detailId) + '?range=' + range;
+  a.download = '';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+});
 
 document.getElementById('dLogFilter').addEventListener('input', applyLogFilter);
 
@@ -2661,10 +2776,105 @@ int cmdServe(const vector<string>& args) {
     });
 
     // Log lines newer than ?after=<seq> (0 = everything buffered).
-    svr.Get(R"(/api/log/([^/]+))", [requireRole, appVisible](const httplib::Request& req, httplib::Response& res) {
+    // Which days of stored logs exist for this app (newest first) — feeds the
+    // detail panel's date picker so an operator can read past days, not just the
+    // in-memory ring (which is only today's recent tail).
+    svr.Get(R"(/api/logdays/([^/]+))", [requireRole, appVisible, dataDir](const httplib::Request& req, httplib::Response& res) {
         if (!requireRole(req, res, 1)) return;
         string id = req.matches[1];
         if (!appVisible(req, id)) { res.status = 404; return; }
+        Json dates = Json::array();
+        for (auto& f : dailyFiles(dataDir, id, "log-")) {
+            string n = f.filename().string();          // log-YYYY-MM-DD.jsonl
+            if (n.size() >= 20) dates.push_back(n.substr(4, 10));
+        }
+        res.set_content(Json({{"dates", dates}}).dump(), "application/json");
+    });
+
+    // Bulk export as a ZIP: logs.txt (concatenated daily files, oldest first) +
+    // every thumbnail and statusImage JPEG in the range. range = today|month|all.
+    svr.Get(R"(/api/logdownload/([^/]+))", [requireRole, appVisible, dataDir](const httplib::Request& req, httplib::Response& res) {
+        if (!requireRole(req, res, 1)) return;
+        string id = req.matches[1];
+        if (!appVisible(req, id)) { res.status = 404; return; }
+        string range = req.has_param("range") ? req.get_param_value("range") : "all";
+        int maxDays = range == "today" ? 1 : range == "month" ? 31 : 1000000;
+        auto now = chrono::system_clock::now();
+        // JPEGs are named YYYYMMDD-HHMMSS.jpg; keep those on/after this cutoff.
+        string cutoff = range == "all" ? ""
+                      : range == "today" ? fmtTimePoint(now, "%Y%m%d")
+                      : fmtTimePoint(now - chrono::hours(24) * 30, "%Y%m%d");
+        error_code ec;
+        ZipWriter z;
+
+        auto files = dailyFiles(dataDir, id, "log-");   // newest first
+        if ((int)files.size() > maxDays) files.resize(maxDays);
+        string logtxt;
+        for (auto it = files.rbegin(); it != files.rend(); ++it) {  // oldest first
+            string date = it->filename().string().substr(4, 10);
+            ifstream in(*it);
+            string ln;
+            while (getline(in, ln)) {
+                if (ln.empty()) continue;
+                try {
+                    Json j = Json::parse(ln);
+                    logtxt += date + " " + j.value("at", "") + " [" + j.value("src", "app") +
+                              "] " + j.value("text", "") + "\n";
+                } catch (...) {}
+            }
+        }
+        z.add("logs.txt", logtxt);
+
+        auto addJpegs = [&](const fs::path& dir, const string& zprefix) {
+            for (auto& e : fs::directory_iterator(dir, ec)) {
+                string n = e.path().filename().string();
+                if (n.size() < 12 || n.compare(n.size() - 4, 4, ".jpg") != 0) continue;
+                if (!cutoff.empty() && n.substr(0, 8) < cutoff) continue;
+                ifstream in(e.path(), ios::binary);
+                string data((istreambuf_iterator<char>(in)), istreambuf_iterator<char>());
+                if (!data.empty()) z.add(zprefix + n, data);
+            }
+        };
+        addJpegs(dataDir / id / "thumbs", "thumbs/");
+        for (auto& nd : fs::directory_iterator(dataDir / id / "images", ec)) {
+            if (nd.is_directory(ec))
+                addJpegs(nd.path(), "images/" + nd.path().filename().string() + "/");
+        }
+
+        res.set_header("Content-Disposition",
+                       "attachment; filename=\"" + id + "-export-" + range + ".zip\"");
+        res.set_content(z.finish(), "application/zip");
+    });
+
+    svr.Get(R"(/api/log/([^/]+))", [requireRole, appVisible, dataDir](const httplib::Request& req, httplib::Response& res) {
+        if (!requireRole(req, res, 1)) return;
+        string id = req.matches[1];
+        if (!appVisible(req, id)) { res.status = 404; return; }
+        // ?date=YYYY-MM-DD reads a whole day straight from disk (a static view);
+        // no date = the live in-memory ring via the ?after= cursor.
+        if (req.has_param("date")) {
+            string date = req.get_param_value("date");
+            bool ok = date.size() == 10 && date[4] == '-' && date[7] == '-';
+            for (char c : date) if (c != '-' && !isdigit((unsigned char)c)) ok = false;
+            if (!ok) { res.status = 400; res.set_content("bad date", "text/plain"); return; }
+            ifstream in(dataDir / id / ("log-" + date + ".jsonl"));
+            deque<Json> tail;
+            string ln;
+            while (getline(in, ln)) {
+                if (ln.empty()) continue;
+                try {
+                    Json j = Json::parse(ln);
+                    tail.push_back({{"at", j.value("at", "")}, {"src", j.value("src", "app")},
+                                    {"text", j.value("text", "")}});
+                    if (tail.size() > 8000) tail.pop_front();  // cap: keep the day's latest
+                } catch (...) {}
+            }
+            Json lines = Json::array();
+            for (auto& l : tail) lines.push_back(std::move(l));
+            res.set_content(Json({{"next", 0}, {"lines", lines},
+                                  {"truncated", tail.size() >= 8000}}).dump(), "application/json");
+            return;
+        }
         uint64_t after = 0;
         if (req.has_param("after")) {
             try { after = stoull(req.get_param_value("after")); } catch (...) {}
