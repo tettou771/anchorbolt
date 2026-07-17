@@ -99,6 +99,7 @@ struct AppState {
     map<string, ImageSlot> images;                  // custom statusImage uploads
     deque<LogLine> logs;                            // ring buffer, newest last
     uint64_t nextLogSeq = 1;
+    bool preloaded = false;                         // disk log tail loaded this session
     map<string, pair<string, int64_t>> logSeen;     // src -> (file, acked end offset)
     deque<LogLine> alerts;                          // app-raised operator alerts
     uint64_t nextAlertSeq = 1;
@@ -117,6 +118,45 @@ constexpr size_t kLogRingSize = 500;
 
 map<string, AppState> g_apps;
 mutex g_appsMutex;
+
+// After a serve restart the in-memory log ring is empty, but the venue keeps its
+// own cursor and won't re-ship history — so the detail panel would show nothing
+// until fresh lines arrive. On an app's first contact this session, seed the ring
+// from the tail of its most recent on-disk log-YYYY-MM-DD.jsonl. Done per-app on
+// contact (not for every dir at boot) so long-gone venues aren't resurrected.
+// Caller holds g_appsMutex.
+void preloadAppLogs(const fs::path& dataDir, const string& id, AppState& st) {
+    if (st.preloaded) return;
+    st.preloaded = true;
+    error_code ec;
+    fs::path latest;
+    string latestName;
+    for (auto& e : fs::directory_iterator(dataDir / id, ec)) {
+        string n = e.path().filename().string();
+        if (n.rfind("log-", 0) == 0 && n.size() >= 6 &&
+            n.compare(n.size() - 6, 6, ".jsonl") == 0 && n > latestName) {
+            latestName = n;
+            latest = e.path();
+        }
+    }
+    if (latest.empty()) return;
+    ifstream in(latest);
+    if (!in) return;
+    deque<string> tail;
+    string ln;
+    while (getline(in, ln)) {
+        if (ln.empty()) continue;
+        tail.push_back(std::move(ln));
+        if (tail.size() > kLogRingSize) tail.pop_front();
+    }
+    for (auto& line : tail) {
+        try {
+            Json j = Json::parse(line);
+            st.logs.push_back(LogLine{st.nextLogSeq++, j.value("at", ""),
+                                      j.value("src", "app"), j.value("text", "")});
+        } catch (...) {}
+    }
+}
 
 atomic<bool> g_stop{false};
 void onSignal(int) { g_stop = true; }
@@ -2490,6 +2530,7 @@ int cmdServe(const vector<string>& args) {
         {
             lock_guard<mutex> lock(g_appsMutex);
             auto& st = g_apps[id];
+            preloadAppLogs(dataDir, id, st);   // seed the log ring on first contact
             st.health = body;
             st.lastSeen = chrono::steady_clock::now();
         }
@@ -2605,6 +2646,8 @@ int cmdServe(const vector<string>& args) {
             res.set_content("ok (duplicate)", "text/plain");
             return;
         }
+        // Seed history before appending new lines, so old lines keep lower seqs.
+        preloadAppLogs(dataDir, id, st);
         ofstream out(dir / ("log-" + getTimestampString("%Y-%m-%d") + ".jsonl"), ios::app);
         for (auto& l : body.value("lines", Json::array())) {
             if (!l.is_string()) continue;
