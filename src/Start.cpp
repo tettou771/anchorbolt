@@ -38,6 +38,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <io.h>       // _isatty
 #else
 #include <sys/wait.h>
 #include <sys/socket.h>
@@ -1187,6 +1188,73 @@ optional<string> resolveIdFromServer(const string& serverUrl, const string& toke
     return nullopt;
 }
 
+// Redeem a 6-digit pairing code at the fleet server for this venue's
+// server-assigned id + agent token. Fills opt on success; sets err otherwise.
+bool redeemPairCode(const string& serverUrl, const string& code,
+                    StartOptions& opt, string& err) {
+    tcx::curl::HttpClient cli;
+    cli.setBaseUrl(serverUrl);
+    cli.setTimeout(5);
+    auto res = cli.request("POST", "/api/pair", Json({{"code", code}}).dump(), "application/json");
+    if (res.statusCode != 200) {
+        err = res.statusCode ? "pairing failed (HTTP " + to_string(res.statusCode) + ": " + res.body + ")"
+                             : "server " + serverUrl + " unreachable";
+        return false;
+    }
+    Json pr;
+    try { pr = Json::parse(res.body); }
+    catch (...) { err = "pairing response was not JSON"; return false; }
+    opt.appId = pr.value("app", "");
+    opt.token = pr.value("token", "");
+    if (opt.appId.empty() || opt.token.empty()) {
+        err = "pairing response missing app/token";
+        return false;
+    }
+    return true;
+}
+
+bool stdinIsTty() {
+#ifdef _WIN32
+    return _isatty(_fileno(stdin)) != 0;
+#else
+    return isatty(STDIN_FILENO) != 0;
+#endif
+}
+
+// Interactive onboarding: with a terminal attached but no token yet, ask for a
+// 6-digit pairing code (redeemed immediately) or an agent token (validated
+// later by whoami). Fills opt.token (+ opt.appId for the pairing path). Never
+// called without a TTY, so systemd/launchd runs stay non-interactive.
+bool promptOnboard(StartOptions& opt) {
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        cout << "This venue has no token yet. Enter a 6-digit pairing code from the\n"
+                "dashboard, or paste an agent token (tc-...): " << flush;
+        string line;
+        if (!getline(cin, line)) return false;  // EOF / closed stdin
+        // Trim surrounding whitespace.
+        size_t a = line.find_first_not_of(" \t\r\n");
+        size_t b = line.find_last_not_of(" \t\r\n");
+        line = (a == string::npos) ? "" : line.substr(a, b - a + 1);
+        if (line.empty()) continue;
+
+        bool sixDigits = line.size() == 6 &&
+                         all_of(line.begin(), line.end(), [](char c){ return isdigit((unsigned char)c); });
+        if (sixDigits) {
+            string err;
+            if (redeemPairCode(opt.serverUrl, line, opt, err)) {
+                logNotice("anchorbolt") << "paired as '" << opt.appId << "'";
+                return true;
+            }
+            cerr << "  " << err << " — try again" << endl;
+        } else {
+            opt.token = line;   // whoami validates it and resolves the id next
+            return true;
+        }
+    }
+    cerr << "anchorbolt start: no valid code or token entered" << endl;
+    return false;
+}
+
 // Platform-conventional log home (CWD-relative defaults break under
 // launchd/systemd, whose cwd is /). --log-dir / config log.dir override.
 fs::path platformLogDir(const string& appId) {
@@ -1565,25 +1633,9 @@ int cmdStart(const vector<string>& args) {
             cerr << "anchorbolt start: --pair needs --server <fleet url>" << endl;
             return 1;
         }
-        tcx::curl::HttpClient cli;
-        cli.setBaseUrl(opt.serverUrl);
-        cli.setTimeout(5);
-        auto res = cli.request("POST", "/api/pair", Json({{"code", opt.pairCode}}).dump(), "application/json");
-        if (res.statusCode != 200) {
-            cerr << "anchorbolt start: pairing failed"
-                 << (res.statusCode ? " (HTTP " + to_string(res.statusCode) + ": " + res.body + ")"
-                                    : " (server " + opt.serverUrl + " unreachable)") << endl;
-            return 1;
-        }
-        Json pr;
-        try { pr = Json::parse(res.body); } catch (...) {
-            cerr << "anchorbolt start: pairing response was not JSON" << endl;
-            return 1;
-        }
-        opt.appId = pr.value("app", "");   // server-assigned id + token win this run
-        opt.token = pr.value("token", "");
-        if (opt.appId.empty() || opt.token.empty()) {
-            cerr << "anchorbolt start: pairing response missing app/token" << endl;
+        string err;
+        if (!redeemPairCode(opt.serverUrl, opt.pairCode, opt, err)) {
+            cerr << "anchorbolt start: " << err << endl;
             return 1;
         }
         logNotice("anchorbolt") << "paired as '" << opt.appId << "' via code";
@@ -1618,11 +1670,19 @@ int cmdStart(const vector<string>& args) {
     bool resolvedId = false;
     if (!opt.serverUrl.empty()) {
         if (opt.token.empty()) {
-            cerr << "anchorbolt start: --server needs a token (no open mode).\n"
-                    "  pair with a 6-digit code from the dashboard:  --pair <code>\n"
-                    "  or pass a token from `anchorbolt token agent new <id>`:  --token tc-..."
-                 << endl;
-            return 1;
+            // Terminal attached: ask for a code/token instead of failing, and
+            // persist it so the next run connects on its own. No TTY (systemd/
+            // launchd) stays a hard error — an interactive prompt would hang.
+            if (stdinIsTty()) {
+                if (!promptOnboard(opt)) return 1;
+                resolvedId = true;   // persist whatever we just obtained
+            } else {
+                cerr << "anchorbolt start: --server needs a token (no open mode).\n"
+                        "  pair with a 6-digit code from the dashboard:  --pair <code>\n"
+                        "  or pass a token from `anchorbolt token agent new <id>`:  --token tc-..."
+                     << endl;
+                return 1;
+            }
         }
         if (opt.appId.empty()) {
             auto id = resolveIdFromServer(opt.serverUrl, opt.token);
