@@ -995,6 +995,8 @@ R"HTML(
              color: #4ecb71; font: 12px ui-monospace, Menlo, monospace;
              padding: 8px 10px; margin-top: 8px; word-break: break-all; }
   .sReveal[hidden] { display: none; }
+  .sSub { margin: 20px 0 8px; font-size: 13px; color: #9aa3b2; font-weight: 600;
+          border-top: 1px solid #21252d; padding-top: 16px; }
 </style>
 </head>
 <body>
@@ -1061,6 +1063,19 @@ R"HTML(
         <button class="sBtn" id="sOpAdd">Create</button>
       </div>
       <div class="sReveal" id="sOpToken" hidden></div>
+
+      <h4 class="sSub">Share links &mdash; read-only, no login</h4>
+      <table class="sTable">
+        <colgroup><col style="width:46%"><col style="width:22%"><col style="width:16%"><col></colgroup>
+        <thead><tr><th>scope</th><th>expires</th><th>created</th><th></th></tr></thead>
+        <tbody id="sShares"></tbody>
+      </table>
+      <div class="sRow">
+        <input id="sShareScope" placeholder="scope (e.g. osaka,app:special) — blank = all">
+        <input id="sShareDays" type="number" min="0" placeholder="days (0 = never)" style="width:130px; flex:none">
+        <button class="sBtn" id="sShareAdd">Create link</button>
+      </div>
+      <div class="sReveal" id="sShareOut" hidden></div>
     </div>
   </div>
 </div>
@@ -1185,6 +1200,13 @@ function applyRole(me) {
 }
 
 (async () => {
+  // Share link: ?share=<token> logs in read-only, then we strip it from the URL
+  // so the token isn't left sitting in the address bar / history.
+  const share = new URLSearchParams(location.search).get('share');
+  if (share) {
+    try { await fetch('/api/login', {method: 'POST', body: JSON.stringify({token: share})}); } catch {}
+    history.replaceState(null, '', location.pathname);
+  }
   try {
     const r = await fetch('/api/me');
     if (r.status === 401) { showLogin(); return; }
@@ -2112,9 +2134,11 @@ async function openSettings() {
   byId('settings').hidden = false;
   byId('sOpToken').hidden = true;
   byId('sPairOut').hidden = true;
+  byId('sShareOut').hidden = true;
   showSettingsPane('pApps');
   loadSettingsApps();
   loadSettingsOps();
+  loadSettingsShares();
 }
 
 // One "Apps" table over every app-id this server knows: the union of apps
@@ -2219,6 +2243,44 @@ byId('sOpAdd').addEventListener('click', async () => {
     loadSettingsOps();
   } else {
     stReveal('sOpToken', 'error: ' + (await r.text()));
+  }
+});
+
+function fmtShareExpiry(exp) {
+  return exp ? new Date(exp * 1000).toISOString().slice(0, 10) : 'never';
+}
+async function loadSettingsShares() {
+  const tb = byId('sShares');
+  let shares = [];
+  try { shares = await (await fetch('/api/admin/shares')).json(); } catch {}
+  if (!shares.length) { tb.replaceChildren(stMsg(4, 'no share links yet')); return; }
+  tb.replaceChildren(...shares.map(s => {
+    const tr = document.createElement('tr');
+    const rv = document.createElement('button');
+    rv.className = 'sBtn danger'; rv.textContent = 'Revoke';
+    rv.addEventListener('click', async () => {
+      if (!confirm('Revoke this share link? It stops working immediately.')) return;
+      await stPost('/api/admin/share/revoke', { id: s.id });
+      loadSettingsShares();
+    });
+    const tdX = document.createElement('td'); tdX.className = 'acts'; tdX.append(rv);
+    tr.append(stCell((s.scope || []).join(', ') || 'all'),
+              stCell(fmtShareExpiry(s.expires)), stCell(s.created || ''), tdX);
+    return tr;
+  }));
+}
+
+byId('sShareAdd').addEventListener('click', async () => {
+  const r = await stPost('/api/admin/share/new',
+    { scope: byId('sShareScope').value.trim(), days: parseInt(byId('sShareDays').value, 10) || 0 });
+  if (r.ok) {
+    const j = await r.json();
+    stReveal('sShareOut', 'share link (copy & send — grants read-only access to the scope):\n'
+             + location.origin + '/?share=' + j.token);
+    byId('sShareScope').value = ''; byId('sShareDays').value = '';
+    loadSettingsShares();
+  } else {
+    stReveal('sShareOut', 'error: ' + (await r.text()));
   }
 });
 
@@ -2549,6 +2611,33 @@ int cmdServe(const vector<string>& args) {
         if (tok.empty()) { res.status = 400; res.set_content("invalid role (viewer|operator|admin)", "text/plain"); return; }
         // The plaintext token is returned ONCE — the UI shows it and nowhere else.
         res.set_content(dumpSafeS(Json({{"name", name}, {"token", tok}})), "application/json");
+    });
+
+    // Share links: a viewer-scoped token delivered as a URL (?share=...). Admin
+    // mints one with a scope + optional expiry; recipients get read-only access
+    // to just those apps, no login. The token is shown once (it's in the URL).
+    svr.Get("/api/admin/shares", [dataDir, requireRole](const httplib::Request& req, httplib::Response& res) {
+        if (!requireRole(req, res, 3)) return;
+        res.set_content(dumpSafeS(token::listShares(dataDir.string())), "application/json");
+    });
+    svr.Post("/api/admin/share/new", [dataDir, requireRole, parseBody, parseScope](const httplib::Request& req, httplib::Response& res) {
+        if (!requireRole(req, res, 3)) return;
+        Json body;
+        if (!parseBody(req, res, body)) return;
+        int days = body.value("days", 0);   // 0 = never expires
+        string tok = token::mintShare(dataDir.string(), parseScope(body.value("scope", Json())),
+                                      days > 0 ? days * 86400 : 0);
+        if (tok.empty()) { res.status = 500; res.set_content("could not mint share", "text/plain"); return; }
+        res.set_content(dumpSafeS(Json({{"token", tok}})), "application/json");
+    });
+    svr.Post("/api/admin/share/revoke", [dataDir, requireRole, parseBody](const httplib::Request& req, httplib::Response& res) {
+        if (!requireRole(req, res, 3)) return;
+        Json body;
+        if (!parseBody(req, res, body)) return;
+        if (!token::revokeShare(dataDir.string(), body.value("id", ""))) {
+            res.status = 404; res.set_content("not found", "text/plain"); return;
+        }
+        res.set_content("ok", "text/plain");
     });
 
     svr.Post("/api/admin/operator/revoke", [dataDir, requireRole, parseBody](const httplib::Request& req, httplib::Response& res) {

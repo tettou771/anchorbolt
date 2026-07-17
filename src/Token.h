@@ -131,4 +131,17 @@ std::string mintCode(const std::string& dataDir, const std::string& kind,
 std::optional<std::pair<std::string, std::string>> redeemCode(
     const std::string& dataDir, const std::string& code);
 
+// --- share links (viewer-scoped tokens delivered as a URL) ---
+
+// Mint a share token (viewer role) with the given scope and an optional expiry
+// (ttlSec = 0 → never expires). Returns the plaintext token, shown once.
+std::string mintShare(const std::string& dataDir,
+                      const std::vector<std::string>& scope, int ttlSec);
+
+// Active shares (hash prefix + scope + expiry), pruning expired ones.
+tc::Json listShares(const std::string& dataDir);
+
+// Revoke a share by its hash prefix (from listShares). False if none matched.
+bool revokeShare(const std::string& dataDir, const std::string& hashPrefix);
+
 } // namespace token

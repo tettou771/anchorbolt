@@ -39,6 +39,7 @@ fs::path operatorsPath(const string& dataDir){ return fs::path(dataDir) / "opera
 fs::path groupsPath(const string& dataDir)   { return fs::path(dataDir) / "groups.json"; }
 fs::path sessionsPath(const string& dataDir) { return fs::path(dataDir) / "sessions.json"; }
 fs::path codesPath(const string& dataDir)    { return fs::path(dataDir) / "codes.json"; }
+fs::path sharesPath(const string& dataDir)   { return fs::path(dataDir) / "shares.json"; }
 
 // 32 random bytes from the OS CSPRNG, as "<prefix><hex>".
 string mintToken(const char* prefix) {
@@ -164,7 +165,63 @@ optional<Operator> verifyOperator(const string& dataDir, const string& tok) {
         sessions.erase(hash);
         saveRegistry(dataDir, sessionsPath(dataDir), sessions);
     }
+    // Share link: a viewer-scoped token with an expiry, delivered as a URL. Not
+    // a named human, so it lives in its own registry; expired ones are pruned.
+    Json shares = loadRegistry(sharesPath(dataDir));
+    if (shares.contains(hash) && shares[hash].is_object()) {
+        int64_t exp = shares[hash].value("expires", (int64_t)0);
+        if (exp == 0 || (int64_t)time(nullptr) < exp)
+            return Operator{"share", "viewer", scopeVec(shares[hash])};
+        shares.erase(hash);
+        saveRegistry(dataDir, sharesPath(dataDir), shares);
+    }
     return nullopt;
+}
+
+// Mint a share link: a viewer-scoped token with an optional expiry (ttlSec=0 =
+// never expires). Returns the plaintext token (embedded in a URL, shown once).
+string mintShare(const string& dataDir, const vector<string>& scope, int ttlSec) {
+    Json shares = loadRegistry(sharesPath(dataDir));
+    int64_t now = (int64_t)time(nullptr);
+    string tok = mintToken("sh-");
+    Json e = {{"expires", ttlSec > 0 ? now + ttlSec : 0},
+              {"created", getTimestampString("%Y-%m-%d")}};
+    if (!scope.empty()) e["scope"] = scope;
+    shares[sha::sha256Hex(tok)] = e;
+    if (!saveRegistry(dataDir, sharesPath(dataDir), shares)) return "";
+    return tok;
+}
+
+// Active shares for the settings UI (never the token — only a hash prefix to
+// revoke by). Prunes expired ones as a side effect.
+Json listShares(const string& dataDir) {
+    Json shares = loadRegistry(sharesPath(dataDir));
+    int64_t now = (int64_t)time(nullptr);
+    Json out = Json::array();
+    bool changed = false;
+    for (auto it = shares.begin(); it != shares.end();) {
+        int64_t exp = it->value("expires", (int64_t)0);
+        if (exp != 0 && now >= exp) { it = shares.erase(it); changed = true; continue; }
+        out.push_back({{"id", it.key().substr(0, 12)},
+                       {"scope", scopeVec(*it)},
+                       {"expires", exp},
+                       {"created", it->value("created", "")}});
+        ++it;
+    }
+    if (changed) saveRegistry(dataDir, sharesPath(dataDir), shares);
+    return out;
+}
+
+bool revokeShare(const string& dataDir, const string& hashPrefix) {
+    Json shares = loadRegistry(sharesPath(dataDir));
+    for (auto it = shares.begin(); it != shares.end(); ++it) {
+        if (it.key().rfind(hashPrefix, 0) == 0) {
+            shares.erase(it);
+            saveRegistry(dataDir, sharesPath(dataDir), shares);
+            return true;
+        }
+    }
+    return false;
 }
 
 int roleRank(const string& role) {
