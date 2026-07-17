@@ -672,10 +672,10 @@ const char* kDashboardHtml = R"HTML(<!DOCTYPE html>
   .thumbWrap .none { position: absolute; inset: 0; display: flex;
                      align-items: center; justify-content: center;
                      color: #4a4f59; font-size: 12px; }
-  .meta { padding: 10px 14px; display: flex; justify-content: space-between;
-          align-items: baseline; gap: 8px; }
+  .meta { padding: 10px 14px; display: flex; flex-direction: column; gap: 3px; }
   .meta .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis;
-                white-space: nowrap; }
+                white-space: nowrap; min-width: 0; }
+  .meta .name .label { overflow: hidden; text-overflow: ellipsis; }
   .meta .stats { color: #7d838e; font-size: 12px; white-space: nowrap;
                  overflow: hidden; text-overflow: ellipsis; }
   .abadge { background: #4a1d1d; color: #ff8a80; border: 1px solid #7a3030;
@@ -727,11 +727,15 @@ const char* kDashboardHtml = R"HTML(<!DOCTYPE html>
   #detail[hidden] { display: none; }
   #dPanel { background: #1b1e24; border: 1px solid #323844; border-radius: 12px;
             width: min(860px, 100%); margin-bottom: 4vh; }
-  .dhead { display: flex; align-items: center; gap: 10px; padding: 14px 18px;
+  .dhead { display: flex; flex-direction: column; gap: 8px; padding: 14px 18px;
            border-bottom: 1px solid #2a2e36; }
-  .dhead h2 { margin: 0; font-size: 16px; }
-  .dhead .stats { color: #7d838e; font-size: 12px; flex: 1;
+  .dTitleRow { display: flex; align-items: center; gap: 8px; }
+  .dTitleRow h2 { margin: 0; font-size: 16px; flex: 1; min-width: 0;
                   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .dBtnRow { display: flex; gap: 8px; }
+  .dBtnRow[hidden] { display: none; }
+  .dStatusRow .stats { color: #7d838e; font-size: 12px;
+                       overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   #dClose { background: none; border: none; color: #7d838e; font-size: 22px;
             cursor: pointer; padding: 0 4px; line-height: 1; }
   #dClose:hover { color: #d4d7dd; }
@@ -782,12 +786,6 @@ const char* kDashboardHtml = R"HTML(<!DOCTYPE html>
   #dLog .ll.sup  { color: #7ea6d9; }
   #dLog .ll .lt  { color: #565c66; margin-right: 8px; }
   #dLog .empty   { color: #4a4f59; padding: 12px; }
-  /* Command-channel status: a plain dot (green = the agent is connected and
-     can take commands, gray = offline). A dot, not a "live" label, so it
-     doesn't read as a second copy of the Live button beside it. */
-  .liveDot { width: 9px; height: 9px; border-radius: 50%; flex: none;
-             background: #3fb950; }
-  .liveDot.off { background: #4a4f59; }
   #dRestart { background: #33251a; color: #e0a06a; border: 1px solid #55402c;
               border-radius: 6px; font-size: 12px; padding: 4px 12px;
               cursor: pointer; flex: none; }
@@ -965,15 +963,18 @@ R"HTML(
 <div id="detail" hidden>
   <div id="dPanel">
     <div class="dhead">
-      <span class="dot" id="dDot"></span>
-      <h2 id="dTitle"></h2>
-      <span class="stats" id="dStats"></span>
-      <span class="liveDot off" id="dLive" title="agent offline"></span>
-      <button id="dLiveBtn" title="live view + remote control">Live</button>
-      <button id="dUpdate" disabled title="git pull + build + restart on the venue machine">Update</button>
-      <button id="dRollback" disabled title="restore the previous binary">Roll back</button>
-      <button id="dRestart" disabled>Restart</button>
-      <button id="dClose" title="close">&times;</button>
+      <div class="dTitleRow">
+        <span class="dot" id="dDot"></span>
+        <h2 id="dTitle"></h2>
+        <button id="dClose" title="close">&times;</button>
+      </div>
+      <div class="dBtnRow" id="dBtns" hidden>
+        <button id="dLiveBtn" title="live view + remote control">Live</button>
+        <button id="dUpdate" title="git pull + build + restart on the venue machine">Update</button>
+        <button id="dRollback" title="restore the previous binary">Roll back</button>
+        <button id="dRestart">Restart</button>
+      </div>
+      <div class="dStatusRow"><span class="stats" id="dStats"></span></div>
     </div>
     <div class="dbody">
       <div id="dLiveWrap" hidden>
@@ -1089,6 +1090,15 @@ function statsLine(app) {
   const parts = [];
   if (h.fps !== undefined) parts.push(h.fps.toFixed(0) + ' fps');
   if (h.width) parts.push(h.width + 'x' + h.height);
+  if (h.uptimeSec !== undefined) parts.push('up ' + fmtUptime(h.uptimeSec));
+  if (app.ageSec > STALE_SEC) parts.push('last seen ' + Math.floor(app.ageSec) + 's ago');
+  return parts.join(' · ');
+}
+
+// Wall cards show only uptime + freshness; fps/size live in the detail view.
+function wallStats(app) {
+  const h = app.health || {};
+  const parts = [];
   if (h.uptimeSec !== undefined) parts.push('up ' + fmtUptime(h.uptimeSec));
   if (app.ageSec > STALE_SEC) parts.push('last seen ' + Math.floor(app.ageSec) + 's ago');
   return parts.join(' · ');
@@ -1272,12 +1282,10 @@ async function renderDetail() {
   const stale = app.ageSec > STALE_SEC;
   document.getElementById('dDot').classList.toggle('bad', stale);
   document.getElementById('dTitle').textContent = app.id;
-  const live = document.getElementById('dLive');
-  live.classList.toggle('off', !app.live);
-  live.title = app.live ? 'agent online — remote control available' : 'agent offline';
-  document.getElementById('dRestart').disabled = !app.live;
-  document.getElementById('dUpdate').disabled = !app.live;
-  document.getElementById('dRollback').disabled = !app.live;
+  // The action buttons ride the command channel, so they only make sense when
+  // the agent's WS is connected. Hide the whole row when it's offline rather
+  // than showing dead controls (the title dot already reports health).
+  document.getElementById('dBtns').hidden = !app.live;
   const h = app.health || {};
   const extra = [];
   if (h.git) extra.push('@' + h.git);
@@ -1753,7 +1761,7 @@ async function refresh() {
     el.classList.toggle('stale', app.ageSec > STALE_SEC);
     el.dataset.group = app.group || '';
     el.querySelector('.label').textContent = app.id;
-    el.querySelector('.stats').textContent = statsLine(app);
+    el.querySelector('.stats').textContent = wallStats(app);
     const badge = el.querySelector('.abadge');
     badge.hidden = !(app.alerts > 0);
     if (app.alerts > 0) badge.textContent = '\u26a0 ' + app.alerts;
@@ -2009,12 +2017,12 @@ int cmdServe(const vector<string>& args) {
         return 1;
     }
 
-    // Agent authentication: with at least one token registered, every ingest
-    // request and WS hello must present a valid token for its app id.
-    // No tokens = open mode (the zero-config path on trusted networks).
+    // Agent authentication: every ingest request and WS hello must present a
+    // valid token for its app id. Secure by default — a venue reaches the fleet
+    // only with a token minted here (via `token agent new` or a pairing code);
+    // there is no open mode, so knowing the URL alone gets you nothing.
     auto authOk = [dataDir](const httplib::Request& req, const string& appId) {
         string d = dataDir.string();
-        if (!token::enforcementEnabled(d)) return true;
         string h = req.get_header_value("Authorization");
         const string prefix = "Bearer ";
         if (h.rfind(prefix, 0) != 0) return false;
@@ -2076,8 +2084,7 @@ int cmdServe(const vector<string>& args) {
             string app = m.value("app", "");
             string tok = m.value("token", "");
             string d = dataDir.string();
-            if (!validAppId(app) ||
-                (token::enforcementEnabled(d) && !token::verify(d, app, tok))) {
+            if (!validAppId(app) || !token::verify(d, app, tok)) {
                 g_agents.hub.sendText(clientId, Json({{"type", "error"},
                                                       {"error", "auth failed"}}).dump());
                 g_agents.hub.closeClient(clientId);
@@ -2379,6 +2386,19 @@ int cmdServe(const vector<string>& args) {
         if (tok.empty()) { res.status = 500; res.set_content("could not mint token", "text/plain"); return; }
         logNotice("anchorbolt") << "paired venue '" << app << "' via code";
         res.set_content(dumpSafeS(Json({{"app", app}, {"token", tok}})), "application/json");
+    });
+
+    // Token -> id: a venue started with only its agent token (no client-side
+    // id) resolves its server-assigned id here once, then caches it. The token
+    // is the credential; a bad one just 401s.
+    svr.Post("/api/whoami", [dataDir](const httplib::Request& req, httplib::Response& res) {
+        string h = req.get_header_value("Authorization");
+        const string prefix = "Bearer ";
+        auto id = (h.rfind(prefix, 0) == 0)
+                      ? token::resolveAgent(dataDir.string(), h.substr(prefix.size()))
+                      : nullopt;
+        if (!id) { res.status = 401; res.set_content("invalid token", "text/plain"); return; }
+        res.set_content(dumpSafeS(Json({{"app", *id}})), "application/json");
     });
 
     // Operator login by code: redeem, mint a SESSION token (os-...), set the
@@ -2810,8 +2830,7 @@ int cmdServe(const vector<string>& args) {
 
     logNotice("anchorbolt") << "fleet server on http://localhost:" << opt.port
                             << " (ws " << opt.wsPort << ", data " << dataDir.string()
-                            << (token::enforcementEnabled(dataDir.string())
-                                ? ", agent tokens ENFORCED)" : ", open mode)");
+                            << ")";
     // Dual-stack listen: Windows resolves `localhost` to ::1 first, so an
     // IPv4-only listener made agent POSTs fail silently there (the WS channel
     // still connected — a confusing half-alive state). "::" with the httplib

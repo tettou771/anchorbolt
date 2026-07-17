@@ -94,15 +94,19 @@ namespace token {
 
 // --- agent tokens ---
 
-bool enforcementEnabled(const string& dataDir) {
-    Json t = loadRegistry(agentsPath(dataDir));
-    return t.is_object() && !t.empty();
-}
-
 bool verify(const string& dataDir, const string& appId, const string& tok) {
     Json t = loadRegistry(agentsPath(dataDir));
     if (!t.contains(appId) || !t[appId].is_string()) return false;
     return t[appId].get<string>() == sha::sha256Hex(tok);
+}
+
+optional<string> resolveAgent(const string& dataDir, const string& tok) {
+    if (tok.empty()) return nullopt;
+    Json t = loadRegistry(agentsPath(dataDir));
+    string hash = sha::sha256Hex(tok);
+    for (auto& [app, h] : t.items())
+        if (h.is_string() && h.get<string>() == hash) return app;
+    return nullopt;
 }
 
 string mintAgent(const string& dataDir, const string& appId) {
@@ -378,9 +382,8 @@ int cmdToken(const vector<string>& args) {
             cout << (replacing ? "replaced agent token for '" : "new agent token for '")
                  << id << "':\n\n  " << tok << "\n\n"
                  << "shown once — only its hash is stored. On the venue machine:\n"
-                 << "  anchorbolt start <app> --server <url> --id " << id << " --token " << tok << "\n"
-                 << "NOTE: with at least one agent token registered, this server now\n"
-                 << "REQUIRES a valid token from every agent (ingest open mode is off)." << endl;
+                 << "  anchorbolt start <app> --server <url> --token " << tok << "\n"
+                 << "the id ('" << id << "') is derived from the token — no --id needed." << endl;
             return 0;
         }
         if (verb == "revoke") {

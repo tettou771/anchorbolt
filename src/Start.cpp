@@ -974,7 +974,6 @@ bool parseArgs(const vector<string>& args, StartOptions& opt) {
         else if (a == "--watchdog-timeout") { auto v = next("--watchdog-timeout"); if (!v) return false; opt.watchdogTimeoutSec = stoi(*v); }
         else if (a == "--log-keep") { auto v = next("--log-keep"); if (!v) return false; opt.logKeepDays = stoi(*v); }
         else if (a == "--server")   { auto v = next("--server");   if (!v) return false; opt.serverUrl = *v; }
-        else if (a == "--id")       { auto v = next("--id");       if (!v) return false; opt.appId = *v; }
         else if (a == "--token")    { auto v = next("--token");    if (!v) return false; opt.token = *v; }
         else if (a == "--token-file") {
             auto v = next("--token-file");
@@ -1094,7 +1093,8 @@ bool loadConfig(const fs::path& path, StartOptions& opt) {
         for (auto& a : c["args"]) opt.appArgs.push_back(a.get<string>());
     }
     opt.cwd       = c.value("cwd", opt.cwd);
-    opt.appId     = c.value("id", opt.appId);
+    // No "id" key: on a fleet the id is server-assigned (derived from the token);
+    // local-only runs name their log dir from the binary.
     opt.serverUrl = c.value("server", opt.serverUrl);
     if (c.contains("port")) { opt.port = c["port"].get<int>(); opt.portExplicit = true; }
     opt.wsPort    = c.value("wsPort", opt.wsPort);
@@ -1168,6 +1168,23 @@ void readPairTokenFile(const fs::path& file, StartOptions& opt) {
         opt.appId = j["id"].get<string>();
     if (opt.token.empty() && j.contains("token") && j["token"].is_string())
         opt.token = j["token"].get<string>();
+}
+
+// Ask the fleet server which id this agent token authenticates (POST
+// /api/whoami). Lets a venue run with just its token and no client-side id.
+optional<string> resolveIdFromServer(const string& serverUrl, const string& token) {
+    tcx::curl::HttpClient cli;
+    cli.setBaseUrl(serverUrl);
+    cli.setTimeout(5);
+    cli.setBearerToken(token);
+    auto res = cli.request("POST", "/api/whoami", "", "application/json");
+    if (res.statusCode != 200) return nullopt;
+    try {
+        Json j = Json::parse(res.body);
+        string id = j.value("app", "");
+        if (!id.empty()) return id;
+    } catch (...) {}
+    return nullopt;
 }
 
 // Platform-conventional log home (CWD-relative defaults break under
@@ -1594,7 +1611,34 @@ int cmdStart(const vector<string>& args) {
     // it. Skipped on the pairing run itself (we just got a fresh identity).
     if (!pairArg) readPairTokenFile(pairTokenFile(runPath), opt);
 
-    if (opt.appId.empty()) opt.appId = runPath.stem().string();
+    // Fleet identity. Joining a fleet (--server) is secure by default: it needs
+    // an agent token (from `token agent new` or a pairing code), and the id is
+    // derived from that token server-side — never supplied by the venue. A
+    // token with no cached id resolves once via /api/whoami, then persists.
+    bool resolvedId = false;
+    if (!opt.serverUrl.empty()) {
+        if (opt.token.empty()) {
+            cerr << "anchorbolt start: --server needs a token (no open mode).\n"
+                    "  pair with a 6-digit code from the dashboard:  --pair <code>\n"
+                    "  or pass a token from `anchorbolt token agent new <id>`:  --token tc-..."
+                 << endl;
+            return 1;
+        }
+        if (opt.appId.empty()) {
+            auto id = resolveIdFromServer(opt.serverUrl, opt.token);
+            if (!id) {
+                cerr << "anchorbolt start: the server did not recognize this token"
+                        " (revoked, or wrong --server)" << endl;
+                return 1;
+            }
+            opt.appId = *id;
+            resolvedId = true;
+        }
+    } else if (opt.appId.empty()) {
+        // Local-only supervision (no fleet): the id just names the local log
+        // dir, so the binary name is a fine default.
+        opt.appId = runPath.stem().string();
+    }
     for (char& c : opt.appId) {
         if (!isalnum((unsigned char)c) && c != '-' && c != '_' && c != '.') c = '-';
     }
@@ -1602,8 +1646,9 @@ int cmdStart(const vector<string>& args) {
                                          : fs::absolute(opt.logDir);
     fs::create_directories(logDir);
 
-    // Just paired: persist id + token so the next plain run reuses them.
-    if (pairArg) {
+    // Just paired (or resolved an id from a bare token): persist id + token so
+    // the next plain run reuses them and skips the server round-trip.
+    if (pairArg || resolvedId) {
         fs::path pf = pairTokenFile(runPath);
         error_code ec;
         fs::create_directories(pf.parent_path(), ec);

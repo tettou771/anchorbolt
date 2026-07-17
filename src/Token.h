@@ -41,12 +41,14 @@ namespace token {
 
 // --- agent tokens ---
 
-// True if any agent token is registered => serve must enforce ingest auth.
-bool enforcementEnabled(const std::string& dataDir);
-
 // Validate a presented agent token for an app id against the stored hash.
 bool verify(const std::string& dataDir, const std::string& appId,
             const std::string& tok);
+
+// Reverse lookup: the app id this raw token authenticates, if any. Lets a
+// venue learn its server-assigned id from the token alone (no client id).
+std::optional<std::string> resolveAgent(const std::string& dataDir,
+                                        const std::string& tok);
 
 // Mint (or replace) an agent token for an app id. Returns the plaintext token
 // (shown once; only its hash is persisted). Empty on write failure.
