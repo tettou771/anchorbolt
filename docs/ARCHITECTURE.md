@@ -180,11 +180,11 @@ route alone — only the interactive features use the hub.
 
 ## Remote update
 
-With `--allow-update`, the dashboard's **Update** button runs a pipeline on the
-venue machine — by default `git pull --ff-only` → `trusscli update` →
-`trusscli build`, overridable via the config `update` array (prepend
-`trusscli upgrade` to also update TrussC itself; use any commands for non-TrussC
-projects).
+The dashboard's **Update** button (operators, allowed by default) runs a
+pipeline on the venue machine — by default `git pull --ff-only` →
+`trusscli update` → `trusscli build`, overridable via the config `update` array
+(prepend `trusscli upgrade` to also update TrussC itself; use any commands for
+non-TrussC projects).
 
 The pipeline runs **while the old binary keeps running**, so a failed build
 never takes the installation down — the build output streams live into the
@@ -199,8 +199,9 @@ failed attempt remembers the commit it failed at, so a retry on the same commit
 runs fully instead of being skipped. The agent reports the project's git commit
 on every heartbeat, so the wall shows which venue runs which version.
 
-It is remote code execution by definition, hence the explicit `--allow-update`
-opt-in on the venue side.
+It is remote code execution by definition, so it is gated on the operator role
+server-side; a venue that must never be updated remotely opts out with
+`--deny-update`.
 
 ---
 
@@ -218,9 +219,11 @@ keycodes), and hover is forwarded throttled to ~20/s so hover-reactive
 installations respond without flooding the channel. Coordinates scale by the
 app's real window size (from health), not the downscaled frame.
 
-Control requires **both** the operator role (server side) and `--allow-control`
-(venue side), and the app must opt into input injection with
-`mcp::registerDebuggerTools()`.
+Control requires the operator role (server side) and an app that opted into
+input injection with `mcp::registerDebuggerTools()` — that is the whole gate,
+no venue flag. A mutating tool exists only if the app registered it, so the
+app's own MCP surface *is* the control opt-in; the venue advertises this
+(`caps.control`) so the dashboard shows the control toggle only when it applies.
 
 ---
 
@@ -287,8 +290,8 @@ image block — the assistant *sees* the installation), `restart_app`, and the
 passthrough uses two fixed proxies with the venue as an argument, rather than
 mirroring every app's tools into the fleet's tool list — so the list stays fixed
 no matter how many venues connect. Roles apply: viewers get the read-only tools;
-`restart_app` and mutating `app_call` need operator (and the venue's
-`--allow-control` still applies on top).
+`restart_app` and mutating `app_call` need operator (and a mutating tool exists
+only if the app registered it).
 
 > **Open-mode caution:** with no operators registered, `/mcp` grants everyone
 > admin — which means remote restart to anyone with the URL. Register an

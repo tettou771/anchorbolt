@@ -151,10 +151,10 @@ ingress:
     service: http://localhost:54722
 ```
 
-**会場側** — コントロールを有効化するだけ：
+**会場側** — 追加は何も要りません：
 
 ```bash
-anchorbolt start -p myApp --server https://ops.example.com --allow-control
+anchorbolt start -p myApp --server https://ops.example.com
 ```
 
 `https://` のサーバーは「前段に TLS 終端プロキシが居る」ことを意味するので、会場は規約に従いハブを `wss://<同じホスト>/ws` で探します——上の ingress と一致します。会場ごとの WS フラグは不要です。（変則的なパスのプロキシだけ `--ws-url wss://host/other` を明示。）
@@ -163,9 +163,9 @@ anchorbolt start -p myApp --server https://ops.example.com --allow-control
 
 ![リモートコントロール付きのライブビュー](images/live.png)
 
-リモートコントロールには、operator ロール（サーバー側）と `--allow-control`（会場側）の*両方*が必要で、さらにアプリが `mcp::registerDebuggerTools()` でオプトインしていなければなりません。監視だけなら HTTP のルートだけで足ります。
+リモートコントロールに必要なのは、operator ロール（サーバー側）と、アプリが `mcp::registerDebuggerTools()` でオプトインしていること——これがゲートのすべてで、会場側フラグは不要です。control トグルはアプリが入力ツールを出しているときだけ現れます。監視だけなら HTTP のルートだけで足ります。
 
-> リモートアップデートも同じ形です：`--allow-update` を追加すると、詳細ビューの **Update** ボタンが、アプリを動かしたまま会場マシン上で `git pull` ＋リビルドを実行し、成功したときだけ切り替えます。
+> リモートアップデートはデフォルトで operator に許可されています——詳細ビューの **Update** ボタンが、アプリを動かしたまま会場マシン上で `git pull` ＋リビルドを実行し、成功したときだけ切り替えます。絶対に遠隔更新されたくない会場は `--deny-update` でオプトアウトします。
 
 ---
 
@@ -191,7 +191,6 @@ anchorbolt start -p myApp --server https://ops.example.com --pair 483201
   "args": ["--fullscreen"],
   "server": "https://ops.example.com",
   "tokenFile": "osaka.token",
-  "allowControl": true,
   "watchdogTimeout": 10,
   "sinks": [ { "preset": "slack", "urlFile": "slack.url" } ]
 }

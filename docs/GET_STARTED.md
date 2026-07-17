@@ -185,10 +185,10 @@ ingress:
     service: http://localhost:54722
 ```
 
-**venue** — just opt into control:
+**venue** — nothing extra to add:
 
 ```bash
-anchorbolt start -p myApp --server https://ops.example.com --allow-control
+anchorbolt start -p myApp --server https://ops.example.com
 ```
 
 An `https://` server tells the venue a TLS-terminating proxy is in front, so it
@@ -201,13 +201,15 @@ Now the detail view has a **Live** button. Click it to watch the screen; toggle
 
 ![Live view with remote control](images/live.png)
 
-Remote control needs *both* the operator role (server side) and `--allow-control`
-(venue side), and the app must opt in with `mcp::registerDebuggerTools()`.
-Monitoring alone needs only the HTTP route.
+Remote control needs the operator role (server side) and an app that opted in
+with `mcp::registerDebuggerTools()` — that's the whole gate, no venue flag. The
+control toggle only appears when the app exposes input tools. Monitoring alone
+needs only the HTTP route.
 
-> Remote update is the same shape: add `--allow-update`, and the detail view's
+> Remote update is allowed for operators by default — the detail view's
 > **Update** button runs `git pull` + rebuild on the venue while the app keeps
-> running, switching over only on success.
+> running, switching over only on success. A venue that must never be updated
+> remotely opts out with `--deny-update`.
 
 ---
 
@@ -242,7 +244,6 @@ from; `anchorbolt start` next to an `anchorbolt.json` picks it up automatically:
   "args": ["--fullscreen"],
   "server": "https://ops.example.com",
   "tokenFile": "osaka.token",
-  "allowControl": true,
   "watchdogTimeout": 10,
   "sinks": [ { "preset": "slack", "urlFile": "slack.url" } ]
 }
