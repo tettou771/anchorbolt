@@ -12,7 +12,8 @@
 #include "Sink.h"
 
 #include <TrussC.h>
-#include <impl/httplib.h>
+#include <impl/httplib.h>   // localhost MCP calls only (plain http)
+#include <tcxCurl.h>        // fleet-server push (needs https over the tunnel)
 #include <tcWebSocketClient.h>
 
 #include <algorithm>
@@ -461,30 +462,30 @@ struct LogBatch {
 class ServerPush {
 public:
     ServerPush(const string& url, const string& appId, const string& token)
-        : cli_(url), appId_(appId) {
-        cli_.set_connection_timeout(2, 0);
-        cli_.set_read_timeout(2, 0);
-        if (!token.empty()) {
-            cli_.set_default_headers({{"Authorization", "Bearer " + token}});
-        }
+        : appId_(appId) {
+        // tcxCurl (libcurl + native TLS) so the push works over an https tunnel;
+        // httplib here is built without OpenSSL and rejects https:// outright.
+        cli_.setBaseUrl(url);
+        cli_.setTimeout(2);
+        if (!token.empty()) cli_.setBearerToken(token);
     }
 
     void heartbeat(Json health) {
         health["app"] = appId_;
-        auto res = cli_.Post("/api/heartbeat", dumpSafe(health), "application/json");
-        report(res && res->status == 200, "heartbeat");
+        auto res = cli_.request("POST", "/api/heartbeat", dumpSafe(health), "application/json");
+        report(res.statusCode == 200, "heartbeat");
     }
 
     void thumbnail(const vector<unsigned char>& jpg) {
-        auto res = cli_.Post("/api/thumb/" + appId_,
-                             string((const char*)jpg.data(), jpg.size()), "image/jpeg");
-        report(res && res->status == 200, "thumbnail");
+        auto res = cli_.request("POST", "/api/thumb/" + appId_,
+                                string((const char*)jpg.data(), jpg.size()), "image/jpeg");
+        report(res.statusCode == 200, "thumbnail");
     }
 
     void image(const string& name, const vector<unsigned char>& jpg) {
-        auto res = cli_.Post("/api/image/" + appId_ + "/" + name,
-                             string((const char*)jpg.data(), jpg.size()), "image/jpeg");
-        report(res && res->status == 200, "image");
+        auto res = cli_.request("POST", "/api/image/" + appId_ + "/" + name,
+                                string((const char*)jpg.data(), jpg.size()), "image/jpeg");
+        report(res.statusCode == 200, "image");
     }
 
     // Supervisor/app event for the dashboard (badge + event list). Best-effort
@@ -495,8 +496,8 @@ public:
             {"at", getTimestampString("%Y-%m-%dT%H:%M:%S")},
             {"event", event},
             {"text", text}}})}};
-        auto res = cli_.Post("/api/alert/" + appId_, dumpSafe(body), "application/json");
-        report(res && res->status == 200, "alert");
+        auto res = cli_.request("POST", "/api/alert/" + appId_, dumpSafe(body), "application/json");
+        report(res.statusCode == 200, "alert");
     }
 
     // src is "app" (the app's TRUSSC_LOG_FILE) or "sup" (supervisor events).
@@ -504,8 +505,8 @@ public:
     bool logs(const string& src, const LogBatch& b) {
         Json body = {{"src", src}, {"file", b.file},
                      {"start", b.start}, {"end", b.end}, {"lines", b.lines}};
-        auto res = cli_.Post("/api/log/" + appId_, dumpSafe(body), "application/json");
-        bool ok = res && res->status == 200;
+        auto res = cli_.request("POST", "/api/log/" + appId_, dumpSafe(body), "application/json");
+        bool ok = res.statusCode == 200;
         report(ok, "log");
         return ok;
     }
@@ -521,7 +522,7 @@ private:
         }
     }
 
-    httplib::Client cli_;
+    tcx::curl::HttpClient cli_;
     string appId_;
     bool reachable_ = true;  // assume up so the first failure logs
 };
@@ -674,12 +675,12 @@ public:
     CommandChannel(const StartOptions& opt, fs::path logDir)
         : opt_(opt), logDir_(std::move(logDir)) {
         if (!opt.wsUrl.empty()) {
-            // Explicit override: a reverse proxy / Cloudflare tunnel routes a
-            // PATH (e.g. wss://host/ws) to the hub, so the host:port+1 guess
-            // below can't reach it. Use it verbatim.
+            // Explicit override, only needed for a proxy that routes the hub to
+            // a non-standard path (something other than the /ws convention below).
             url_ = opt.wsUrl;
         } else {
-            // ws://host:wsPort/ derived from the HTTP server URL.
+            // Derive the hub URL from --server. Strip scheme + path, keep host
+            // and any explicit :port.
             string url = opt.serverUrl;
             bool tls = url.rfind("https://", 0) == 0;
             if (tls) url = url.substr(8);
@@ -688,13 +689,21 @@ public:
             if (slash != string::npos) url = url.substr(0, slash);
             size_t colon = url.find(':');
             string host = (colon == string::npos) ? url : url.substr(0, colon);
-            int wsPort = opt.wsPort;
-            if (wsPort == 0) {
+
+            if (tls && opt.wsPort == 0) {
+                // An https --server means a TLS-terminating proxy / tunnel sits
+                // in front, routing by PATH on 443 — a separate port+1 isn't
+                // exposed. Convention: the hub is at /ws on the same host (see
+                // the cloudflared ingress in the docs). No per-venue flag needed.
+                url_ = "wss://" + host + "/ws";
+            } else {
+                // Plain LAN (http), or an explicit --ws-port: the hub is reached
+                // directly at http-port + 1.
                 int httpPort = tls ? 443 : 80;
                 if (colon != string::npos) httpPort = stoi(url.substr(colon + 1));
-                wsPort = httpPort + 1;
+                int wsPort = opt.wsPort ? opt.wsPort : httpPort + 1;
+                url_ = (tls ? "wss://" : "ws://") + host + ":" + to_string(wsPort) + "/";
             }
-            url_ = (tls ? "wss://" : "ws://") + host + ":" + to_string(wsPort) + "/";
         }
 
         openL_ = ws_.onOpen.listen([this]() {
@@ -1539,18 +1548,18 @@ int cmdStart(const vector<string>& args) {
             cerr << "anchorbolt start: --pair needs --server <fleet url>" << endl;
             return 1;
         }
-        httplib::Client cli(opt.serverUrl);
-        cli.set_connection_timeout(5, 0);
-        cli.set_read_timeout(5, 0);
-        auto res = cli.Post("/api/pair", Json({{"code", opt.pairCode}}).dump(), "application/json");
-        if (!res || res->status != 200) {
+        tcx::curl::HttpClient cli;
+        cli.setBaseUrl(opt.serverUrl);
+        cli.setTimeout(5);
+        auto res = cli.request("POST", "/api/pair", Json({{"code", opt.pairCode}}).dump(), "application/json");
+        if (res.statusCode != 200) {
             cerr << "anchorbolt start: pairing failed"
-                 << (res ? " (HTTP " + to_string(res->status) + ": " + res->body + ")"
-                         : " (server " + opt.serverUrl + " unreachable)") << endl;
+                 << (res.statusCode ? " (HTTP " + to_string(res.statusCode) + ": " + res.body + ")"
+                                    : " (server " + opt.serverUrl + " unreachable)") << endl;
             return 1;
         }
         Json pr;
-        try { pr = Json::parse(res->body); } catch (...) {
+        try { pr = Json::parse(res.body); } catch (...) {
             cerr << "anchorbolt start: pairing response was not JSON" << endl;
             return 1;
         }
