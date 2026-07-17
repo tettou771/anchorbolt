@@ -1156,10 +1156,21 @@ bool loadConfig(const fs::path& path, StartOptions& opt) {
 fs::path platformLogDir(const string& appId);  // defined below
 
 fs::path pairTokenFile(const fs::path& runPath) {
+    // Key by binary name + a hash of the absolute path, so two same-named apps
+    // installed at different paths get distinct token files (no cross-adoption
+    // of one venue's id/token by another). The name stays in the dir for
+    // readability; the full path is also written into the JSON so a human can
+    // tell which install a file belongs to. FNV-1a (not std::hash) so the key
+    // is stable across builds and platforms — a moved install re-pairs, which
+    // is the intended behavior.
     string key = runPath.stem().string();
     for (char& c : key)
         if (!isalnum((unsigned char)c) && c != '-' && c != '_' && c != '.') c = '-';
-    return platformLogDir(key) / "anchorbolt.token.json";
+    uint64_t h = 1469598103934665603ull;
+    for (unsigned char c : runPath.string()) { h ^= c; h *= 1099511628211ull; }
+    char hex[17];
+    snprintf(hex, sizeof(hex), "%016llx", (unsigned long long)h);
+    return platformLogDir(key + "-" + hex) / "anchorbolt.token.json";
 }
 
 // Adopt a persisted {id, token} as a base: only fills fields nothing else set,
@@ -1764,7 +1775,8 @@ int cmdStart(const vector<string>& args) {
         error_code ec;
         fs::create_directories(pf.parent_path(), ec);
         { ofstream out(pf, ios::trunc);
-          if (out) out << Json({{"id", opt.appId}, {"token", opt.token}}).dump(2) << "\n"; }
+          if (out) out << Json({{"id", opt.appId}, {"token", opt.token},
+                                {"path", runPath.string()}}).dump(2) << "\n"; }
         if (fs::exists(pf, ec)) {
 #ifndef _WIN32
             // Owner read/write only — it holds a token. (Windows: %LOCALAPPDATA%
