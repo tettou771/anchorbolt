@@ -94,6 +94,8 @@ struct LogLine {
 struct AppState {
     Json     health;                                // last heartbeat payload
     chrono::steady_clock::time_point lastSeen{};
+    int64_t  lastSeenUnix = 0;                      // wall-clock last report (0 = never); persisted
+    bool     hidden = false;                        // hidden from the wall (restorable)
     vector<unsigned char> thumb;                    // latest JPEG
     uint64_t thumbSeq = 0;                          // bumped per upload (cache busting)
     map<string, ImageSlot> images;                  // custom statusImage uploads
@@ -155,6 +157,67 @@ void preloadAppLogs(const fs::path& dataDir, const string& id, AppState& st) {
             st.logs.push_back(LogLine{st.nextLogSeq++, j.value("at", ""),
                                       j.value("src", "app"), j.value("text", "")});
         } catch (...) {}
+    }
+}
+
+// The known-apps registry: id -> {lastSeen (unix), health, hidden}. Persisting
+// it lets the wall survive a serve restart — apps come back as offline cards
+// (with their last screenshot + last-seen) so history stays browsable, and the
+// hidden flag lives here too. Written on a timer / at shutdown / when hidden
+// toggles, never per heartbeat.
+fs::path appsRegistryPath(const fs::path& dataDir) { return dataDir / "apps.json"; }
+
+void flushAppRegistry(const fs::path& dataDir) {
+    Json reg = Json::object();
+    {
+        lock_guard<mutex> lock(g_appsMutex);
+        for (auto& [id, st] : g_apps) {
+            if (st.lastSeenUnix == 0 && !st.hidden) continue;  // never reported, not hidden
+            reg[id] = {{"lastSeen", st.lastSeenUnix}, {"hidden", st.hidden}, {"health", st.health}};
+        }
+    }
+    error_code ec;
+    fs::create_directories(dataDir, ec);
+    ofstream out(appsRegistryPath(dataDir));
+    if (out) out << reg.dump() << "\n";
+}
+
+// Load the registry at startup: recreate each app as an offline entry with its
+// last-seen reconstructed (so ageSec shows the real staleness) and its newest
+// stored thumbnail loaded for the card. Live reports then update them in place.
+void loadAppRegistry(const fs::path& dataDir) {
+    ifstream in(appsRegistryPath(dataDir));
+    if (!in) return;
+    Json reg;
+    try { reg = Json::parse(in); } catch (...) { return; }
+    if (!reg.is_object()) return;
+    auto nowSteady = chrono::steady_clock::now();
+    int64_t nowUnix = (int64_t)time(nullptr);
+    error_code ec;
+    lock_guard<mutex> lock(g_appsMutex);
+    for (auto& [id, e] : reg.items()) {
+        if (!e.is_object()) continue;
+        auto& st = g_apps[id];
+        st.lastSeenUnix = e.value("lastSeen", (int64_t)0);
+        st.hidden = e.value("hidden", false);
+        st.health = e.value("health", Json::object());
+        int64_t age = nowUnix - st.lastSeenUnix;
+        if (st.lastSeenUnix > 0 && age >= 0)
+            st.lastSeen = nowSteady - chrono::seconds(age);   // real offline duration
+        // Newest stored thumbnail (YYYYMMDD-HHMMSS.jpg) for the offline card.
+        fs::path latest; string latestName;
+        for (auto& f : fs::directory_iterator(dataDir / id / "thumbs", ec)) {
+            string n = f.path().filename().string();
+            if (n.size() == 19 && n.compare(15, 4, ".jpg") == 0 && n > latestName) {
+                latestName = n; latest = f.path();
+            }
+        }
+        if (!latest.empty()) {
+            ifstream tin(latest, ios::binary);
+            string data((istreambuf_iterator<char>(tin)), istreambuf_iterator<char>());
+            st.thumb.assign(data.begin(), data.end());
+            st.thumbSeq = 1;
+        }
     }
 }
 
@@ -759,6 +822,13 @@ const char* kDashboardHtml = R"HTML(<!DOCTYPE html>
           overflow: hidden; cursor: pointer; }
   .card:hover { border-color: #3d4450; }
   .card.stale { border-color: #7a3030; }
+  .card.stale .thumbWrap img { filter: blur(3px) brightness(.4) grayscale(.4); }
+  .offlay { position: absolute; inset: 0; display: flex; flex-direction: column;
+            align-items: center; justify-content: center; gap: 3px; text-align: center;
+            padding: 8px; text-shadow: 0 1px 4px #000; }
+  .offlay[hidden] { display: none; }
+  .offlay .who { font-weight: 600; font-size: 15px; color: #eceff3; }
+  .offlay .ago { font-size: 12px; color: #ff9a8a; }
   .thumbWrap { position: relative; aspect-ratio: 16 / 10; background: #0e0f12; }
   .thumbWrap img { position: absolute; inset: 0; width: 100%; height: 100%;
                    object-fit: contain; }
@@ -1322,7 +1392,8 @@ function card(app) {
   el.className = 'card';
   el.id = 'app-' + app.id;
   el.innerHTML = `
-    <div class="thumbWrap"><span class="none">no thumbnail</span><img hidden></div>
+    <div class="thumbWrap"><span class="none">no thumbnail</span><img hidden>
+      <div class="offlay" hidden><span class="who"></span><span class="ago"></span></div></div>
     <div class="meta">
       <span class="name"><span class="dot"></span><span class="label"></span><span class="abadge" hidden></span></span>
       <span class="stats"></span>
@@ -2041,14 +2112,23 @@ async function refresh() {
   const alive = new Set();
 
   for (const app of apps) {
+    if (app.hidden) continue;             // hidden from the wall (still in settings)
     alive.add('app-' + app.id);
     let el = document.getElementById('app-' + app.id);
     if (!el) { el = card(app); grid.appendChild(el); }
 
+    const offline = app.reported && app.ageSec > STALE_SEC;
     el.classList.toggle('stale', app.ageSec > STALE_SEC);
     el.dataset.group = app.group || '';
     el.querySelector('.label').textContent = app.id;
     el.querySelector('.stats').textContent = wallStats(app);
+    // Offline: the last screenshot is blurred (CSS) with a text overlay on top.
+    const off = el.querySelector('.offlay');
+    off.hidden = !offline;
+    if (offline) {
+      off.querySelector('.who').textContent = app.id;
+      off.querySelector('.ago').textContent = wallStats(app) || 'offline';
+    }
     const badge = el.querySelector('.abadge');
     badge.hidden = !(app.alerts > 0);
     if (app.alerts > 0) badge.textContent = '\u26a0 ' + app.alerts;
@@ -2173,7 +2253,7 @@ async function loadSettingsApps() {
   try { apps = await (await fetch('/api/apps')).json(); } catch {}
   try { agents = await (await fetch('/api/admin/agents')).json(); } catch {}
   const byIdMap = new Map();
-  for (const a of apps) byIdMap.set(a.id, { id: a.id, group: a.group || '', hash: null });
+  for (const a of apps) byIdMap.set(a.id, { id: a.id, group: a.group || '', hash: null, hidden: !!a.hidden });
   for (const g of agents) {
     const e = byIdMap.get(g.id) || { id: g.id, group: '', hash: null };
     e.hash = g.hashPrefix || '';
@@ -2201,6 +2281,14 @@ async function loadSettingsApps() {
     pc.className = 'sBtn'; pc.textContent = 'Pairing code';
     pc.addEventListener('click', () => mintPairCode(a.id));
     const tdX = document.createElement('td'); tdX.className = 'acts'; tdX.append(pc);
+    // Hide/Show on the wall (restorable, not a delete).
+    const hb = document.createElement('button');
+    hb.className = 'sBtn'; hb.textContent = a.hidden ? 'Show' : 'Hide'; hb.style.marginLeft = '4px';
+    hb.addEventListener('click', async () => {
+      await stPost('/api/admin/app/hide', { app: a.id, hidden: !a.hidden });
+      loadSettingsApps();
+    });
+    tdX.append(hb);
     if (a.hash !== null) {
       const rv = document.createElement('button');
       rv.className = 'sBtn danger'; rv.textContent = 'Revoke'; rv.style.marginLeft = '4px';
@@ -2211,6 +2299,7 @@ async function loadSettingsApps() {
       });
       tdX.append(rv);
     }
+    if (a.hidden) tr.style.opacity = '.5';   // hidden from the wall
     tr.append(stCell(a.id), tdG, tdT, tdX);
     return tr;
   }));
@@ -2616,6 +2705,19 @@ int cmdServe(const vector<string>& args) {
         res.set_content("ok", "text/plain");
     });
 
+    // Hide an app from the wall (restorable — not a delete). Kept in the app
+    // registry, so it stays hidden across restarts; flushed immediately.
+    svr.Post("/api/admin/app/hide", [dataDir, requireRole, parseBody](const httplib::Request& req, httplib::Response& res) {
+        if (!requireRole(req, res, 3)) return;
+        Json body;
+        if (!parseBody(req, res, body)) return;
+        string app = body.value("app", "");
+        if (!validAppId(app)) { res.status = 400; res.set_content("invalid app id", "text/plain"); return; }
+        { lock_guard<mutex> lock(g_appsMutex); g_apps[app].hidden = body.value("hidden", true); }
+        flushAppRegistry(dataDir);
+        res.set_content("ok", "text/plain");
+    });
+
     svr.Get("/api/admin/operators", [dataDir, requireRole](const httplib::Request& req, httplib::Response& res) {
         if (!requireRole(req, res, 3)) return;
         res.set_content(dumpSafeS(token::listOperators(dataDir.string())), "application/json");
@@ -2833,6 +2935,7 @@ int cmdServe(const vector<string>& args) {
             preloadAppLogs(dataDir, id, st);   // seed the log ring on first contact
             st.health = body;
             st.lastSeen = chrono::steady_clock::now();
+            st.lastSeenUnix = (int64_t)time(nullptr);
         }
         // Append to the day's JSONL (DB-free storage; rotation by filename).
         fs::path dir = dataDir / id;
@@ -3207,6 +3310,7 @@ int cmdServe(const vector<string>& args) {
                             {"thumbSeq", st.thumbSeq},
                             {"images", images},
                             {"live", g_agents.live(id)},
+                            {"hidden", st.hidden},
                             {"alerts", st.unackedAlerts},
                             {"health", st.health}});
         }
@@ -3308,6 +3412,9 @@ int cmdServe(const vector<string>& args) {
     signal(SIGINT, onSignal);
     signal(SIGTERM, onSignal);
 
+    // Bring known apps back as offline cards so the wall survives a restart.
+    loadAppRegistry(dataDir);
+
     // svr.listen() blocks; a watcher thread turns the signal flag into stop().
     thread stopWatcher([&svr]() {
         while (!g_stop) this_thread::sleep_for(chrono::milliseconds(100));
@@ -3322,6 +3429,16 @@ int cmdServe(const vector<string>& args) {
             for (int i = 0; i < 36000 && !g_stop; ++i) {
                 this_thread::sleep_for(chrono::milliseconds(100));
             }
+        }
+    });
+
+    // Persist the app registry every ~30s (and once at shutdown, below) so
+    // offline cards + hidden flags survive a restart without per-heartbeat I/O.
+    thread registrar([dataDir]() {
+        while (!g_stop) {
+            for (int i = 0; i < 300 && !g_stop; ++i)
+                this_thread::sleep_for(chrono::milliseconds(100));
+            flushAppRegistry(dataDir);
         }
     });
 
@@ -3342,6 +3459,8 @@ int cmdServe(const vector<string>& args) {
     g_stop = true;
     stopWatcher.join();
     pruner.join();
+    registrar.join();
+    flushAppRegistry(dataDir);   // final snapshot so nothing since the last flush is lost
     g_agents.hub.stop();
 
     if (!ok && !stoppedBySignal) {
