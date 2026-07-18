@@ -86,7 +86,7 @@ struct StartOptions {
     string wsUrl;                // explicit ws(s):// override (bypasses host:port+1
                                  // derivation — needed behind a reverse proxy /
                                  // Cloudflare tunnel that routes a PATH to the hub)
-    bool   denyUpdate = false;   // opt out of remote update/rollback on this venue
+    bool   denyUpdate = false;   // opt out of remote update/rollback for this app
                                  // (default: allowed for operators). Control needs
                                  // no flag — a tool exists only if the app
                                  // registered it (registerDebuggerTools).
@@ -305,7 +305,7 @@ string quotePath(const string& s) {
 }
 
 // Current commit of the project (short hash), for the fleet dashboard —
-// "which venue runs which version" at a glance. Empty if not a git checkout.
+// "which app runs which version" at a glance. Empty if not a git checkout.
 string gitHash(const string& projectDir) {
     if (projectDir.empty()) return "";
 #ifdef _WIN32
@@ -713,7 +713,7 @@ public:
                 // An https --server means a TLS-terminating proxy / tunnel sits
                 // in front, routing by PATH on 443 — a separate port+1 isn't
                 // exposed. Convention: the hub is at /ws on the same host (see
-                // the cloudflared ingress in the docs). No per-venue flag needed.
+                // the cloudflared ingress in the docs). No per-app flag needed.
                 url_ = "wss://" + host + "/ws";
             } else {
                 // Plain LAN (http), or an explicit --ws-port: the hub is reached
@@ -881,11 +881,11 @@ private:
             reply["ok"] = true;
             reply["result"] = {{"message", "restart initiated"}};
         } else if (action == "update") {
-            // Allowed by default (server-side operator role is the gate); a venue
+            // Allowed by default (server-side operator role is the gate); an app
             // that must never be remotely updated opts out with --deny-update.
             if (opt_.denyUpdate) {
                 reply["ok"] = false;
-                reply["error"] = "blocked by supervisor: this venue was started with --deny-update";
+                reply["error"] = "blocked by supervisor: this app was started with --deny-update";
             } else if (g_updateRunning) {
                 reply["ok"] = false;
                 reply["error"] = "an update is already running";
@@ -900,7 +900,7 @@ private:
             error_code ec;
             if (opt_.denyUpdate) {
                 reply["ok"] = false;
-                reply["error"] = "blocked by supervisor: this venue was started with --deny-update";
+                reply["error"] = "blocked by supervisor: this app was started with --deny-update";
             } else if (g_updateRunning) {
                 reply["ok"] = false;
                 reply["error"] = "an update is running; wait for it to finish";
@@ -1181,13 +1181,13 @@ bool loadConfig(const fs::path& path, StartOptions& opt) {
 // guards against). The location is keyed by the BINARY NAME (stable across
 // the pairing run and later restarts); the server-assigned id lives INSIDE
 // the file. Read back on later (non-pair) runs as the lowest-priority token
-// source, so a venue keeps its token across restarts.
+// source, so an app keeps its token across restarts.
 fs::path platformLogDir(const string& appId);  // defined below
 
 fs::path pairTokenFile(const fs::path& runPath) {
     // Key by binary name + a hash of the absolute path, so two same-named apps
     // installed at different paths get distinct token files (no cross-adoption
-    // of one venue's id/token by another). The name stays in the dir for
+    // of one app's id/token by another). The name stays in the dir for
     // readability; the full path is also written into the JSON so a human can
     // tell which install a file belongs to. FNV-1a (not std::hash) so the key
     // is stable across builds and platforms — a moved install re-pairs, which
@@ -1216,7 +1216,7 @@ void readPairTokenFile(const fs::path& file, StartOptions& opt) {
 }
 
 // Ask the fleet server which id this agent token authenticates (POST
-// /api/whoami). Lets a venue run with just its token and no client-side id.
+// /api/whoami). Lets an app run with just its token and no client-side id.
 optional<string> resolveIdFromServer(const string& serverUrl, const string& token) {
     tcx::curl::HttpClient cli;
     cli.setBaseUrl(serverUrl);
@@ -1232,7 +1232,7 @@ optional<string> resolveIdFromServer(const string& serverUrl, const string& toke
     return nullopt;
 }
 
-// Redeem a 6-digit pairing code at the fleet server for this venue's
+// Redeem a 6-digit pairing code at the fleet server for this app's
 // server-assigned id + agent token. Fills opt on success; sets err otherwise.
 bool redeemPairCode(const string& serverUrl, const string& code,
                     StartOptions& opt, string& err) {
@@ -1276,7 +1276,7 @@ bool stdinIsTty() {
 // called without a TTY, so systemd/launchd runs stay non-interactive.
 bool promptOnboard(StartOptions& opt) {
     for (int attempt = 0; attempt < 3; ++attempt) {
-        cout << "This venue has no token yet. Enter a 6-digit pairing code from the\n"
+        cout << "This app has no token yet. Enter a 6-digit pairing code from the\n"
                 "dashboard, or paste an agent token (tc-...): " << flush;
         string line;
         if (!getline(cin, line)) return false;  // EOF / closed stdin
@@ -1664,7 +1664,7 @@ static void printConfigTemplate() {
         "  // Remote control (input injection) needs no flag: it works only if the app\n"
         "  // registered debugger tools (mcp::registerDebuggerTools). Remote update\n"
         "  // (git pull + rebuild) is allowed by default for operators; set denyUpdate\n"
-        "  // true to refuse it on this venue.\n"
+        "  // true to refuse it for this app.\n"
         "  // \"denyUpdate\": false,\n"
         "\n"
         "  // Restart the app if it stops answering the health check for this long, in\n"
@@ -1710,7 +1710,7 @@ int cmdStart(const vector<string>& args) {
     const bool pairArg = !opt.pairCode.empty();  // now that flags are parsed
 
     // --pair <code>: before anything else, redeem the code at the fleet server
-    // for this venue's id + agent token. No tc-... string ever gets copied by
+    // for this app's id + agent token. No tc-... string ever gets copied by
     // hand — the operator pastes a 6-digit code they read off the dashboard.
     if (!opt.pairCode.empty()) {
         if (opt.serverUrl.empty()) {
@@ -1749,7 +1749,7 @@ int cmdStart(const vector<string>& args) {
 
     // Fleet identity. Joining a fleet (--server) is secure by default: it needs
     // an agent token (from `token agent new` or a pairing code), and the id is
-    // derived from that token server-side — never supplied by the venue. A
+    // derived from that token server-side — never supplied by the app. A
     // token with no cached id resolves once via /api/whoami, then persists.
     bool resolvedId = false;
     if (!opt.serverUrl.empty()) {
@@ -1920,7 +1920,7 @@ int cmdStart(const vector<string>& args) {
         // day continue the same file.
         string logFile = (logDir / ("app-" + getTimestampString("%Y-%m-%d") + ".log")).string();
         // Once per app run (it only changes through updates): the commit the
-        // dashboard shows next to this venue.
+        // dashboard shows next to this app.
         string appGit = gitHash(opt.projectDir);
         // Claimed at spawn, not at loop exit: the flag is raised BEFORE the
         // update-restart, and it's the run AFTER that restart being audited.

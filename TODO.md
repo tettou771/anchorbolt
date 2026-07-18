@@ -5,16 +5,11 @@ This file tracks what's left, roughly in priority order.
 
 ## Deferred / out of scope for now
 
-- **Serve-side sink notifications.** The Notifier/sink engine lives on the
-  venue (`start`) only; serve has no push channel. Wiring it into serve would
-  let "approval pending" ping slack/ntfy — until then the dashboard badge and
-  `anchorbolt approvals list` are the ways to notice a queued call.
-
 - **`tc::fromBase64` — core side DONE (TrussC dev, 2026-07-18)**: header +
   api-reference.toml + luagen + web regen shipped. Remaining here: swap the two
   vendored copies (Start.cpp / Serve.cpp) for `tc::fromBase64` once every
   machine that builds anchorbolt runs a TrussC that has it (it must not break
-  a venue building against an older main).
+  a venue machine building against an older main).
 - **CP932 / mojibake at ingest (Windows).** `dumpSafe` (U+FFFD) stops the
   crash, but a localized MSVC's build output shows as replacement chars on the
   dashboard — decode the console codepage at ingest. Windows-only; verify on a
@@ -24,6 +19,18 @@ This file tracks what's left, roughly in priority order.
 
 ## Done
 
+Serve-side sink notifications: gear → Notify tab, fleet-wide sinks stored in
+`config/notify.json` (slack / discord / ntfy / uptime-kuma presets + generic
+JSON-template webhook, per-sink `events` / `scope` filters, per-row Test
+button, `/help/notify` walkthroughs); serve-only `approval` / `offline` /
+`online` events (`--offline-after`, default 120s).
+
+Data-dir layout v0.8.1: `config/` (apps.json roster = tokens + groups + hidden
+merged, operators.json, shares.json, notify.json — renamed from sinks.json) /
+`state/` (sessions, codes, approvals, apps-health, approval-decisions/) /
+`apps/<id>/` (JSONL + thumbs + images); old flat dirs auto-migrated at serve
+startup.
+
 Approval queue for AI-driven mutating calls: fleet `/mcp` restart_app +
 mutating app_call queue for human approval by default (`--auto-approve` opts
 out, `--approval-ttl` default 900s); the call waits ~20s for a decision, then
@@ -31,7 +38,8 @@ returns a ticket polled via the read-only `get_approval` tool; deciders are the
 dashboard Approvals badge/panel (operator+ within scope) and `anchorbolt
 approvals list|approve|deny` on the server machine (unique id prefixes; id
 optional when exactly one is pending; decisions travel as one-file-per-decision
-under approval-decisions/ so the CLI never races serve's approvals.json). The
+under state/approval-decisions/ so the CLI never races serve's
+state/approvals.json). The
 /mcp surface has no approve tool — an AI cannot approve its own request.
 
 Delivery cursor / offline spool; serve retention `--keep-days`; remote update
@@ -55,13 +63,13 @@ from the token via `/api/whoami`; **secure by default** — no agent open mode;
 interactive onboarding (TTY prompt for a pairing code / token); short `--help`
 + `--verbose`; `--generate-config`; dashboard UX (2-line wall cards, 3-row
 detail header, plain health dot, Clear empties the event list, no bogus
-last-seen for unreported venues); default boot grace 120s; pair-token file keyed
+last-seen for unreported apps); default boot grace 120s; pair-token file keyed
 by binary *path* (not just name) + path recorded inside it; **`--allow-control` /
 `--allow-update` removed** — control auto-detected from `registerDebuggerTools`,
 update operator-gated with `--deny-update` opt-out, capability-gated dashboard
 buttons; log-panel preload from disk after a serve restart; log date picker +
 zip export (logs + images, today / 30d / all); screenshot scrubber (today +
 past days, timelapse play); **share links** (viewer-scoped URL, scope + expiry,
-auto-login, `shares.json`); Windows console-subsystem fix (`TRUSSC_SHOW_CONSOLE`
+auto-login, `config/shares.json`); Windows console-subsystem fix (`TRUSSC_SHOW_CONSOLE`
 in local.cmake + core `TRUSSC_LIBRARY_TU` guard); WS Ping→Pong so a tunnel
 doesn't reap the command channel (restores the live/control flag).

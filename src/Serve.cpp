@@ -81,7 +81,7 @@ struct ServeOptions {
     int    wsPort   = 0;      // 0 = port + 1
     string dataDir  = "anchorbolt-data";
     int    keepDays = 90;     // server-side retention (0 = keep forever);
-                              // independent of any venue's local --log-keep
+                              // independent of any app's local --log-keep
     bool   autoApprove = false;  // execute mutating /mcp calls directly (no queue)
     int    approvalTtlSec = 900; // pending approvals expire after this
     int    offlineAfterSec = 120; // heartbeat silence before the offline event
@@ -155,18 +155,41 @@ mutex g_approvalsMutex;
 bool g_autoApprove = false;
 int  g_approvalTtlSec = 900;
 
-fs::path approvalsPath(const fs::path& dataDir) { return dataDir / "approvals.json"; }
+// ---- data-dir layout (v0.8.1) ---------------------------------------------
+// config/ = human-set (kept on cleanup), state/ = machine-made (safe to wipe),
+// apps/<id>/ = per-app content (logs/screenshots; delete per client). A dir
+// without config/ is the legacy flat layout: serve migrates it at startup
+// (migrateDataDir); these helpers keep addressing the legacy spots until then
+// so the `approvals` CLI works against an un-migrated dir too.
+bool newLayout(const fs::path& dataDir) { return fs::exists(dataDir / "config"); }
+
+fs::path appContentDir(const fs::path& dataDir, const string& id) {
+    return newLayout(dataDir) ? dataDir / "apps" / id : appContentDir(dataDir, id);
+}
+
+fs::path approvalsPath(const fs::path& dataDir) {
+    return newLayout(dataDir) ? dataDir / "state" / "approvals.json"
+                              : dataDir / "approvals.json";
+}
+
+fs::path decisionsDir(const fs::path& dataDir) {
+    return newLayout(dataDir) ? dataDir / "state" / "approval-decisions"
+                              : dataDir / "approval-decisions";
+}
 
 // ---- serve-side notify (sinks) --------------------------------------------
-// Same engine as the venue's `sinks` config, configured fleet-wide in ONE
+// Same engine as the app-side `sinks` config, configured fleet-wide in ONE
 // place: <dataDir>/sinks.json (settings "Notify" tab edits it). Each sink can
 // scope to groups / "app:<id>" — an app:<id>-only sink behaves like the same
-// sink configured on that venue. Events: everything venues push (restart/up/
+// sink configured on that app. Events: everything apps push (restart/up/
 // down/update/stop/alert) plus serve-only approval / offline / online.
 shared_ptr<Notifier> g_serveNotifier;
 mutex g_serveNotifierMutex;
 
-fs::path sinksPath(const fs::path& dataDir) { return dataDir / "sinks.json"; }
+fs::path sinksPath(const fs::path& dataDir) {
+    return newLayout(dataDir) ? dataDir / "config" / "notify.json"
+                              : dataDir / "sinks.json";
+}
 
 // (Re)build the notifier from sinks.json. Returns how many sinks are armed.
 int loadServeSinks(const fs::path& dataDir) {
@@ -184,9 +207,9 @@ int loadServeSinks(const fs::path& dataDir) {
         }
     }
     auto cfgs = parseSinks(arr, dataDir);
-    // uptime-kuma needs one monitor per venue: allow it only when scoped to
+    // uptime-kuma needs one monitor per app: allow it only when scoped to
     // exactly one app (then it beats while THAT app's heartbeats are fresh —
-    // venue parity). Broader scopes have no sound "healthy" semantics here.
+    // parity with an app-side sink). Broader scopes have no sound "healthy" semantics here.
     for (auto it = cfgs.begin(); it != cfgs.end();) {
         if (it->heartbeat &&
             !(it->scope.size() == 1 && it->scope[0].rfind("app:", 0) == 0)) {
@@ -264,11 +287,11 @@ void loadApprovals(const fs::path& dataDir) {
     }
 }
 
-// After a serve restart the in-memory log ring is empty, but the venue keeps its
+// After a serve restart the in-memory log ring is empty, but the agent keeps its
 // own cursor and won't re-ship history — so the detail panel would show nothing
 // until fresh lines arrive. On an app's first contact this session, seed the ring
 // from the tail of its most recent on-disk log-YYYY-MM-DD.jsonl. Done per-app on
-// contact (not for every dir at boot) so long-gone venues aren't resurrected.
+// contact (not for every dir at boot) so long-gone apps aren't resurrected.
 // Caller holds g_appsMutex.
 void preloadAppLogs(const fs::path& dataDir, const string& id, AppState& st) {
     if (st.preloaded) return;
@@ -276,7 +299,7 @@ void preloadAppLogs(const fs::path& dataDir, const string& id, AppState& st) {
     error_code ec;
     fs::path latest;
     string latestName;
-    for (auto& e : fs::directory_iterator(dataDir / id, ec)) {
+    for (auto& e : fs::directory_iterator(appContentDir(dataDir, id), ec)) {
         string n = e.path().filename().string();
         if (n.rfind("log-", 0) == 0 && n.size() >= 6 &&
             n.compare(n.size() - 6, 6, ".jsonl") == 0 && n > latestName) {
@@ -303,24 +326,27 @@ void preloadAppLogs(const fs::path& dataDir, const string& id, AppState& st) {
     }
 }
 
-// The known-apps registry: id -> {lastSeen (unix), health, hidden}. Persisting
-// it lets the wall survive a serve restart — apps come back as offline cards
-// (with their last screenshot + last-seen) so history stays browsable, and the
-// hidden flag lives here too. Written on a timer / at shutdown / when hidden
-// toggles, never per heartbeat.
-fs::path appsRegistryPath(const fs::path& dataDir) { return dataDir / "apps.json"; }
+// The health cache: id -> {lastSeen (unix), health}. Persisting it lets the
+// wall survive a serve restart — apps come back as offline cards (with their
+// last screenshot + last-seen) so history stays browsable. Pure machine state
+// (state/apps-health.json); the admin-set hidden flag lives in the config
+// roster instead. Written on a timer / at shutdown, never per heartbeat.
+fs::path appsRegistryPath(const fs::path& dataDir) {
+    return newLayout(dataDir) ? dataDir / "state" / "apps-health.json"
+                              : dataDir / "apps.json";
+}
 
 void flushAppRegistry(const fs::path& dataDir) {
     Json reg = Json::object();
     {
         lock_guard<mutex> lock(g_appsMutex);
         for (auto& [id, st] : g_apps) {
-            if (st.lastSeenUnix == 0 && !st.hidden) continue;  // never reported, not hidden
-            reg[id] = {{"lastSeen", st.lastSeenUnix}, {"hidden", st.hidden}, {"health", st.health}};
+            if (st.lastSeenUnix == 0) continue;  // never reported
+            reg[id] = {{"lastSeen", st.lastSeenUnix}, {"health", st.health}};
         }
     }
     error_code ec;
-    fs::create_directories(dataDir, ec);
+    fs::create_directories(appsRegistryPath(dataDir).parent_path(), ec);
     ofstream out(appsRegistryPath(dataDir));
     if (out) out << reg.dump() << "\n";
 }
@@ -337,16 +363,18 @@ void loadAppRegistry(const fs::path& dataDir) {
     auto nowSteady = chrono::steady_clock::now();
     int64_t nowUnix = (int64_t)time(nullptr);
     error_code ec;
-    // A venue whose token was revoked can never report again — don't resurrect
+    // An app whose token was revoked can never report again — don't resurrect
     // it as an un-fulfillable card. Keep it only if it still holds a token, or
-    // it was explicitly hidden (a kept-but-off-wall app).
-    set<string> agentIds;
+    // it was explicitly hidden (a kept-but-off-wall app; hidden is config now).
+    set<string> agentIds, hiddenIds;
     for (auto& a : token::listAgents(dataDir.string()))
         agentIds.insert(a.value("id", ""));
+    for (auto& h : token::hiddenApps(dataDir.string()))
+        hiddenIds.insert(h.get<string>());
     lock_guard<mutex> lock(g_appsMutex);
     for (auto& [id, e] : reg.items()) {
         if (!e.is_object()) continue;
-        bool hidden = e.value("hidden", false);
+        bool hidden = hiddenIds.count(id) > 0;
         if (!hidden && !agentIds.count(id)) continue;   // revoked & not hidden -> drop
         auto& st = g_apps[id];
         st.lastSeenUnix = e.value("lastSeen", (int64_t)0);
@@ -357,7 +385,7 @@ void loadAppRegistry(const fs::path& dataDir) {
             st.lastSeen = nowSteady - chrono::seconds(age);   // real offline duration
         // Newest stored thumbnail (YYYYMMDD-HHMMSS.jpg) for the offline card.
         fs::path latest; string latestName;
-        for (auto& f : fs::directory_iterator(dataDir / id / "thumbs", ec)) {
+        for (auto& f : fs::directory_iterator(appContentDir(dataDir, id) / "thumbs", ec)) {
             string n = f.path().filename().string();
             if (n.size() == 19 && n.compare(15, 4, ".jpg") == 0 && n > latestName) {
                 latestName = n; latest = f.path();
@@ -388,12 +416,12 @@ int64_t parseStampName(const string& n) {
     } catch (...) { return 0; }
 }
 
-// Every provisioned venue (an agent token in tokens.json) is a known app, even
+// Every provisioned app (an agent token in the roster) is a known app, even
 // if it hasn't reported to this build yet — so the wall matches the settings
 // Apps list. Seed a g_apps entry for each; ones the registry already filled keep
 // their state. For the rest, recover last-seen + the last screenshot from the
-// venue's own stored thumbnails (a known app, not a directory scan) so it shows
-// as an offline card; a venue with no history stays "waiting for first report".
+// app's own stored thumbnails (a known app, not a directory scan) so it shows
+// as an offline card; an app with no history stays "waiting for first report".
 void loadKnownAgents(const fs::path& dataDir) {
     Json agents = token::listAgents(dataDir.string());
     auto nowSteady = chrono::steady_clock::now();
@@ -406,7 +434,7 @@ void loadKnownAgents(const fs::path& dataDir) {
         auto& st = g_apps[id];
         if (st.lastSeenUnix != 0) continue;   // registry already gave it real state
         fs::path latest; string latestName;
-        for (auto& f : fs::directory_iterator(dataDir / id / "thumbs", ec)) {
+        for (auto& f : fs::directory_iterator(appContentDir(dataDir, id) / "thumbs", ec)) {
             string n = f.path().filename().string();
             if (n.size() == 19 && n.compare(15, 4, ".jpg") == 0 && n > latestName) {
                 latestName = n; latest = f.path();
@@ -423,6 +451,75 @@ void loadKnownAgents(const fs::path& dataDir) {
         st.thumb.assign(data.begin(), data.end());
         st.thumbSeq = 1;
     }
+    // Hidden is admin-set config: stamp it onto (or create) the entries.
+    for (auto& h : token::hiddenApps(dataDir.string()))
+        g_apps[h.get<string>()].hidden = true;
+}
+
+// One-shot layout migration to config/ + state/ + apps/ (v0.8.1). Idempotent:
+// keyed on the config/ dir existing. Runs ONLY here in serve — the CLI reads
+// whichever layout is present but never migrates, so it can't race an old
+// serve still writing the flat files.
+void migrateDataDir(const fs::path& dataDir) {
+    if (newLayout(dataDir)) return;
+    error_code ec;
+    if (!fs::exists(dataDir)) return;   // fresh dir: created lazily in new layout
+    fs::create_directories(dataDir / "state", ec);
+    fs::create_directories(dataDir / "apps", ec);
+
+    // Merge tokens.json + groups.json + apps.json(hidden) -> config/apps.json,
+    // and strip hidden out of the health cache on its way to state/.
+    Json apps = Json::object();
+    auto load = [&](const char* name) -> Json {
+        ifstream in(dataDir / name);
+        if (!in) return Json::object();
+        try { Json j = Json::parse(in); return j.is_object() ? j : Json::object(); }
+        catch (...) { return Json::object(); }
+    };
+    Json tokens = load("tokens.json");
+    for (auto& [id, h] : tokens.items()) if (h.is_string()) apps[id]["token"] = h;
+    Json groups = load("groups.json");
+    for (auto& [id, g] : groups.items())
+        if (g.is_string() && !g.get<string>().empty()) apps[id]["group"] = g;
+    Json reg = load("apps.json");
+    Json health = Json::object();
+    for (auto& [id, e] : reg.items()) {
+        if (!e.is_object()) continue;
+        if (e.value("hidden", false)) apps[id]["hidden"] = true;
+        if (e.value("lastSeen", (int64_t)0) != 0)
+            health[id] = {{"lastSeen", e["lastSeen"]}, {"health", e.value("health", Json::object())}};
+    }
+    // Everything below config/ marks the layout as migrated — write it LAST-ish
+    // but before moves that depend on the gate; order here: create config now.
+    fs::create_directories(dataDir / "config", ec);
+    { ofstream out(dataDir / "config" / "apps.json"); out << apps.dump(2) << "\n"; }
+    { ofstream out(dataDir / "state" / "apps-health.json"); out << health.dump() << "\n"; }
+    fs::remove(dataDir / "tokens.json", ec);
+    fs::remove(dataDir / "groups.json", ec);
+    fs::remove(dataDir / "apps.json", ec);
+
+    auto mv = [&](const char* from, const fs::path& to) {
+        if (fs::exists(dataDir / from)) fs::rename(dataDir / from, to, ec);
+    };
+    mv("operators.json", dataDir / "config" / "operators.json");
+    mv("shares.json",    dataDir / "config" / "shares.json");
+    mv("sinks.json",     dataDir / "config" / "notify.json");
+    mv("sessions.json",  dataDir / "state" / "sessions.json");
+    mv("codes.json",     dataDir / "state" / "codes.json");
+    mv("approvals.json", dataDir / "state" / "approvals.json");
+    mv("approval-decisions", dataDir / "state" / "approval-decisions");
+
+    // Every remaining root directory is per-app content -> apps/<id>/.
+    int moved = 0;
+    for (auto& e : fs::directory_iterator(dataDir, ec)) {
+        if (!e.is_directory()) continue;
+        string n = e.path().filename().string();
+        if (n == "config" || n == "state" || n == "apps") continue;
+        fs::rename(e.path(), dataDir / "apps" / n, ec);
+        if (!ec) ++moved;
+    }
+    logNotice("anchorbolt") << "data dir migrated to config/ + state/ + apps/ ("
+                            << moved << " app dir(s) moved)";
 }
 
 atomic<bool> g_stop{false};
@@ -520,7 +617,7 @@ bool opSeesApp(const optional<token::Operator>& op, const string& dataDir,
 }
 
 // --- server-side retention ----------------------------------------------------
-// Independent policy from any venue's local --log-keep (deletions never
+// Independent policy from any app's local --log-keep (deletions never
 // propagate in either direction; the server typically keeps LONGER than the
 // kiosk). All timestamps live in filenames, so pruning is pure string math —
 // no mtime, no parsing.
@@ -576,9 +673,10 @@ void pruneData(const fs::path& dataDir, int keepDays) {
 
     error_code ec;
     int removed = 0;
-    for (auto& appDir : fs::directory_iterator(dataDir, ec)) {
+    fs::path contentRoot = newLayout(dataDir) ? dataDir / "apps" : dataDir;
+    for (auto& appDir : fs::directory_iterator(contentRoot, ec)) {
         error_code e2;
-        if (!appDir.is_directory(e2)) continue;  // skips tokens.json etc.
+        if (!appDir.is_directory(e2)) continue;  // legacy layout: skips *.json
         if (!dropDate.empty()) {
             // Daily JSONL (heartbeat-YYYY-MM-DD.jsonl / log-YYYY-MM-DD.jsonl):
             // compare the date embedded in the name against the cutoff.
@@ -814,7 +912,7 @@ Json enqueueApproval(const fs::path& dataDir, Approval a) {
 vector<fs::path> dailyFiles(const fs::path& dataDir, const string& app, const string& prefix) {
     vector<fs::path> out;
     error_code ec;
-    for (auto& e : fs::directory_iterator(dataDir / app, ec)) {
+    for (auto& e : fs::directory_iterator(appContentDir(dataDir, app), ec)) {
         string n = e.path().filename().string();
         if (n.rfind(prefix, 0) == 0 && n.size() > 6 &&
             n.compare(n.size() - 6, 6, ".jsonl") == 0) {
@@ -1070,7 +1168,7 @@ Json fleetToolCall(const fs::path& dataDir, const string& name, const Json& args
         string day = args.value("day", "");
         vector<string> names;
         error_code ec;
-        for (auto& e : fs::directory_iterator(dataDir / app / "thumbs", ec)) {
+        for (auto& e : fs::directory_iterator(appContentDir(dataDir, app) / "thumbs", ec)) {
             string n = e.path().filename().string();
             if (n.size() == 19 && n.compare(15, 4, ".jpg") == 0) {
                 string stamp = n.substr(0, 15);
@@ -1088,7 +1186,7 @@ Json fleetToolCall(const fs::path& dataDir, const string& name, const Json& args
         string at = args.value("at", "");
         vector<string> names;
         error_code ec;
-        for (auto& e : fs::directory_iterator(dataDir / app / "thumbs", ec)) {
+        for (auto& e : fs::directory_iterator(appContentDir(dataDir, app) / "thumbs", ec)) {
             string n = e.path().filename().string();
             if (n.size() == 19 && n.compare(15, 4, ".jpg") == 0) names.push_back(n);
         }
@@ -1104,7 +1202,7 @@ Json fleetToolCall(const fs::path& dataDir, const string& name, const Json& args
             }
             if (pick.empty()) pick = names.front();
         }
-        ifstream in(dataDir / app / "thumbs" / pick, ios::binary);
+        ifstream in(appContentDir(dataDir, app) / "thumbs" / pick, ios::binary);
         vector<unsigned char> jpg((istreambuf_iterator<char>(in)), istreambuf_iterator<char>());
         if (jpg.empty()) return mcpError("could not read " + pick);
         return mcpImage(jpg, Json{{"app", app}, {"at", pick.substr(0, 15)}});
@@ -1130,7 +1228,7 @@ Json fleetToolCall(const fs::path& dataDir, const string& name, const Json& args
         string toolName = args.value("tool", "");
         if (toolName.empty()) return mcpError("'tool' is required (see app_list_tools)");
         // Read-only passthrough for viewers; anything else needs operator here.
-        // On the venue, a mutating tool exists only if the app registered it.
+        // App-side, a mutating tool exists only if the app registered it.
         if (toolName.rfind("tc_get_", 0) != 0 && rank < 2) {
             return mcpError("'" + toolName + "' is not read-only; it needs the operator role");
         }
@@ -1500,7 +1598,7 @@ R"HTML(
         <input id="sPairApp" placeholder="app-id for a new pairing code">
         <button class="sBtn" id="sPairBtn">Pairing code</button>
       </div>
-      <div class="sNote">A pairing code lets a venue run
+      <div class="sNote">A pairing code lets an app's machine run
         <code>anchorbolt start --pair &lt;code&gt;</code> to fetch its token — no
         <code>tc-...</code> string is copied by hand.</div>
       <div class="sReveal" id="sPairOut" hidden></div>
@@ -1546,11 +1644,11 @@ R"HTML(
         <span style="flex:1"></span>
         <a class="sHelpLink" href="/help/notify" target="_blank" rel="noopener">How to get a webhook URL &nearr;</a>
       </div>
-      <div class="sNote">Fleet-wide notifications, one place for every venue.
+      <div class="sNote">Fleet-wide notifications, one place for every app.
         <b>events</b>: comma list of restart, up, down, update, stop, alert,
         approval, offline, online — blank = all. <b>scope</b>: groups /
         <code>app:&lt;id&gt;</code> like operator scope — blank = every app.
-        A venue's own <code>sinks</code> config keeps working independently.</div>
+        An app's own <code>sinks</code> config keeps working independently.</div>
       <div class="sReveal" id="sSinkOut" hidden></div>
     </div>
   </div>
@@ -2100,7 +2198,7 @@ async function renderDetail() {
   if (app.group) dg.textContent = '[' + app.group + ']';
   // The action buttons ride the command channel, so they only make sense when
   // the agent's WS is connected and the operator can act. Update/Rollback show
-  // only if the venue allows update (it advertises this); Restart is always
+  // only if the app allows update (it advertises this); Restart is always
   // there for an operator. Viewers get no action row.
   const caps = (app.health && app.health.caps) || {};
   const canOperate = myRole !== 'viewer';   // null (open mode) / operator / admin
@@ -2345,7 +2443,7 @@ function startLiveView() {
   document.getElementById('dLiveWrap').hidden = false;
   document.getElementById('dLiveStatus').textContent = 'waiting for stream...';
   // Control needs the operator role AND an app that exposes input tools (the
-  // venue advertises caps.control). myRole===null is open mode (allowed).
+  // app advertises caps.control). myRole===null is open mode (allowed).
   const ctlApp = lastApps.find(a => a.id === detailId);
   const canControl = myRole !== 'viewer' &&
                      !!(ctlApp && (ctlApp.health || {}).caps && ctlApp.health.caps.control);
@@ -2930,7 +3028,7 @@ byId('sSinkSave').addEventListener('click', async () => {
 R"HTML(
 
 // One "Apps" table over every app-id this server knows: the union of apps
-// that have reported and app-ids that hold an agent token (a venue can be
+// that have reported and app-ids that hold an agent token (an app can be
 // provisioned before it first connects). Each row carries its group and its
 // token status — "app" and "agent token" are the same identity, so they live
 // together instead of in two mismatched sections.
@@ -3086,7 +3184,7 @@ async function mintPairCode(app) {
   if (r.ok) {
     const j = await r.json();
     stReveal('sPairOut', 'pairing code for ' + app + ': ' + j.code + '  (valid 10 min)\n'
-      + 'venue: anchorbolt start --pair ' + j.code + ' --server <this server url>');
+      + 'on the app machine: anchorbolt start --pair ' + j.code + ' --server <this server url>');
     loadSettingsApps();   // a code provisions the app-id — show it in the table
   } else {
     stReveal('sPairOut', 'error: ' + (await r.text()));
@@ -3165,7 +3263,7 @@ the Notify tab, hit <b>Test</b>, then <b>Save all</b>.</p>
   <li>Add a monitor of type <b>Push</b>; Kuma shows a push URL
       (<code>.../api/push/&lt;token&gt;</code>). Paste that.</li>
   <li>Scope the sink to exactly one app (<code>app:&lt;id&gt;</code>) — Kuma
-      gets pinged while that venue's heartbeats stay fresh and alerts when
+      gets pinged while that app's heartbeats stay fresh and alerts when
       they stop.</li>
 </ol>
 
@@ -3192,7 +3290,7 @@ int cmdServe(const vector<string>& args) {
     }
 
     // Agent authentication: every ingest request and WS hello must present a
-    // valid token for its app id. Secure by default — a venue reaches the fleet
+    // valid token for its app id. Secure by default — an app reaches the fleet
     // only with a token minted here (via `token agent new` or a pairing code);
     // there is no open mode, so knowing the URL alone gets you nothing.
     auto authOk = [dataDir](const httplib::Request& req, const string& appId) {
@@ -3471,8 +3569,10 @@ int cmdServe(const vector<string>& args) {
         if (!parseBody(req, res, body)) return;
         string app = body.value("app", "");
         if (!validAppId(app)) { res.status = 400; res.set_content("invalid app id", "text/plain"); return; }
-        { lock_guard<mutex> lock(g_appsMutex); g_apps[app].hidden = body.value("hidden", true); }
-        flushAppRegistry(dataDir);
+        bool hidden = body.value("hidden", true);
+        // hidden is admin-set -> persisted in the config roster, mirrored here.
+        token::setHidden(dataDir.string(), app, hidden);
+        { lock_guard<mutex> lock(g_appsMutex); g_apps[app].hidden = hidden; }
         res.set_content("ok", "text/plain");
     });
 
@@ -3693,7 +3793,7 @@ int cmdServe(const vector<string>& args) {
         res.set_content("ok", "text/plain");
     });
 
-    // Mint a single-use pairing code for a venue (app-id). The venue redeems it
+    // Mint a single-use pairing code for an app. Its supervisor redeems it
     // with `anchorbolt start --pair <code>` — no token ever gets copied by hand.
     svr.Post("/api/admin/pair-code", [dataDir, requireRole, parseBody](const httplib::Request& req, httplib::Response& res) {
         if (!requireRole(req, res, 3)) return;
@@ -3738,11 +3838,11 @@ int cmdServe(const vector<string>& args) {
         string app = redeemed->second;
         string tok = token::mintAgent(dataDir.string(), app);
         if (tok.empty()) { res.status = 500; res.set_content("could not mint token", "text/plain"); return; }
-        logNotice("anchorbolt") << "paired venue '" << app << "' via code";
+        logNotice("anchorbolt") << "paired app '" << app << "' via code";
         res.set_content(dumpSafeS(Json({{"app", app}, {"token", tok}})), "application/json");
     });
 
-    // Token -> id: a venue started with only its agent token (no client-side
+    // Token -> id: an app started with only its agent token (no client-side
     // id) resolves its server-assigned id here once, then caches it. The token
     // is the credential; a bad one just 401s.
     svr.Post("/api/whoami", [dataDir](const httplib::Request& req, httplib::Response& res) {
@@ -3842,17 +3942,17 @@ int cmdServe(const vector<string>& args) {
             st.lastSeenUnix = (int64_t)time(nullptr);
         }
         // Append to the day's JSONL (DB-free storage; rotation by filename).
-        fs::path dir = dataDir / id;
+        fs::path dir = appContentDir(dataDir, id);
         error_code ec;
         fs::create_directories(dir, ec);
         Json line = {{"at", getTimestampString("%Y-%m-%dT%H:%M:%S")}, {"health", body}};
         ofstream out(dir / ("heartbeat-" + getTimestampString("%Y-%m-%d") + ".jsonl"), ios::app);
         out << line.dump() << "\n";
-        // Tell the venue whether we currently hold its command-channel WS. The
+        // Tell the agent whether we currently hold its command-channel WS. The
         // heartbeat is HTTP (independent of the WS), so it still reaches us when
         // the WS is half-open — e.g. after a serve restart or a dropped tunnel,
-        // where the venue's socket looks Open but we have no record of it. The
-        // venue reconnects on wsConnected=false, restoring live/control.
+        // where the agent's socket looks Open but we have no record of it. The
+        // agent reconnects on wsConnected=false, restoring live/control.
         res.set_content(Json{{"ok", true}, {"wsConnected", g_agents.live(id)}}.dump(),
                         "application/json");
     });
@@ -3890,7 +3990,7 @@ int cmdServe(const vector<string>& args) {
             }
         }
         if (!dup) {
-            fs::path dir = dataDir / id / "thumbs";
+            fs::path dir = appContentDir(dataDir, id) / "thumbs";
             error_code ec;
             fs::create_directories(dir, ec);
             ofstream out(dir / (getTimestampString("%Y%m%d-%H%M%S") + ".jpg"), ios::binary);
@@ -3928,7 +4028,7 @@ int cmdServe(const vector<string>& args) {
             }
         }
         if (!dup) {
-            fs::path dir = dataDir / id / "images" / name;
+            fs::path dir = appContentDir(dataDir, id) / "images" / name;
             error_code ec;
             fs::create_directories(dir, ec);
             ofstream out(dir / (getTimestampString("%Y%m%d-%H%M%S") + ".jpg"), ios::binary);
@@ -3971,7 +4071,7 @@ int cmdServe(const vector<string>& args) {
         string bfile = body.value("file", "");
         int64_t bend = body.value("end", (int64_t)0);
         string now = getTimestampString("%H:%M:%S");
-        fs::path dir = dataDir / id;
+        fs::path dir = appContentDir(dataDir, id);
         error_code ec;
         fs::create_directories(dir, ec);
         lock_guard<mutex> lock(g_appsMutex);
@@ -4055,8 +4155,8 @@ int cmdServe(const vector<string>& args) {
                 if (!data.empty()) z.add(zprefix + n, data);
             }
         };
-        addJpegs(dataDir / id / "thumbs", "thumbs/");
-        for (auto& nd : fs::directory_iterator(dataDir / id / "images", ec)) {
+        addJpegs(appContentDir(dataDir, id) / "thumbs", "thumbs/");
+        for (auto& nd : fs::directory_iterator(appContentDir(dataDir, id) / "images", ec)) {
             if (nd.is_directory(ec))
                 addJpegs(nd.path(), "images/" + nd.path().filename().string() + "/");
         }
@@ -4077,7 +4177,7 @@ int cmdServe(const vector<string>& args) {
             bool ok = date.size() == 10 && date[4] == '-' && date[7] == '-';
             for (char c : date) if (c != '-' && !isdigit((unsigned char)c)) ok = false;
             if (!ok) { res.status = 400; res.set_content("bad date", "text/plain"); return; }
-            ifstream in(dataDir / id / ("log-" + date + ".jsonl"));
+            ifstream in(appContentDir(dataDir, id) / ("log-" + date + ".jsonl"));
             deque<Json> tail;
             string ln;
             while (getline(in, ln)) {
@@ -4127,7 +4227,7 @@ int cmdServe(const vector<string>& args) {
             res.status = 400;
             return;
         }
-        fs::path dir = dataDir / id;
+        fs::path dir = appContentDir(dataDir, id);
         error_code ec;
         fs::create_directories(dir, ec);
         ofstream out(dir / ("alert-" + getTimestampString("%Y-%m-%d") + ".jsonl"), ios::app);
@@ -4143,7 +4243,7 @@ int cmdServe(const vector<string>& args) {
             if (line.text.empty()) continue;
             out << Json({{"at", line.at}, {"event", ev}, {"text", line.text}}).dump() << "\n";
             // Fan out to serve-side sinks too (fleet-wide notify config); the
-            // venue's own sinks fire independently — both configured = both
+            // app's own sinks fire independently — both configured = both
             // deliver, by design.
             serveNotify(dataDir, id, ev, line.text);
             st.alerts.push_back(std::move(line));
@@ -4201,7 +4301,7 @@ int cmdServe(const vector<string>& args) {
         string id = req.matches[1];
         if (!validAppId(id)) { res.status = 400; return; }
         if (!appVisible(req, id)) { res.status = 404; return; }
-        ifstream in(dataDir / id / ("heartbeat-" + getTimestampString("%Y-%m-%d") + ".jsonl"));
+        ifstream in(appContentDir(dataDir, id) / ("heartbeat-" + getTimestampString("%Y-%m-%d") + ".jsonl"));
         deque<string> lines;
         string line;
         while (getline(in, line)) {
@@ -4232,7 +4332,7 @@ int cmdServe(const vector<string>& args) {
             string group = (groups.contains(id) && groups[id].is_string())
                                ? groups[id].get<string>() : "";
             if (op && !token::inScope(*op, id, group)) continue;
-            // A provisioned venue (agent token / WS connect) can be in the map
+            // A provisioned app (agent token / WS connect) can be in the map
             // before its first heartbeat; lastSeen is still zero then, so report
             // it as unreported rather than "last seen <uptime> ago".
             bool reported = st.lastSeen != chrono::steady_clock::time_point{};
@@ -4265,7 +4365,7 @@ int cmdServe(const vector<string>& args) {
         for (char c : date) if (c != '-') ymd += c;
         error_code ec;
         vector<string> times;
-        for (auto& e : fs::directory_iterator(dataDir / id / "thumbs", ec)) {
+        for (auto& e : fs::directory_iterator(appContentDir(dataDir, id) / "thumbs", ec)) {
             string n = e.path().filename().string();   // YYYYMMDD-HHMMSS.jpg
             if (n.size() == 19 && n.compare(n.size() - 4, 4, ".jpg") == 0 &&
                 n.compare(0, 8, ymd) == 0)
@@ -4287,7 +4387,7 @@ int cmdServe(const vector<string>& args) {
             for (size_t i = 0; i < ts.size(); ++i)
                 if (i != 8 && !isdigit((unsigned char)ts[i])) ok = false;
             if (!ok) { res.status = 400; res.set_content("bad ts", "text/plain"); return; }
-            ifstream in(dataDir / id / "thumbs" / (ts + ".jpg"), ios::binary);
+            ifstream in(appContentDir(dataDir, id) / "thumbs" / (ts + ".jpg"), ios::binary);
             if (!in) { res.status = 404; res.set_content("no such frame", "text/plain"); return; }
             string data((istreambuf_iterator<char>(in)), istreambuf_iterator<char>());
             res.set_content(data, "image/jpeg");
@@ -4349,8 +4449,15 @@ int cmdServe(const vector<string>& args) {
     signal(SIGTERM, onSignal);
 
     // Bring known apps back so the wall survives a restart: registry first
-    // (last-seen + health + thumbnail), then every token-holding venue (so a
+    // (last-seen + health + thumbnail), then every token-holding app (so a
     // provisioned-but-quiet app still shows, matching the settings Apps list).
+    migrateDataDir(dataDir);            // legacy flat layout -> config/state/apps
+    {
+        error_code ec;                  // fresh dir: start in the new layout
+        fs::create_directories(dataDir / "config", ec);
+        fs::create_directories(dataDir / "state", ec);
+        fs::create_directories(dataDir / "apps", ec);
+    }
     loadAppRegistry(dataDir);
     loadKnownAgents(dataDir);
     loadApprovals(dataDir);
@@ -4390,10 +4497,10 @@ int cmdServe(const vector<string>& args) {
         }
     });
 
-    // Offline/online watcher for the notify sinks: a venue that stops
+    // Offline/online watcher for the notify sinks: an app that stops
     // heartbeating can't report its own death — only serve can see the
     // silence. First pass only baselines (a serve restart must not re-announce
-    // every long-gone venue); transitions after that fire offline / online.
+    // every long-gone app); transitions after that fire offline / online.
     // Fresh apps also feed per-app uptime-kuma sinks.
     thread offlineWatcher([dataDir, opt]() {
         bool baseline = true;
@@ -4442,7 +4549,7 @@ int cmdServe(const vector<string>& args) {
     // approval-decisions/ (single writer per file — no shared-file races with
     // our own approvals.json rewrites).
     thread approvalSweeper([dataDir]() {
-        fs::path decDir = dataDir / "approval-decisions";
+        fs::path decDir = decisionsDir(dataDir);
         while (!g_stop) {
             for (int i = 0; i < 20 && !g_stop; ++i)
                 this_thread::sleep_for(chrono::milliseconds(100));
@@ -4543,7 +4650,7 @@ int cmdApprovals(const std::vector<std::string>& args) {
         return 1;
     }
     auto load = [&]() -> Json {
-        ifstream in(fs::path(dataDir) / "approvals.json");
+        ifstream in(approvalsPath(fs::path(dataDir)));
         if (!in) return Json::object();
         try { return Json::parse(in); } catch (...) { return Json::object(); }
     };
@@ -4617,7 +4724,7 @@ int cmdApprovals(const std::vector<std::string>& args) {
         }
         string id = hits[0];
         Json entry = all[id];
-        fs::path decDir = fs::path(dataDir) / "approval-decisions";
+        fs::path decDir = decisionsDir(fs::path(dataDir));
         error_code ec;
         fs::create_directories(decDir, ec);
         {

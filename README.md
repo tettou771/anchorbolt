@@ -4,7 +4,7 @@
 
 [日本語](README.ja.md) ・ [Get started](docs/GET_STARTED.md) ・ [Architecture](docs/ARCHITECTURE.md)
 
-![The fleet wall — every venue at a glance](docs/images/wall.png)
+![The fleet wall — every app at a glance](docs/images/wall.png)
 
 ## Why
 
@@ -17,7 +17,7 @@ be sure".
 
 **AnchorBolt is the ops layer for those installations.** It babysits your app
 on the venue machine — restarts it when it dies or hangs, collects the logs,
-and phones home with a live thumbnail so you can see every venue at a glance
+and phones home with a live thumbnail so you can see every app at a glance
 from your desk. When something needs a human, it can restart, update, or even
 let you drive the app remotely from the browser. Your app needs **zero code
 changes** to get the core of this.
@@ -30,9 +30,9 @@ and notification parts work for any program you can launch.
 
 - **Auto-restart** — watches the app two ways (it exited / it went silent) and
   brings it back. No app code needed.
-- **The wall** — a live thumbnail of every venue in one browser page, green/red
+- **The wall** — a live thumbnail of every app in one browser page, green/red
   at a glance, grouped into tabs.
-- **Logs, always** — the venue's logs are collected locally and shipped to your
+- **Logs, always** — the app's logs are collected locally and shipped to your
   server, surviving hours of network outage and reconnecting where it left off.
 - **Notifications** — a crash, a hang, or an app-raised alert lands in Slack /
   Discord / ntfy / Uptime Kuma, or a red badge on the wall.
@@ -44,7 +44,7 @@ and notification parts work for any program you can launch.
 - **Graphs & status** — fps, memory (the app's and the whole machine's), and
   any numbers/images your app chooses to publish, plotted over time.
 - **For AI** — the server is itself an MCP endpoint, so an assistant can search
-  last night's logs, pull screenshots, and (with permission) restart a venue.
+  last night's logs, pull screenshots, and (with human approval) restart an app.
 - **Access control** — operator logins with roles, per-client visibility scopes,
   and 6-digit codes so nobody copies long secret strings around.
 
@@ -62,15 +62,15 @@ anchorbolt start -p myApp --server https://ops.example.com
 anchorbolt serve
 ```
 
-A venue that only needs local auto-restart can skip `--server` entirely — the
+An app that only needs local auto-restart can skip `--server` entirely — the
 supervisor works fine on its own.
 
-![Clicking a venue opens the detail view: live thumbnail, graphs, events, logs](docs/images/detail.png)
+![Clicking an app opens the detail view: live thumbnail, graphs, events, logs](docs/images/detail.png)
 
 ## Get started
 
 The [Get Started guide](docs/GET_STARTED.md) walks from a 30-second local trial
-to a real deployment behind a Cloudflare tunnel — grouping venues, wiring up
+to a real deployment behind a Cloudflare tunnel — grouping apps, wiring up
 Slack, giving a client a read-only login, and turning on remote control. Each
 step is copy-pasteable.
 
@@ -90,11 +90,11 @@ surface, and the reasoning behind the choices (why it's separate from
 
 ## Status
 
-Feature-complete for real use on **macOS and Linux**; the venue supervisor also
+Feature-complete for real use on **macOS and Linux**; the venue-side supervisor also
 builds for **Windows** (real-hardware verification in progress). It's a young
-tool moving fast — the CLI and dashboard are stable enough to deploy, and the
-remaining roadmap items (an approval queue for AI-driven changes, shareable
-view-only URLs) are additive.
+tool moving fast — the CLI and dashboard are stable enough to deploy, and
+recent additions (the approval queue for AI-driven changes, fleet-wide
+notifications, shareable view-only URLs) all landed as additive layers.
 
 Deliberately a **separate tool from `trusscli`**: the dev CLI builds projects;
 AnchorBolt babysits them in production. See the TrussC ROADMAP (kiosk / fleet

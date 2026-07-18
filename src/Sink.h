@@ -36,7 +36,7 @@ struct SinkConfig {
 };
 
 // Does this sink's scope cover (app, group)? Same semantics as operator scope:
-// empty = all, "all"/"*" = all, "app:<id>" targets one venue, anything else is
+// empty = all, "all"/"*" = all, "app:<id>" targets one app, anything else is
 // a group name.
 bool sinkCovers(const SinkConfig& cfg, const std::string& app,
                 const std::string& group);
@@ -66,7 +66,7 @@ public:
     void healthyTick();
 
     // Serve-side variant: a fresh heartbeat from `app` feeds heartbeat sinks
-    // whose scope is exactly that app ("app:<id>") — the venue-parity case.
+    // whose scope is exactly that app ("app:<id>") — parity with a venue-side sink.
     // Broader kuma scopes are rejected at load time (ambiguous semantics).
     void healthyTick(const std::string& app);
 

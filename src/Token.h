@@ -7,29 +7,33 @@
 
 #include <TrussC.h>  // tc::Json
 
-// Token management, two classes minted on the SERVER side and shown once —
-// only SHA-256 hashes are stored:
+// Token management. Registries live under the data dir's config/ (human-set,
+// kept on cleanup) and state/ (machine-made, safe to wipe); a dir without
+// config/ is the legacy flat layout, which every helper here still reads and
+// writes until serve migrates it at startup.
 //
-//   agent tokens    <data-dir>/tokens.json     {app-id: hash}
-//     publish-only identity for a venue supervisor. Any registered =>
-//     every ingest request / WS hello must authenticate.
+//   config/apps.json       {app-id: {token: hash, group?, hidden?}}
+//     ONE roster per app: the agent token (publish-only identity for the
+//     app's supervisor — any registered => every ingest request / WS hello
+//     must authenticate), its wall group, and the hidden flag. Mirrors the
+//     settings Apps tab.
 //
-//   operator tokens <data-dir>/operators.json  {name: {role, hash, created, scope?}}
+//   config/operators.json  {name: {role, hash, created, scope?}}
 //     humans (and AIs) at the dashboard. Roles: viewer (read-only),
 //     operator (+ restart/update/tools/clear), admin (+ token management).
 //     Any registered => the dashboard requires login (cookie). Optional
 //     "scope" narrows what an operator sees (groups / app:<id>).
 //
-// Empty/absent registry = open mode for that class, so the zero-config
-// path keeps working on trusted networks. Verification re-reads the file
-// per request: revocation is instant, no sessions to invalidate.
+//   config/shares.json     {sha256(share-tok): {scope?, expires, created}}
+//                          — read-only share links delivered as URLs
+//   state/sessions.json    {sha256(session-tok): {name, created}}
+//                          — login-code sessions (resolve to a live operator)
+//   state/codes.json       {6-digit: {kind, subject, expires}}
+//                          — single-use pairing / login codes (10 min TTL)
 //
-// Three auxiliary registries live in the same directory:
-//   <data-dir>/groups.json    {app-id: group-name}     — wall grouping + scope
-//   <data-dir>/sessions.json  {sha256(session-tok): {name, created}}
-//                             — login-code sessions (resolve to a live operator)
-//   <data-dir>/codes.json     {6-digit: {kind, subject, expires}}
-//                             — single-use pairing / login codes (10 min TTL)
+// Tokens are shown once; only SHA-256 hashes are stored. Empty/absent
+// operator registry = open dashboard (bootstrap path). Verification re-reads
+// the file per request: revocation is instant, no sessions to invalidate.
 //
 // CLI: anchorbolt token agent new|revoke <app-id>
 //      anchorbolt token operator new <name> --role viewer|operator|admin [--scope a,app:b]
@@ -46,7 +50,7 @@ bool verify(const std::string& dataDir, const std::string& appId,
             const std::string& tok);
 
 // Reverse lookup: the app id this raw token authenticates, if any. Lets a
-// venue learn its server-assigned id from the token alone (no client id).
+// app learn its server-assigned id from the token alone (no client id).
 std::optional<std::string> resolveAgent(const std::string& dataDir,
                                         const std::string& tok);
 
@@ -114,9 +118,16 @@ tc::Json loadGroups(const std::string& dataDir);
 // The group of one app ("" when ungrouped).
 std::string groupOf(const std::string& dataDir, const std::string& appId);
 
-// Assign (empty group = remove). Persists groups.json.
+// Assign (empty group = remove). Persists the roster (config/apps.json).
 bool setGroup(const std::string& dataDir, const std::string& appId,
               const std::string& group);
+
+// --- hidden flag (wall visibility; admin-set => lives in config) ---
+
+bool setHidden(const std::string& dataDir, const std::string& appId, bool hidden);
+
+// App ids currently hidden, as a JSON array (seeds AppState on serve start).
+tc::Json hiddenApps(const std::string& dataDir);
 
 // --- sessions ---
 

@@ -24,7 +24,7 @@ choices are what they are. For step-by-step usage see the
 
 ## One binary, two roles
 
-AnchorBolt ships as a single executable with three subcommands:
+AnchorBolt ships as a single executable with four subcommands:
 
 - **`anchorbolt start`** — the venue-side supervisor. Launches the app with the
   ops environment injected (`TRUSSC_MCP`, `TRUSSC_MCP_PORT`, `TRUSSC_LOG_FILE`),
@@ -34,9 +34,11 @@ AnchorBolt ships as a single executable with three subcommands:
   DB-free storage, the WebSocket command hub, and the AI-facing `/mcp`.
 - **`anchorbolt token`** — mints and revokes the two token classes on the
   server side.
+- **`anchorbolt approvals`** — lists and decides the AI approval queue from
+  the server machine.
 
-Both ends of the wire protocol live in one codebase, so version skew between a
-venue and its server is structurally impossible.
+Both ends of the wire protocol live in one codebase, so version skew between an
+app and its server is structurally impossible.
 
 Precedence for every setting: **flags > `ANCHORBOLT_TOKEN` env > config file >
 defaults.** The config is JSON with comments allowed; `anchorbolt start` next
@@ -56,7 +58,7 @@ The supervisor watches the app **two independent ways**:
 
 The watchdog is wall-clock from the last healthy reply, not a miss-counter, so
 HTTP timeouts don't stretch the effective window. A boot grace period
-(`--grace`, default 15s) keeps a slow-starting app from being killed before it
+(`--grace`, default 120s) keeps a slow-starting app from being killed before it
 first reports healthy. `--watchdog-timeout 0` supervises process exit only,
 which is what makes AnchorBolt useful for **any** binary, not just TrussC apps
 with an MCP endpoint.
@@ -77,7 +79,7 @@ machine.
 
 ## Log delivery — the offline spool
 
-The venue's logs are the source of truth, always complete, kept locally in daily
+The app's logs are the source of truth, always complete, kept locally in daily
 files. When `--server` is set, they're also shipped — and the shipping is built
 to survive the reality of venue networks, which drop for hours.
 
@@ -113,16 +115,16 @@ httplib) plus a small WebSocket hub. It answers:
 - **Read** (for the dashboard): `GET /api/apps`, `/api/thumb/<id>`,
   `/api/image/<id>/<name>`, `/api/history/<id>` (heartbeat series),
   `/api/log/<id>?after=<seq>`, `/api/alert/<id>?after=<seq>`.
-- **Command bridge**: `POST /api/command/<id>` relays a request to the venue
+- **Command bridge**: `POST /api/command/<id>` relays a request to the app
   over the WebSocket hub and blocks on the reply.
 - **The dashboard** at `/` — one self-contained HTML page, no external assets.
 
-The dashboard shows the **wall** (a live thumbnail per venue, green/red,
+The dashboard shows the **wall** (a live thumbnail per app, green/red,
 grouped into tabs) and, on click, the **detail view**: a bigger live thumbnail,
 fps / memory / custom graphs, custom image streams, the event list, and a
 severity-colored searchable log panel.
 
-**Incident badges:** every venue event (`restart` / `up` / `down` / `update` /
+**Incident badges:** every app event (`restart` / `up` / `down` / `update` /
 `stop` / `alert`) lands in the detail view's event list; incidents
 (`restart` / `down` / `alert`) also light a red badge on the wall card until an
 operator clicks Clear — so "osaka restarted 3 times overnight" is visible the
@@ -132,12 +134,37 @@ next morning without opening anything.
 
 ## Storage and retention
 
-Storage is **DB-free by design**, under `--data` (default `./anchorbolt-data`):
+Storage is **DB-free by design**, under `--data` (default `./anchorbolt-data`),
+split by one question — *would a human have to redo work if this were
+deleted?*:
 
-- daily heartbeat / log / alert JSONL per app (`heartbeat-YYYY-MM-DD.jsonl`, …)
-- timestamp-named JPEGs (`thumbs/YYYYMMDD-HHMMSS.jpg`, and per-name custom
-  images) — the directory *is* the index
-- `tokens.json`, `operators.json`, `groups.json`, `sessions.json`, `codes.json`
+```
+anchorbolt-data/
+├── config/                  # human-set — cleanup keeps this
+│   ├── apps.json            #   {app-id: {token: <sha256>, group, hidden}} — the one roster
+│   ├── operators.json       #   operator accounts (role, hash, scope)
+│   ├── shares.json          #   share links
+│   └── notify.json          #   fleet-wide notification sinks (the Notify tab)
+├── state/                   # machine-made — `rm -rf state/` is safe
+│   ├── sessions.json  codes.json  approvals.json  apps-health.json
+│   └── approval-decisions/
+└── apps/<id>/               # per-app content — delete per client
+    ├── heartbeat-*.jsonl  log-*.jsonl  alert-*.jsonl
+    ├── thumbs/              # timestamp-named JPEGs — the directory *is* the index
+    └── images/<name>/       # custom statusImage streams
+```
+
+- **`config/`** is everything a human set up — app tokens / groups, operators,
+  share links, notification settings. Cleanup never touches it; copy `config/`
+  to move a server.
+- **`state/`** regenerates itself — sessions, login codes, the approval queue,
+  the health cache. Deleting it logs everyone out and nothing more.
+- **`apps/<id>/`** is the big per-client content. When a job ends, delete that
+  one directory.
+
+A data directory from an older release (flat files at the top level) is
+migrated to this layout automatically the first time the new `serve` starts —
+no manual steps.
 
 At installation scale (a few MB/day/app) a file scan answers "the errors around
 2am last night" at ripgrep speed, and append-only files are crash-proof,
@@ -146,7 +173,7 @@ migration-free, and readable with `less` when everything else is broken.
 **Retention** (`--keep-days`, default 90, 0 = forever) prunes stored JSONL and
 images older than the cutoff, hourly. Thumbnails get an extra thinning: the last
 24h is kept complete, older shots thin to one per hour. This is **independent of
-the venue's local `--log-keep`** — deletions never propagate in either
+the venue-side `--log-keep`** — deletions never propagate in either
 direction, and the server typically keeps things *longer* than the kiosk (its
 whole reason to exist is after-the-fact investigation). All pruning is filename
 string math; no mtime, no parsing.
@@ -156,21 +183,21 @@ string math; no mtime, no parsing.
 ## The command channel (WebSocket)
 
 The interactive features — Restart / Update buttons, live view, remote control,
-the AI passthrough — need the server to *talk to* a venue, not just receive from
+the AI passthrough — need the server to *talk to* an app, not just receive from
 it. That runs over a WebSocket:
 
-- Each venue keeps **one outbound WebSocket** to the server's hub (NAT-friendly;
-  the venue dials out, no inbound port at the venue).
+- Each app's agent keeps **one outbound WebSocket** to the server's hub
+  (NAT-friendly; the venue side dials out, no inbound port at the venue).
 - The hub is a minimal RFC6455 server built over TrussC's `TcpServer`, on a
   **separate port** (server port + 1, default 54723) — the vendored httplib has
   no WebSocket support, so the hub is its own thing.
-- Server→venue is `{type:"cmd", id, action, …}`; the reply is
+- Server→agent is `{type:"cmd", id, action, …}`; the reply is
   `{type:"result", id, ok, …}`. `POST /api/command/<id>` bridges an HTTP request
   onto this and blocks on the matching reply (15s timeout).
 
-Behind a reverse proxy or tunnel that exposes a single hostname, the venue can't
-reach `host:port+1`. An `https://` server URL signals a TLS-terminating proxy in
-front, so the venue derives the hub as **`wss://<host>/ws`** by convention —
+Behind a reverse proxy or tunnel that exposes a single hostname, the venue side
+can't reach `host:port+1`. An `https://` server URL signals a TLS-terminating
+proxy in front, so the agent derives the hub as **`wss://<host>/ws`** by convention —
 route that path to the hub in your proxy (the hub ignores the path in its
 handshake, so no server-side change is needed). A non-standard proxy path needs
 an explicit **`--ws-url`**. Either way, monitoring works fully over the HTTP
@@ -197,10 +224,10 @@ Two conveniences: if `git pull` brings nothing new, the default pipeline stops
 there and doesn't touch the app (pressing Update "just in case" is free); and a
 failed attempt remembers the commit it failed at, so a retry on the same commit
 runs fully instead of being skipped. The agent reports the project's git commit
-on every heartbeat, so the wall shows which venue runs which version.
+on every heartbeat, so the wall shows which app runs which version.
 
 It is remote code execution by definition, so it is gated on the operator role
-server-side; a venue that must never be updated remotely opts out with
+server-side; an app that must never be updated remotely opts out with
 `--deny-update`.
 
 ---
@@ -221,8 +248,8 @@ app's real window size (from health), not the downscaled frame.
 
 Control requires the operator role (server side) and an app that opted into
 input injection with `mcp::registerDebuggerTools()` — that is the whole gate,
-no venue flag. A mutating tool exists only if the app registered it, so the
-app's own MCP surface *is* the control opt-in; the venue advertises this
+no venue-side flag. A mutating tool exists only if the app registered it, so the
+app's own MCP surface *is* the control opt-in; the agent advertises this
 (`caps.control`) so the dashboard shows the control toggle only when it applies.
 
 ---
@@ -232,17 +259,18 @@ app's own MCP surface *is* the control opt-in; the venue advertises this
 Two token classes, both minted on the server, shown once, stored only as
 SHA-256 hashes.
 
-**Agent tokens** (`tokens.json`, `{app-id: hash}`) — a venue's publish-only
-identity. There is **no open mode**: every ingest request and WebSocket hello
-must authenticate, so a fleet is closed by default and knowing the URL alone
-grants nothing. The id is bound to the token at mint time; a venue derives its
-id from the token (`POST /api/whoami`, a hash reverse-lookup) rather than
-declaring one — so there is no `--id`, and a leaked agent token's blast radius
-is just that one venue's fake data, never impersonation of another id. A
-venue with no `--server` skips all of this (local-only supervision needs no
-token).
+**Agent tokens** (in `config/apps.json`, `{app-id: {token: <sha256>, group,
+hidden}}` — the one roster, which also carries each app's group and visibility) —
+an app's publish-only identity. There is **no open mode**: every ingest request
+and WebSocket hello must authenticate, so a fleet is closed by default and
+knowing the URL alone grants nothing. The id is bound to the token at mint
+time; an app derives its id from the token (`POST /api/whoami`, a hash
+reverse-lookup) rather than declaring one — so there is no `--id`, and a leaked
+agent token's blast radius is just that one app's fake data, never
+impersonation of another id. An app with no `--server` skips all of this
+(local-only supervision needs no token).
 
-**Operator tokens** (`operators.json`, `{name: {role, hash, created, scope}}`) —
+**Operator tokens** (`config/operators.json`, `{name: {role, hash, created, scope}}`) —
 humans (and AIs) at the dashboard. Roles: **viewer** (read-only), **operator**
 (+ restart / update / control / alert-clear), **admin** (+ the settings page).
 This class *does* have an open mode: with no operator registered the dashboard
@@ -255,10 +283,10 @@ invalidate.
 
 **Scope** narrows what an operator sees: an array of group names or `app:<id>`
 entries; empty = everything. Out-of-scope apps 404 everywhere — the wall, every
-per-app endpoint, and the fleet `/mcp` — so a venue's existence doesn't even
+per-app endpoint, and the fleet `/mcp` — so an app's existence doesn't even
 leak to a scoped client.
 
-**Sessions and 6-digit codes.** Codes (`codes.json`, single-use, 10-min TTL, a
+**Sessions and 6-digit codes.** Codes (`state/codes.json`, single-use, 10-min TTL, a
 global brute-force guard that 429s after 10 failures) serve two flows:
 
 - **Pairing** — `anchorbolt start --pair <code>` trades the code (no auth; the
@@ -267,8 +295,8 @@ global brute-force guard that 429s after 10 failures) serve two flows:
   keyed by binary name so the machine reuses it on later plain runs). No
   `tc-...` string is ever copied by hand.
 - **Login codes** — mint one for an operator; they sign in by typing 6 digits.
-  This mints an `os-...` session token (`sessions.json`) that resolves back
-  through `operators.json`, so revoking the operator kills their sessions
+  This mints an `os-...` session token (`state/sessions.json`) that resolves back
+  through `config/operators.json`, so revoking the operator kills their sessions
   automatically.
 
 ---
@@ -287,9 +315,9 @@ Tools: `list_apps`, `search_logs`, `tail_logs`, `get_events`,
 `get_health_history`, `list_screenshots`, `get_screenshot` (returns a real MCP
 image block — the assistant *sees* the installation), `restart_app`, and the
 `app_list_tools` / `app_call` passthrough to each app's own MCP tools. The
-passthrough uses two fixed proxies with the venue as an argument, rather than
+passthrough uses two fixed proxies with the app as an argument, rather than
 mirroring every app's tools into the fleet's tool list — so the list stays fixed
-no matter how many venues connect. Roles apply: viewers get the read-only tools;
+no matter how many apps connect. Roles apply: viewers get the read-only tools;
 `restart_app` and mutating `app_call` need operator (and a mutating tool exists
 only if the app registered it).
 
@@ -312,11 +340,11 @@ approve tool, so an AI cannot approve its own request:
 - **Server machine:** `anchorbolt approvals list | approve [id] | deny [id]`.
   Ids accept unique prefixes (`approve 3f`); with exactly one pending entry the
   id can be omitted. CLI decisions are written one-file-per-decision under
-  `approval-decisions/` and picked up by serve's sweeper (~2 s), so the CLI
-  never races serve's own `approvals.json` writes and execution — which needs
+  `state/approval-decisions/` and picked up by serve's sweeper (~2 s), so the CLI
+  never races serve's own `state/approvals.json` writes and execution — which needs
   the agent WebSocket — always happens inside serve.
 
-The queue lives in `approvals.json` and survives a serve restart. To find the
+The queue lives in `state/approvals.json` and survives a serve restart. To find the
 data directory without `--data`, the CLI reads the **runtime pointer** serve
 writes at startup — `serve.json` (`dataDir`, `port`, `pid`) in the platform
 state dir (`~/.local/state/anchorbolt/` on Linux, `~/Library/Logs/anchorbolt/`
@@ -400,13 +428,15 @@ it terminates at a reverse proxy, not in AnchorBolt.
 **One templated webhook engine, not per-service adapters.** Slack, Discord,
 ntfy, Kuma and any generic endpoint are the same HTTP POST with a body
 template; presets just prefill it. Adding a service is adding a preset, not an
-adapter.
+adapter. The same engine runs on the venue machine (per-app `sinks` in
+`anchorbolt.json`) and on the server (fleet-wide sinks in `config/notify.json`,
+the dashboard's Notify tab).
 
 **Notifications are one-way; interaction lives in the dashboard.** Webhooks
 push out (aggregated, deduped), but approving a mutating action, driving the
 app, reading logs — those happen in the dashboard, never in a chat app. That
 path leads to a swamp of per-service bots and OAuth.
 
-**Local-first.** Most venues only ever need auto-restart and local logs; the
+**Local-first.** Most apps only ever need auto-restart and local logs; the
 server is for the few who run a fleet. Every server feature is optional — a bare
 `anchorbolt start` is a complete, useful tool on its own.

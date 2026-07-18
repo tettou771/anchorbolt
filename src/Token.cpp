@@ -35,12 +35,79 @@ bool saveRegistry(const string& dataDir, const fs::path& path, const Json& j) {
     return true;
 }
 
-fs::path agentsPath(const string& dataDir)   { return fs::path(dataDir) / "tokens.json"; }
-fs::path operatorsPath(const string& dataDir){ return fs::path(dataDir) / "operators.json"; }
-fs::path groupsPath(const string& dataDir)   { return fs::path(dataDir) / "groups.json"; }
-fs::path sessionsPath(const string& dataDir) { return fs::path(dataDir) / "sessions.json"; }
-fs::path codesPath(const string& dataDir)    { return fs::path(dataDir) / "codes.json"; }
-fs::path sharesPath(const string& dataDir)   { return fs::path(dataDir) / "shares.json"; }
+// Layout (v0.8.1): config/ holds what a human set up (kept on cleanup),
+// state/ holds what the machine regenerates (safe to wipe). A data dir
+// without config/ is the legacy flat layout — serve migrates it at startup;
+// these helpers just address whichever layout is present, so the CLI works
+// against an un-migrated dir too (it never migrates by itself: an old serve
+// could still be running against the flat files).
+bool newLayout(const string& dataDir) {
+    return fs::exists(fs::path(dataDir) / "config");
+}
+
+fs::path operatorsPath(const string& dataDir) {
+    return newLayout(dataDir) ? fs::path(dataDir) / "config" / "operators.json"
+                              : fs::path(dataDir) / "operators.json";
+}
+fs::path sharesPath(const string& dataDir) {
+    return newLayout(dataDir) ? fs::path(dataDir) / "config" / "shares.json"
+                              : fs::path(dataDir) / "shares.json";
+}
+fs::path sessionsPath(const string& dataDir) {
+    return newLayout(dataDir) ? fs::path(dataDir) / "state" / "sessions.json"
+                              : fs::path(dataDir) / "sessions.json";
+}
+fs::path codesPath(const string& dataDir) {
+    return newLayout(dataDir) ? fs::path(dataDir) / "state" / "codes.json"
+                              : fs::path(dataDir) / "codes.json";
+}
+
+// The merged per-app registry, config/apps.json: {id: {token: <sha256>,
+// group: "...", hidden: bool}} — one file mirroring the settings Apps tab.
+// On a legacy dir the same view is assembled from tokens.json + groups.json,
+// and writes are split back into them (so a new CLI beside an old serve stays
+// coherent until the serve migrates).
+Json loadApps(const string& dataDir) {
+    if (newLayout(dataDir)) {
+        Json a = loadRegistry(fs::path(dataDir) / "config" / "apps.json");
+        return a.is_object() ? a : Json::object();
+    }
+    Json out = Json::object();
+    Json tokens = loadRegistry(fs::path(dataDir) / "tokens.json");
+    for (auto& [id, h] : tokens.items())
+        if (h.is_string()) out[id]["token"] = h;
+    Json groups = loadRegistry(fs::path(dataDir) / "groups.json");
+    for (auto& [id, g] : groups.items())
+        if (g.is_string() && !g.get<string>().empty()) out[id]["group"] = g;
+    return out;
+}
+
+bool saveApps(const string& dataDir, const Json& apps) {
+    if (newLayout(dataDir)) {
+        error_code ec;
+        fs::create_directories(fs::path(dataDir) / "config", ec);
+        return saveRegistry(dataDir, fs::path(dataDir) / "config" / "apps.json", apps);
+    }
+    Json tokens = Json::object(), groups = Json::object();
+    for (auto& [id, e] : apps.items()) {
+        if (!e.is_object()) continue;
+        if (e.contains("token")) tokens[id] = e["token"];
+        string g = e.value("group", "");
+        if (!g.empty()) groups[id] = g;
+    }
+    return saveRegistry(dataDir, fs::path(dataDir) / "tokens.json", tokens) &&
+           saveRegistry(dataDir, fs::path(dataDir) / "groups.json", groups);
+}
+
+// Drop an entry once nothing is left in it (no token, no group, not hidden) —
+// a fully-reset app should disappear from the roster.
+void pruneAppEntry(Json& apps, const string& id) {
+    if (!apps.contains(id) || !apps[id].is_object()) return;
+    const Json& e = apps[id];
+    if (e.value("token", "").empty() && e.value("group", "").empty() &&
+        !e.value("hidden", false))
+        apps.erase(id);
+}
 
 // 32 random bytes from the OS CSPRNG, as "<prefix><hex>".
 string mintToken(const char* prefix) {
@@ -109,41 +176,45 @@ namespace token {
 // --- agent tokens ---
 
 bool verify(const string& dataDir, const string& appId, const string& tok) {
-    Json t = loadRegistry(agentsPath(dataDir));
-    if (!t.contains(appId) || !t[appId].is_string()) return false;
-    return t[appId].get<string>() == sha::sha256Hex(tok);
+    Json apps = loadApps(dataDir);
+    if (!apps.contains(appId) || !apps[appId].is_object()) return false;
+    string h = apps[appId].value("token", "");
+    return !h.empty() && h == sha::sha256Hex(tok);
 }
 
 optional<string> resolveAgent(const string& dataDir, const string& tok) {
     if (tok.empty()) return nullopt;
-    Json t = loadRegistry(agentsPath(dataDir));
+    Json apps = loadApps(dataDir);
     string hash = sha::sha256Hex(tok);
-    for (auto& [app, h] : t.items())
-        if (h.is_string() && h.get<string>() == hash) return app;
+    for (auto& [app, e] : apps.items())
+        if (e.is_object() && e.value("token", "") == hash) return app;
     return nullopt;
 }
 
 string mintAgent(const string& dataDir, const string& appId) {
-    Json tokens = loadRegistry(agentsPath(dataDir));
+    Json apps = loadApps(dataDir);
     string tok = mintToken("tc-");
-    tokens[appId] = sha::sha256Hex(tok);
-    if (!saveRegistry(dataDir, agentsPath(dataDir), tokens)) return "";
+    apps[appId]["token"] = sha::sha256Hex(tok);
+    if (!saveApps(dataDir, apps)) return "";
     return tok;
 }
 
 bool revokeAgent(const string& dataDir, const string& appId) {
-    Json tokens = loadRegistry(agentsPath(dataDir));
-    if (!tokens.contains(appId)) return false;
-    tokens.erase(appId);
-    saveRegistry(dataDir, agentsPath(dataDir), tokens);
+    Json apps = loadApps(dataDir);
+    if (!apps.contains(appId) || apps[appId].value("token", "").empty()) return false;
+    apps[appId].erase("token");
+    pruneAppEntry(apps, appId);   // keep the entry only if group/hidden remain
+    saveApps(dataDir, apps);
     return true;
 }
 
 Json listAgents(const string& dataDir) {
-    Json t = loadRegistry(agentsPath(dataDir));
+    Json apps = loadApps(dataDir);
     Json out = Json::array();
-    for (auto& [app, hash] : t.items()) {
-        string h = hash.is_string() ? hash.get<string>() : "";
+    for (auto& [app, e] : apps.items()) {
+        if (!e.is_object()) continue;
+        string h = e.value("token", "");
+        if (h.empty()) continue;   // roster entry without a token (group/hidden only)
         out.push_back({{"id", app}, {"hashPrefix", h.substr(0, 12)}});
     }
     return out;
@@ -311,21 +382,53 @@ Json listOperators(const string& dataDir) {
 // --- app groups ---
 
 Json loadGroups(const string& dataDir) {
-    Json g = loadRegistry(groupsPath(dataDir));
-    return g.is_object() ? g : Json::object();
+    // {app-id: group} view assembled from the merged roster.
+    Json apps = loadApps(dataDir);
+    Json out = Json::object();
+    for (auto& [id, e] : apps.items()) {
+        string g = e.is_object() ? e.value("group", "") : "";
+        if (!g.empty()) out[id] = g;
+    }
+    return out;
 }
 
 string groupOf(const string& dataDir, const string& appId) {
-    Json g = loadGroups(dataDir);
-    if (g.contains(appId) && g[appId].is_string()) return g[appId].get<string>();
+    Json apps = loadApps(dataDir);
+    if (apps.contains(appId) && apps[appId].is_object())
+        return apps[appId].value("group", "");
     return "";
 }
 
 bool setGroup(const string& dataDir, const string& appId, const string& group) {
-    Json g = loadGroups(dataDir);
-    if (group.empty()) g.erase(appId);
-    else g[appId] = group;
-    return saveRegistry(dataDir, groupsPath(dataDir), g);
+    Json apps = loadApps(dataDir);
+    if (group.empty()) {
+        if (apps.contains(appId) && apps[appId].is_object()) apps[appId].erase("group");
+        pruneAppEntry(apps, appId);
+    } else {
+        apps[appId]["group"] = group;
+    }
+    return saveApps(dataDir, apps);
+}
+
+// --- hidden flag (wall visibility; admin-set, so it lives in config) ---
+
+bool setHidden(const string& dataDir, const string& appId, bool hidden) {
+    Json apps = loadApps(dataDir);
+    if (hidden) {
+        apps[appId]["hidden"] = true;
+    } else {
+        if (apps.contains(appId) && apps[appId].is_object()) apps[appId].erase("hidden");
+        pruneAppEntry(apps, appId);
+    }
+    return saveApps(dataDir, apps);
+}
+
+Json hiddenApps(const string& dataDir) {
+    Json apps = loadApps(dataDir);
+    Json out = Json::array();
+    for (auto& [id, e] : apps.items())
+        if (e.is_object() && e.value("hidden", false)) out.push_back(id);
+    return out;
 }
 
 // --- sessions ---
