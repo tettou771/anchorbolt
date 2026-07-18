@@ -10,6 +10,7 @@
 
 #include "Start.h"
 #include "Sink.h"
+#include "DataDir.h"
 
 #include <TrussC.h>
 #include <impl/httplib.h>   // localhost MCP calls only (plain http)
@@ -1306,20 +1307,7 @@ bool promptOnboard(StartOptions& opt) {
 // Platform-conventional log home (CWD-relative defaults break under
 // launchd/systemd, whose cwd is /). --log-dir / config log.dir override.
 fs::path platformLogDir(const string& appId) {
-    fs::path base;
-#if defined(_WIN32)
-    const char* lad = getenv("LOCALAPPDATA");
-    base = fs::path(lad ? lad : ".") / "anchorbolt";
-#elif defined(__APPLE__)
-    const char* home = getenv("HOME");
-    base = fs::path(home ? home : ".") / "Library" / "Logs" / "anchorbolt";
-#else
-    const char* home = getenv("HOME");
-    const char* xdg = getenv("XDG_STATE_HOME");
-    base = xdg ? fs::path(xdg) : fs::path(home ? home : ".") / ".local" / "state";
-    base /= "anchorbolt";
-#endif
-    return base / appId;
+    return datadir::stateBase() / appId;   // one platform-dir definition (DataDir.h)
 }
 
 // Delete our own daily files older than keepDays. Only touches names we

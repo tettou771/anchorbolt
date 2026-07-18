@@ -36,11 +36,7 @@
 #include <random>
 #include <thread>
 
-#if defined(_WIN32)
-#include <windows.h>    // GetCurrentProcessId (serve runtime pointer)
-#else
-#include <unistd.h>     // getpid
-#endif
+#include "DataDir.h"
 
 using namespace std;
 using namespace tc;
@@ -155,26 +151,6 @@ bool g_autoApprove = false;
 int  g_approvalTtlSec = 900;
 
 fs::path approvalsPath(const fs::path& dataDir) { return dataDir / "approvals.json"; }
-
-// Platform state dir (mirrors start's platformLogDir base). serve drops a
-// runtime pointer here — serve.json {dataDir, port, pid} — so CLI verbs like
-// `anchorbolt approvals` can find the live data directory without --data.
-fs::path stateBaseDir() {
-#if defined(_WIN32)
-    const char* lad = getenv("LOCALAPPDATA");
-    return fs::path(lad ? lad : ".") / "anchorbolt";
-#elif defined(__APPLE__)
-    const char* home = getenv("HOME");
-    return fs::path(home ? home : ".") / "Library" / "Logs" / "anchorbolt";
-#else
-    const char* home = getenv("HOME");
-    const char* xdg = getenv("XDG_STATE_HOME");
-    fs::path base = xdg ? fs::path(xdg) : fs::path(home ? home : ".") / ".local" / "state";
-    return base / "anchorbolt";
-#endif
-}
-
-fs::path servePointerPath() { return stateBaseDir() / "serve.json"; }
 
 // Persist the queue (caller holds g_approvalsMutex). Decided entries are kept
 // so `get_approval` / the CLI can report the outcome; pruneData ages the file's
@@ -1146,10 +1122,11 @@ const char* kDashboardHtml = R"HTML(<!DOCTYPE html>
   .abadge { background: #4a1d1d; color: #ff8a80; border: 1px solid #7a3030;
             border-radius: 10px; font-size: 11px; padding: 0 8px; flex: none;
             margin-left: 6px; }
-  /* Group tag: plain muted text ("[test] Name") — a boxed capsule read as a
-     clickable button, which it is not. */
-  .gbadge { color: #7d838e; font-weight: 500; font-size: .85em;
-            flex: none; margin-right: 6px; }
+  /* Group tag: plain muted text ("[test] Name") reading as part of the name —
+     same font and size as the name (inherited), only the color dims. A boxed
+     capsule read as a clickable button, which it is not. */
+  .gbadge { color: #7d838e; flex: none; margin-right: 6px; }
+  #dGroup { font-size: 16px; font-weight: bold; }  /* match the h2 beside it */
   #dEvWrap { background: #101216; border: 1px solid #262b34; border-radius: 8px; }
   #dEvHead { display: flex; align-items: center; gap: 10px; padding: 8px 12px;
              border-bottom: 1px solid #21252d; }
@@ -3997,22 +3974,10 @@ int cmdServe(const vector<string>& args) {
     loadApprovals(dataDir);
     g_autoApprove = opt.autoApprove;
     g_approvalTtlSec = opt.approvalTtlSec;
-    // Runtime pointer for CLI verbs (approvals etc.): where the live serve
+    // Runtime pointer for CLI verbs (token, approvals): where the live serve
     // keeps its data. Best-effort; left behind on unclean exit, which is fine —
     // consumers only trust it if the directory still exists.
-    {
-        error_code ec;
-        fs::create_directories(stateBaseDir(), ec);
-        ofstream out(servePointerPath());
-        out << Json{{"dataDir", dataDir.string()}, {"port", opt.port},
-                    {"pid", (int64_t)
-#if defined(_WIN32)
-                     GetCurrentProcessId()
-#else
-                     getpid()
-#endif
-                    }}.dump(2) << "\n";
-    }
+    datadir::writeServePointer(dataDir, opt.port);
 
     // svr.listen() blocks; a watcher thread turns the signal flag into stop().
     thread stopWatcher([&svr]() {
@@ -4125,30 +4090,14 @@ int cmdApprovals(const std::vector<std::string>& args) {
         if (args[i] == "--data" && i + 1 < args.size()) dataDir = args[++i];
         else rest.push_back(args[i]);
     }
-    // Resolve the data directory: explicit --data > ./anchorbolt-data > the
-    // running serve's runtime pointer (serve.json in the state dir). The last
-    // one is what makes `anchorbolt approvals list` work from any cwd.
-    if (dataDir.empty()) {
-        if (fs::exists("anchorbolt-data")) {
-            dataDir = "anchorbolt-data";
-        } else {
-            ifstream in(servePointerPath());
-            if (in) {
-                try {
-                    Json p = Json::parse(in);
-                    string d = p.value("dataDir", "");
-                    if (!d.empty() && fs::exists(d)) dataDir = d;
-                } catch (...) {}
-            }
-        }
-        if (dataDir.empty()) {
-            cerr << "no data directory found: no ./anchorbolt-data here and no running\n"
-                 << "serve pointer (" << servePointerPath().string() << ").\n"
-                 << "Pass the same --data your serve uses, e.g.\n"
-                 << "  anchorbolt approvals list --data ~/anchorbolt-data" << endl;
-            return 1;
-        }
-    } else if (!fs::exists(dataDir)) {
+    // One resolver for every CLI verb (see DataDir.h): --data >
+    // ./anchorbolt-data > the running serve's runtime pointer.
+    {
+        string err;
+        dataDir = datadir::resolveDataDir(dataDir, &err);
+        if (dataDir.empty()) { cerr << err << endl; return 1; }
+    }
+    if (!fs::exists(dataDir)) {
         // A missing dir would silently read as "no pending approvals"; say so.
         cerr << "data directory not found: " << dataDir << endl;
         return 1;

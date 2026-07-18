@@ -1,5 +1,6 @@
 #include "Token.h"
 #include "Sha.h"
+#include "DataDir.h"
 
 #include <TrussC.h>
 
@@ -392,7 +393,7 @@ optional<pair<string, string>> redeemCode(const string& dataDir, const string& c
 } // namespace token
 
 int cmdToken(const vector<string>& args) {
-    string dataDir = "anchorbolt-data";
+    string dataDir;
     string role;
     string scopeArg;
     vector<string> rest;
@@ -403,6 +404,15 @@ int cmdToken(const vector<string>& args) {
         else rest.push_back(args[i]);
     }
     if (rest.empty()) return usage();
+    // One resolver for every CLI verb (see DataDir.h): --data >
+    // ./anchorbolt-data > the running serve's runtime pointer. Minting verbs
+    // may create an explicitly passed dir; without any resolution we stop
+    // rather than silently minting into a fresh registry in the wrong cwd.
+    {
+        string err;
+        dataDir = datadir::resolveDataDir(dataDir, &err);
+        if (dataDir.empty()) { cerr << err << endl; return 1; }
+    }
 
     // token renew <operator-name> — re-mint keeping role + scope.
     if (rest[0] == "renew") {
