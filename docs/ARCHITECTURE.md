@@ -17,6 +17,7 @@ choices are what they are. For step-by-step usage see the
 - [Authentication](#authentication)
 - [Fleet MCP (AI operations)](#fleet-mcp-ai-operations)
 - [App-published status and alerts](#app-published-status-and-alerts)
+- [Notifications (sinks)](#notifications-sinks)
 - [Platform notes](#platform-notes)
 - [Design decisions](#design-decisions)
 
@@ -384,6 +385,49 @@ thumbnail interval; `alert` is drained from the standard `tc_get_alerts` tool
 and fanned out to the notification sinks and the dashboard event list. It is
 deliberately named **alert**, not notify — raise it for events a human should
 hear about, not as a message bus.
+
+---
+
+## Notifications (sinks)
+
+One templated webhook engine delivers every outbound notification: a sink is a
+URL plus an optional body template with `{{app}}` `{{event}}` `{{msg}}`
+`{{time}}` placeholders; presets (slack / discord / ntfy / uptime-kuma) just
+prefill it. Delivery is at-least-once with per-sink queues and backoff — a
+network outage holds events until it heals; a 4xx drops the event (a bad
+webhook URL must not retry forever).
+
+The engine runs in **two places**, and they are independent by design (both
+configured = both deliver):
+
+- **Venue side** — the `sinks` array in the app's `anchorbolt.json`. Works
+  with no server at all; this is the local-first path.
+- **Server side** — `config/notify.json`, edited on the dashboard's **Notify**
+  tab (admin). One place for the whole fleet, which is the point: each sink
+  takes a `scope` (group names / `app:<id>`, operator-scope semantics, blank =
+  every app), so "client A's Slack hears only client A's apps" is one field,
+  and a sink scoped to a single `app:<id>` behaves like the same sink
+  configured on that app's machine.
+
+Server-side sinks hear everything apps push (`restart` / `up` / `down` /
+`update` / `stop` / `alert`, fanned out at the ingest point) **plus three
+events only the server can know**:
+
+- **`approval`** — a mutating AI call entered the approval queue.
+- **`offline` / `online`** — heartbeat silence past `--offline-after`
+  (default 120 s) and its recovery. A machine that dies can't report its own
+  death; only the server sees the silence. The watcher baselines on its first
+  pass, so a serve restart never re-announces long-gone apps.
+
+uptime-kuma on the server requires a scope of exactly one `app:<id>` — it
+beats while that app's heartbeats stay fresh, matching a venue-side kuma sink.
+Broader kuma scopes have no sound "healthy" semantics and are rejected at load
+with a warning.
+
+Every Notify-tab row has a **Test** button that fires the row *as edited*
+synchronously and reports the outcome (HTTP status or connection error), and
+the tab links `/help/notify` — short webhook walkthroughs for each service.
+Saving re-arms the notifier immediately; no restart needed.
 
 ---
 
