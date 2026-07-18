@@ -2819,7 +2819,11 @@ function sinkRowEl(cfg, idx) {
   const sel = document.createElement('select');
   sel.replaceChildren(...presets.map(p =>
     new Option(p === '' ? 'generic' : p, p, false, (cfg.preset || '') === p)));
-  sel.addEventListener('change', () => { cfg.preset = sel.value; });
+  sel.addEventListener('change', () => {
+    cfg.preset = sel.value;
+    if (cfg.preset) delete cfg.body;   // a stale body would override the preset
+    renderSinkRows();
+  });
   const url = Object.assign(document.createElement('input'),
                             {value: cfg.url || '', placeholder: 'https://hooks...'});
   url.style.width = '95%';
@@ -2866,13 +2870,38 @@ function sinkRowEl(cfg, idx) {
   return tr;
 }
 
+// A generic sink gets a second row: the JSON body template with the four
+// placeholders. Presets keep their body to themselves (that's the point).
+function sinkBodyRowEl(cfg) {
+  const tr = document.createElement('tr');
+  const td = document.createElement('td');
+  td.colSpan = 5;
+  const body = Object.assign(document.createElement('input'), {
+    value: cfg.body || '',
+    placeholder: '{"app":"{{app}}","event":"{{event}}","msg":"{{msg}}","time":"{{time}}"}  (blank = this default)',
+  });
+  body.style.width = '97%';
+  body.style.font = '11px ui-monospace, Menlo, monospace';
+  body.addEventListener('input', () => {
+    cfg.body = body.value.trim();
+    if (!cfg.body) delete cfg.body;
+  });
+  td.appendChild(body);
+  tr.appendChild(td);
+  return tr;
+}
+
 function renderSinkRows() {
   const tb = byId('sSinks');
   if (!sinkRows.length) {
     tb.replaceChildren(stMsg(5, 'no sinks yet — Add one, Test it, then Save all'));
     return;
   }
-  tb.replaceChildren(...sinkRows.map(sinkRowEl));
+  tb.replaceChildren(...sinkRows.flatMap((cfg, i) => {
+    const rows = [sinkRowEl(cfg, i)];
+    if (!cfg.preset) rows.push(sinkBodyRowEl(cfg));
+    return rows;
+  }));
 }
 
 async function loadSettingsSinks() {
