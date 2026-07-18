@@ -10,10 +10,11 @@ This file tracks what's left, roughly in priority order.
   let "approval pending" ping slack/ntfy — until then the dashboard badge and
   `anchorbolt approvals list` are the ways to notice a queued call.
 
-- **`tc::fromBase64` → TrussC core.** Core has `toBase64` (a *documented* API),
-  so adding the decode counterpart pulls in the full add-API pipeline
-  (`api-reference.toml` + luagen + web regen). A TrussC-side task, not an
-  anchorbolt cleanup. Two vendored copies (Start.cpp / Serve.cpp) meanwhile.
+- **`tc::fromBase64` — core side DONE (TrussC dev, 2026-07-18)**: header +
+  api-reference.toml + luagen + web regen shipped. Remaining here: swap the two
+  vendored copies (Start.cpp / Serve.cpp) for `tc::fromBase64` once every
+  machine that builds anchorbolt runs a TrussC that has it (it must not break
+  a venue building against an older main).
 - **CP932 / mojibake at ingest (Windows).** `dumpSafe` (U+FFFD) stops the
   crash, but a localized MSVC's build output shows as replacement chars on the
   dashboard — decode the console codepage at ingest. Windows-only; verify on a
