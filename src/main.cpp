@@ -41,6 +41,8 @@ static void printHelp(bool verbose) {
             "  --data <dir>       storage directory (default ./anchorbolt-data)\n"
             "  --port <n>         HTTP port (default 54722)\n"
             "\n"
+            "  anchorbolt approvals [list|approve [id]|deny [id]]   decide queued AI calls\n"
+            "\n"
             "Run 'anchorbolt --help --verbose' for every option (watchdog, thumbnails,\n"
             "remote update, command-channel routing over a tunnel, webhook sinks, ...).\n";
         return;
@@ -120,7 +122,13 @@ static void printHelp(bool verbose) {
         "  --keep-days <n>    delete stored logs/heartbeats/images older than this\n"
         "                     (default 90; 0 = keep forever). Independent of the\n"
         "                     venue-side --log-keep. Thumbnails older than 24h are\n"
-        "                     additionally thinned to one per hour.\n";
+        "                     additionally thinned to one per hour.\n"
+        "  --auto-approve     execute mutating /mcp calls (restart_app, mutating\n"
+        "                     app_call) immediately. Default: they queue for human\n"
+        "                     approval — dashboard Approvals badge, or on this machine\n"
+        "                     'anchorbolt approvals list|approve [id]|deny [id]'\n"
+        "                     (unique id prefixes ok; id optional when one pending).\n"
+        "  --approval-ttl <sec>  pending approvals expire after this (default 900)\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -150,6 +158,9 @@ int main(int argc, char* argv[]) {
     }
     if (cmd == "token") {
         return cmdToken(vector<string>(args.begin() + 1, args.end()));
+    }
+    if (cmd == "approvals") {
+        return cmdApprovals(vector<string>(args.begin() + 1, args.end()));
     }
 
     cerr << "anchorbolt: unknown command '" << cmd << "'\n" << endl;

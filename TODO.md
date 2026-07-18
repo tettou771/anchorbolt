@@ -3,16 +3,12 @@
 Full settled design lives in TrussC `docs/ROADMAP.md` (kiosk / fleet entries).
 This file tracks what's left, roughly in priority order.
 
-## 1. Approval queue for AI-driven mutating calls
-
-Fleet `/mcp` shipped (read tools + passthrough + restart, role-gated) and
-executes mutating calls immediately. Remaining: mutating calls (restart /
-update / control / mutating `app_call`) block on a server-side approval queue
-with a TTL — notification links the human to an approve/deny page on the
-dashboard (same shape as a permission prompt; never lives in chat apps). Read
-tools stay instant.
-
 ## Deferred / out of scope for now
+
+- **Serve-side sink notifications.** The Notifier/sink engine lives on the
+  venue (`start`) only; serve has no push channel. Wiring it into serve would
+  let "approval pending" ping slack/ntfy — until then the dashboard badge and
+  `anchorbolt approvals list` are the ways to notice a queued call.
 
 - **`tc::fromBase64` → TrussC core.** Core has `toBase64` (a *documented* API),
   so adding the decode counterpart pulls in the full add-API pipeline
@@ -26,6 +22,16 @@ tools stay instant.
   optional password gate is a possible follow-up.
 
 ## Done
+
+Approval queue for AI-driven mutating calls: fleet `/mcp` restart_app +
+mutating app_call queue for human approval by default (`--auto-approve` opts
+out, `--approval-ttl` default 900s); the call waits ~20s for a decision, then
+returns a ticket polled via the read-only `get_approval` tool; deciders are the
+dashboard Approvals badge/panel (operator+ within scope) and `anchorbolt
+approvals list|approve|deny` on the server machine (unique id prefixes; id
+optional when exactly one is pending; decisions travel as one-file-per-decision
+under approval-decisions/ so the CLI never races serve's approvals.json). The
+/mcp surface has no approve tool — an AI cannot approve its own request.
 
 Delivery cursor / offline spool; serve retention `--keep-days`; remote update
 pipeline + auto-rollback + git hash on the wall; sink engine (slack / discord /

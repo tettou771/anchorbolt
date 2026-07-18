@@ -33,6 +33,7 @@
 #include <set>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <thread>
 
 using namespace std;
@@ -76,6 +77,8 @@ struct ServeOptions {
     string dataDir  = "anchorbolt-data";
     int    keepDays = 90;     // server-side retention (0 = keep forever);
                               // independent of any venue's local --log-keep
+    bool   autoApprove = false;  // execute mutating /mcp calls directly (no queue)
+    int    approvalTtlSec = 900; // pending approvals expire after this
 };
 
 struct ImageSlot {
@@ -121,6 +124,75 @@ constexpr size_t kLogRingSize = 500;
 
 map<string, AppState> g_apps;
 mutex g_appsMutex;
+
+// ---- approval queue -------------------------------------------------------
+// Mutating fleet-/mcp/ calls (restart_app, mutating app_call) do not execute
+// directly: they enqueue here and run only once a human approves — on the
+// dashboard or via `anchorbolt approvals` on the server machine. The /mcp
+// surface deliberately has NO approve tool, so an AI cannot approve its own
+// request. `serve --auto-approve` restores the old direct-execution behavior.
+struct Approval {
+    string  app;
+    string  action;          // "restart" | "call"
+    string  tool;            // for "call"
+    Json    args;            // for "call"
+    string  requestedBy;     // operator name ("open" when no operators exist)
+    int64_t created = 0;     // unix seconds
+    int64_t expires = 0;     // unix seconds; past this a pending entry expires
+    string  status = "pending";  // pending | approved | denied | expired
+    string  decidedBy;
+    Json    result;          // MCP-shaped execution result (set on approval)
+};
+map<string, Approval> g_approvals;   // id ("ap-xxxxxx") -> entry
+mutex g_approvalsMutex;
+bool g_autoApprove = false;
+int  g_approvalTtlSec = 900;
+
+fs::path approvalsPath(const fs::path& dataDir) { return dataDir / "approvals.json"; }
+
+// Persist the queue (caller holds g_approvalsMutex). Decided entries are kept
+// so `get_approval` / the CLI can report the outcome; pruneData ages the file's
+// entries out with everything else by created date.
+void flushApprovals(const fs::path& dataDir) {
+    Json all = Json::object();
+    for (auto& [id, a] : g_approvals) {
+        Json e = {{"app", a.app},       {"action", a.action},
+                  {"requestedBy", a.requestedBy},
+                  {"created", a.created}, {"expires", a.expires},
+                  {"status", a.status}};
+        if (!a.tool.empty()) e["tool"] = a.tool;
+        if (!a.args.is_null() && !a.args.empty()) e["args"] = a.args;
+        if (!a.decidedBy.empty()) e["decidedBy"] = a.decidedBy;
+        if (!a.result.is_null()) e["result"] = a.result;
+        all[id] = e;
+    }
+    ofstream out(approvalsPath(dataDir));
+    out << all.dump(2) << "\n";
+}
+
+void loadApprovals(const fs::path& dataDir) {
+    ifstream in(approvalsPath(dataDir));
+    if (!in) return;
+    Json all;
+    try { all = Json::parse(in); } catch (...) { return; }
+    if (!all.is_object()) return;
+    lock_guard<mutex> lock(g_approvalsMutex);
+    for (auto& [id, e] : all.items()) {
+        if (!e.is_object()) continue;
+        Approval a;
+        a.app         = e.value("app", "");
+        a.action      = e.value("action", "");
+        a.tool        = e.value("tool", "");
+        a.args        = e.value("args", Json::object());
+        a.requestedBy = e.value("requestedBy", "");
+        a.created     = e.value("created", (int64_t)0);
+        a.expires     = e.value("expires", (int64_t)0);
+        a.status      = e.value("status", "pending");
+        a.decidedBy   = e.value("decidedBy", "");
+        if (e.contains("result")) a.result = e["result"];
+        g_approvals[id] = std::move(a);
+    }
+}
 
 // After a serve restart the in-memory log ring is empty, but the venue keeps its
 // own cursor and won't re-ship history — so the detail panel would show nothing
@@ -488,6 +560,8 @@ bool parseArgs(const vector<string>& args, ServeOptions& opt) {
         else if (a == "--ws-port")           { auto v = next("--ws-port"); if (!v) return false; opt.wsPort = stoi(*v); }
         else if (a == "--data")              { auto v = next("--data"); if (!v) return false; opt.dataDir = *v; }
         else if (a == "--keep-days")         { auto v = next("--keep-days"); if (!v) return false; opt.keepDays = stoi(*v); }
+        else if (a == "--auto-approve")      { opt.autoApprove = true; }
+        else if (a == "--approval-ttl")      { auto v = next("--approval-ttl"); if (!v) return false; opt.approvalTtlSec = stoi(*v); }
         else {
             cerr << "anchorbolt serve: unknown option '" << a << "'" << endl;
             return false;
@@ -531,6 +605,134 @@ Json mcpImage(const vector<unsigned char>& jpg, const Json& meta) {
     return Json{{"content", Json::array({
         Json{{"type", "image"}, {"data", toBase64(jpg)}, {"mimeType", "image/jpeg"}},
         Json{{"type", "text"}, {"text", meta.dump()}}})}};
+}
+
+// Format an agent-relay reply as an MCP result. The agent folds app image
+// blocks into {data, mimeType, ...}; unfold back into a real image block so
+// the AI sees the picture. (Shared by app_call and approved-call execution.)
+Json mcpFromRelay(const Json& r, const string& failMsg) {
+    if (!r.value("ok", false)) return mcpError(r.value("error", failMsg));
+    Json result = r["result"];
+    if (result.is_object() && result.contains("data") && result.contains("mimeType") &&
+        result["data"].is_string()) {
+        Json meta = Json::object();
+        for (auto key : {"width", "height"}) {
+            if (result.contains(key)) meta[key] = result[key];
+        }
+        return Json{{"content", Json::array({
+            Json{{"type", "image"}, {"data", result["data"]}, {"mimeType", result["mimeType"]}},
+            Json{{"type", "text"}, {"text", meta.dump()}}})}};
+    }
+    return mcpJson(result);
+}
+
+// ---- approval queue mechanics ---------------------------------------------
+
+string newApprovalId() {
+    static mt19937_64 rng(random_device{}());
+    static const char* hex = "0123456789abcdef";
+    uniform_int_distribution<int> d(0, 15);
+    string id = "ap-";
+    for (int i = 0; i < 6; i++) id += hex[d(rng)];
+    return id;
+}
+
+// Run an approved entry's action over the agent relay. MCP-shaped result.
+Json execApproval(const Approval& a) {
+    if (a.action == "restart") {
+        Json r = g_agents.command(a.app, Json{{"action", "restart"}});
+        return r.value("ok", false) ? mcpJson(r["result"])
+                                    : mcpError(r.value("error", "restart failed"));
+    }
+    Json r = g_agents.command(a.app, Json{{"action", "call"},
+                                          {"tool", a.tool},
+                                          {"args", a.args}});
+    return mcpFromRelay(r, "tool call failed");
+}
+
+// Apply a human decision (dashboard or CLI). On approve, executes the action
+// and stores its result on the entry; the execution runs outside the lock —
+// the agent relay can take seconds — with status already "approved", so
+// concurrent deciders are rejected by the status check.
+bool decideApproval(const fs::path& dataDir, const string& id, bool approve,
+                    const string& by, string* err) {
+    Approval copy;
+    {
+        lock_guard<mutex> lock(g_approvalsMutex);
+        auto it = g_approvals.find(id);
+        if (it == g_approvals.end()) { *err = "unknown approval id"; return false; }
+        auto& a = it->second;
+        if (a.status != "pending") { *err = "already " + a.status; return false; }
+        if (time(nullptr) > a.expires) {
+            a.status = "expired";
+            flushApprovals(dataDir);
+            *err = "expired";
+            return false;
+        }
+        a.status = approve ? "approved" : "denied";
+        a.decidedBy = by;
+        if (!approve) { flushApprovals(dataDir); return true; }
+        copy = a;
+    }
+    logNotice("anchorbolt") << "approval " << id << " approved by " << by
+                            << " -> executing " << copy.action << " on " << copy.app;
+    Json result = execApproval(copy);
+    {
+        lock_guard<mutex> lock(g_approvalsMutex);
+        auto it = g_approvals.find(id);
+        if (it != g_approvals.end()) it->second.result = result;
+        flushApprovals(dataDir);
+    }
+    return true;
+}
+
+// Public view of one entry (no args echo — they can be large).
+Json approvalJson(const string& id, const Approval& a) {
+    int64_t now = time(nullptr);
+    Json e = {{"id", id}, {"app", a.app}, {"action", a.action},
+              {"requestedBy", a.requestedBy}, {"status", a.status},
+              {"ageSec", now - a.created},
+              {"expiresInSec", a.status == "pending" ? a.expires - now : 0}};
+    if (!a.tool.empty()) e["tool"] = a.tool;
+    if (!a.decidedBy.empty()) e["decidedBy"] = a.decidedBy;
+    return e;
+}
+
+// Queue a mutating call and give a human a short window to decide before the
+// MCP call returns: many approvals happen within seconds of the request when
+// someone is at the dashboard. Undecided after ~20s -> a pending ticket the
+// caller polls with get_approval.
+Json enqueueApproval(const fs::path& dataDir, Approval a) {
+    a.created = time(nullptr);
+    a.expires = a.created + g_approvalTtlSec;
+    string id;
+    {
+        lock_guard<mutex> lock(g_approvalsMutex);
+        do { id = newApprovalId(); } while (g_approvals.count(id));
+        g_approvals[id] = a;
+        flushApprovals(dataDir);
+    }
+    logNotice("anchorbolt") << "approval " << id << " queued: " << a.action
+                            << " on " << a.app << " (by " << a.requestedBy << ")";
+    for (int i = 0; i < 40 && !g_stop; i++) {
+        this_thread::sleep_for(chrono::milliseconds(500));
+        lock_guard<mutex> lock(g_approvalsMutex);
+        auto it = g_approvals.find(id);
+        if (it == g_approvals.end()) break;
+        const Approval& e = it->second;
+        if (e.status == "denied")
+            return mcpError("denied by " + e.decidedBy);
+        if (e.status == "expired") break;
+        // approved: the result lands right after execution finishes.
+        if (e.status == "approved" && !e.result.is_null()) return e.result;
+    }
+    lock_guard<mutex> lock(g_approvalsMutex);
+    auto it = g_approvals.find(id);
+    Json ticket = (it != g_approvals.end()) ? approvalJson(id, it->second)
+                                            : Json{{"id", id}, {"status", "pending"}};
+    ticket["note"] = "awaiting human approval (dashboard or `anchorbolt approvals`); "
+                     "poll get_approval with this id";
+    return mcpJson(ticket);
 }
 
 // Newest-first list of an app's daily JSONL files with the given prefix.
@@ -646,13 +848,19 @@ Json fleetToolsList() {
              {"at", {{"type", "string"}, {"description", "Timestamp name or prefix (default: latest)"}}}},
         Json::array({"app"})));
     tools.push_back(tool("restart_app",
-        "Restart the app via its supervisor (operator role). Same path as the dashboard Restart button.",
+        "Restart the app via its supervisor (operator role). Mutating: queues for human approval — "
+        "the call waits ~20s for a decision, then returns a pending ticket to poll with get_approval.",
         Json{{"app", appArg["app"]}}, Json::array({"app"})));
+    tools.push_back(tool("get_approval",
+        "Status of a queued mutating call by ticket id. Returns the execution result once approved, "
+        "an error if denied/expired, or the pending ticket while a human is deciding.",
+        Json{{"id", {{"type", "string"}, {"description", "Ticket id (ap-xxxxxx) from the pending response"}}}},
+        Json::array({"id"})));
     tools.push_back(tool("app_list_tools",
         "List the app's OWN MCP tools via the live agent passthrough (tc_* standard tools plus any custom ones the app registered).",
         Json{{"app", appArg["app"]}}, Json::array({"app"})));
     tools.push_back(tool("app_call",
-        "Call one of the app's own MCP tools through the agent passthrough. Read-only tc_get_* tools relay freely; mutating tools need the operator role and only exist if the app registered them (e.g. registerDebuggerTools for input injection). Image results come back as images.",
+        "Call one of the app's own MCP tools through the agent passthrough. Read-only tc_get_* tools relay instantly; anything else needs the operator role AND queues for human approval (waits ~20s, then returns a ticket for get_approval). Image results come back as images.",
         Json{{"app", appArg["app"]},
              {"tool", {{"type", "string"}, {"description", "Tool name from app_list_tools"}}},
              {"args", {{"type", "object"}, {"description", "Tool arguments (optional)"}}}},
@@ -685,6 +893,19 @@ Json fleetToolCall(const fs::path& dataDir, const string& name, const Json& args
             list.push_back(e);
         }
         return mcpJson(list);
+    }
+
+    // Poll a queued mutating call by ticket id (no app arg — the id names it).
+    if (name == "get_approval") {
+        string id = args.value("id", "");
+        lock_guard<mutex> lock(g_approvalsMutex);
+        auto it = g_approvals.find(id);
+        if (it == g_approvals.end()) return mcpError("unknown approval id '" + id + "'");
+        const Approval& a = it->second;
+        if (a.status == "approved" && !a.result.is_null()) return a.result;
+        if (a.status == "denied") return mcpError("denied by " + a.decidedBy);
+        if (a.status == "expired") return mcpError("approval expired undecided");
+        return mcpJson(approvalJson(id, a));
     }
 
     string app = appArg();
@@ -816,6 +1037,9 @@ Json fleetToolCall(const fs::path& dataDir, const string& name, const Json& args
 
     if (name == "restart_app") {
         if (rank < 2) return mcpError("restart_app needs the operator role");
+        if (!g_autoApprove)
+            return enqueueApproval(dataDir, Approval{app, "restart", "", Json::object(),
+                                                     op ? op->name : "open"});
         Json r = g_agents.command(app, Json{{"action", "restart"}});
         return r.value("ok", false) ? mcpJson(r["result"])
                                     : mcpError(r.value("error", "restart failed"));
@@ -835,24 +1059,14 @@ Json fleetToolCall(const fs::path& dataDir, const string& name, const Json& args
         if (toolName.rfind("tc_get_", 0) != 0 && rank < 2) {
             return mcpError("'" + toolName + "' is not read-only; it needs the operator role");
         }
+        Json callArgs = args.value("args", Json::object());
+        if (toolName.rfind("tc_get_", 0) != 0 && !g_autoApprove)
+            return enqueueApproval(dataDir, Approval{app, "call", toolName, callArgs,
+                                                     op ? op->name : "open"});
         Json r = g_agents.command(app, Json{{"action", "call"},
                                             {"tool", toolName},
-                                            {"args", args.value("args", Json::object())}});
-        if (!r.value("ok", false)) return mcpError(r.value("error", "tool call failed"));
-        Json result = r["result"];
-        // The agent folds app image blocks into {data, mimeType, ...}; unfold
-        // back into a real image block so the AI sees the picture.
-        if (result.is_object() && result.contains("data") && result.contains("mimeType") &&
-            result["data"].is_string()) {
-            Json meta = Json::object();
-            for (auto key : {"width", "height"}) {
-                if (result.contains(key)) meta[key] = result[key];
-            }
-            return Json{{"content", Json::array({
-                Json{{"type", "image"}, {"data", result["data"]}, {"mimeType", result["mimeType"]}},
-                Json{{"type", "text"}, {"text", meta.dump()}}})}};
-        }
-        return mcpJson(result);
+                                            {"args", callArgs}});
+        return mcpFromRelay(r, "tool call failed");
     }
 
     return mcpError("unknown tool '" + name + "'");
@@ -906,6 +1120,9 @@ const char* kDashboardHtml = R"HTML(<!DOCTYPE html>
   .abadge { background: #4a1d1d; color: #ff8a80; border: 1px solid #7a3030;
             border-radius: 10px; font-size: 11px; padding: 0 8px; flex: none;
             margin-left: 6px; }
+  .gbadge { background: #232834; color: #8fa3bf; border: 1px solid #333a48;
+            border-radius: 4px; font-size: 10px; font-weight: 500;
+            padding: 1px 6px; flex: none; margin-right: 6px; }
   #dEvWrap { background: #101216; border: 1px solid #262b34; border-radius: 8px; }
   #dEvHead { display: flex; align-items: center; gap: 10px; padding: 8px 12px;
              border-bottom: 1px solid #21252d; }
@@ -928,9 +1145,30 @@ const char* kDashboardHtml = R"HTML(<!DOCTYPE html>
          flex: none; }
   .stale .dot, .dot.bad { background: #f85149; }
   #empty { color: #4a4f59; text-align: center; padding: 80px 20px; }
-  #logoutBtn { background: none; border: 1px solid #2a2e36; color: #7d838e;
-               border-radius: 5px; font-size: 11px; padding: 2px 10px; cursor: pointer; }
-  #logoutBtn:hover { color: #d4d7dd; }
+  /* Header capsules share one box so their heights line up exactly. */
+  #apprBtn, #gearBtn, #logoutBtn { background: none; border: 1px solid #2a2e36;
+      color: #7d838e; border-radius: 5px; font-size: 11px; height: 24px;
+      padding: 0 10px; box-sizing: border-box; display: inline-flex;
+      align-items: center; gap: 5px; cursor: pointer; }
+  #apprBtn:hover, #gearBtn:hover, #logoutBtn:hover { color: #d4d7dd; }
+  #apprBtn[hidden], #gearBtn[hidden], #logoutBtn[hidden] { display: none; }
+  #apprBtn { color: #e3b341; border-color: #55482a; }
+  #apprPanel { position: fixed; top: 52px; right: 16px; width: 440px;
+      max-height: 60vh; overflow-y: auto; background: #16181d;
+      border: 1px solid #2a2e36; border-radius: 10px; padding: 4px 0;
+      box-shadow: 0 10px 40px rgba(0,0,0,.5); z-index: 60; }
+  #apprPanel[hidden] { display: none; }
+  .apRow { display: flex; align-items: center; gap: 8px; padding: 8px 14px;
+           font-size: 12px; }
+  .apRow + .apRow { border-top: 1px solid #21252d; }
+  .apRow .what { flex: 1; min-width: 0; overflow: hidden;
+                 text-overflow: ellipsis; white-space: nowrap; }
+  .apRow .who, .apRow .st { color: #7d838e; flex: none; }
+  .apRow button { border-radius: 5px; font-size: 11px; padding: 3px 10px;
+                  cursor: pointer; flex: none; }
+  .apRow .ok { background: #1a2f22; color: #4ecb71; border: 1px solid #2b4a35; }
+  .apRow .no { background: #33251a; color: #e0a06a; border: 1px solid #55402c; }
+  .apRow.done { opacity: .55; }
   #login { position: fixed; inset: 0; background: #16181d; z-index: 100;
            display: flex; align-items: center; justify-content: center; }
   #login[hidden] { display: none; }
@@ -1088,10 +1326,8 @@ R"HTML(
   #tabs .tab:hover { color: #d4d7dd; }
   #tabs .tab.active { background: #1c2a3a; color: #79b8ff; border-color: #2c405a; }
 
-  /* ---- header gear (admin only) ---- */
-  #gearBtn { background: none; border: 1px solid #2a2e36; color: #7d838e;
-             border-radius: 5px; font-size: 13px; padding: 2px 9px; cursor: pointer; }
-  #gearBtn:hover { color: #d4d7dd; }
+  /* ---- header gear (admin only): shared capsule box above, bigger glyph ---- */
+  #gearBtn { font-size: 14px; }
 
   /* ---- settings overlay (admin) ---- */
   #settings { position: fixed; inset: 0; background: rgba(10,11,14,.75);
@@ -1143,9 +1379,11 @@ R"HTML(
   <span class="sub" id="summary"></span>
   <span style="flex:1"></span>
   <span class="sub" id="who"></span>
+  <button id="apprBtn" hidden title="queued AI calls awaiting approval">approvals <b id="apprN"></b></button>
   <button id="gearBtn" hidden title="settings">&#9881;</button>
   <button id="logoutBtn" hidden>logout</button>
 </header>
+<div id="apprPanel" hidden></div>
 <div id="tabs" hidden></div>
 <div id="grid"></div>
 <div id="empty" hidden>no apps have reported yet &mdash; run
@@ -1223,6 +1461,7 @@ R"HTML(
     <div class="dhead">
       <div class="dTitleRow">
         <span class="dot" id="dDot"></span>
+        <span id="dGroup" class="gbadge" hidden></span>
         <h2 id="dTitle"></h2>
         <button id="dClose" title="close">&times;</button>
       </div>
@@ -1337,6 +1576,75 @@ function applyRole(me) {
   // The gear opens the settings page — admin only (or open mode).
   if (me.open || me.role === 'admin') document.getElementById('gearBtn').hidden = false;
 }
+
+)HTML"
+R"HTML(// ---- approvals: queued AI mutating calls (fleet /mcp) --------------------
+// The badge appears when anything is pending; the panel lists pending entries
+// with Approve/Deny (operator+; the server enforces role + scope regardless)
+// and recently decided ones for context.
+let apprOpen = false;
+async function pollApprovals() {
+  if (myRole === 'viewer') return;
+  let list = [];
+  try {
+    const r = await fetch('/api/approvals');
+    if (!r.ok) return;
+    list = await r.json();
+  } catch { return; }
+  const pend = list.filter(a => a.status === 'pending');
+  document.getElementById('apprN').textContent = pend.length;
+  // Keep the capsule while the panel is open even if the queue just drained.
+  document.getElementById('apprBtn').hidden = pend.length === 0 && !apprOpen;
+  if (apprOpen) renderApprovals(list);
+}
+
+function renderApprovals(list) {
+  const box = document.getElementById('apprPanel');
+  box.replaceChildren();
+  if (!list.length) {
+    box.appendChild(Object.assign(document.createElement('div'),
+                                  {className: 'apRow', textContent: 'no approvals'}));
+    return;
+  }
+  list.sort((a, b) => (a.status === 'pending' ? 0 : 1) - (b.status === 'pending' ? 0 : 1)
+                      || a.ageSec - b.ageSec);
+  for (const a of list) {
+    const row = document.createElement('div');
+    row.className = 'apRow' + (a.status === 'pending' ? '' : ' done');
+    const act = a.action === 'call' ? 'call ' + (a.tool || '?') : a.action;
+    row.innerHTML = '<span class="what"></span><span class="who"></span>';
+    row.querySelector('.what').textContent = a.app + ' · ' + act;
+    row.querySelector('.who').textContent = a.requestedBy + ' · ' + fmtAgo(a.ageSec) + ' ago';
+    if (a.status === 'pending') {
+      const ok = Object.assign(document.createElement('button'), {className: 'ok', textContent: 'Approve'});
+      const no = Object.assign(document.createElement('button'), {className: 'no', textContent: 'Deny'});
+      ok.addEventListener('click', () => decideApprovalUi(a.id, true));
+      no.addEventListener('click', () => decideApprovalUi(a.id, false));
+      row.append(ok, no);
+    } else {
+      row.appendChild(Object.assign(document.createElement('span'), {className: 'st',
+        textContent: a.status + (a.decidedBy ? ' by ' + a.decidedBy : '')}));
+    }
+    box.appendChild(row);
+  }
+}
+
+async function decideApprovalUi(id, approve) {
+  try {
+    await fetch('/api/approvals/decide', {method: 'POST', body: JSON.stringify({id, approve})});
+  } catch {}
+  pollApprovals();
+}
+
+document.getElementById('apprBtn').addEventListener('click', () => {
+  apprOpen = !apprOpen;
+  document.getElementById('apprPanel').hidden = !apprOpen;
+  if (apprOpen) pollApprovals();
+});
+setInterval(pollApprovals, 3000);
+pollApprovals();
+)HTML"
+R"HTML(
 
 (async () => {
   // Share link: ?share=<token> logs in read-only, then we strip it from the URL
@@ -1506,7 +1814,7 @@ function card(app) {
     <div class="thumbWrap"><span class="none">no thumbnail</span><img hidden>
       <div class="offlay" hidden><span class="who"></span></div></div>
     <div class="meta">
-      <span class="name"><span class="dot"></span><span class="label"></span><span class="abadge" hidden></span></span>
+      <span class="name"><span class="dot"></span><span class="gbadge" hidden></span><span class="label"></span><span class="abadge" hidden></span></span>
       <span class="stats"></span>
     </div>`;
   el.addEventListener('click', () => openDetail(app.id));
@@ -1687,6 +1995,9 @@ async function renderDetail() {
   const stale = app.ageSec > STALE_SEC;
   document.getElementById('dDot').classList.toggle('bad', stale);
   document.getElementById('dTitle').textContent = app.id;
+  const dg = document.getElementById('dGroup');
+  dg.hidden = !app.group;
+  if (app.group) dg.textContent = app.group;
   // The action buttons ride the command channel, so they only make sense when
   // the agent's WS is connected and the operator can act. Update/Rollback show
   // only if the venue allows update (it advertises this); Restart is always
@@ -2273,6 +2584,9 @@ async function refresh() {
     el.classList.toggle('stale', app.ageSec > STALE_SEC);
     el.dataset.group = app.group || '';
     el.querySelector('.label').textContent = app.id;
+    const gb = el.querySelector('.gbadge');
+    gb.hidden = !app.group;
+    if (app.group) gb.textContent = app.group;
     el.querySelector('.stats').textContent = wallStats(app);
     // Offline: the last screenshot is blurred (CSS) with a text overlay on top.
     const off = el.querySelector('.offlay');
@@ -2865,6 +3179,56 @@ int cmdServe(const vector<string>& args) {
         { lock_guard<mutex> lock(g_appsMutex); g_apps[app].hidden = body.value("hidden", true); }
         flushAppRegistry(dataDir);
         res.set_content("ok", "text/plain");
+    });
+
+    // Approvals: pending + recently decided mutating calls. Any logged-in role
+    // may look (the dashboard badge), scope-filtered like everything else.
+    svr.Get("/api/approvals", [dataDir, requireRole, currentOp](const httplib::Request& req, httplib::Response& res) {
+        if (!requireRole(req, res, 1)) return;
+        auto op = currentOp(req);
+        string d = dataDir.string();
+        int64_t now = time(nullptr);
+        Json list = Json::array();
+        lock_guard<mutex> lock(g_approvalsMutex);
+        for (auto& [id, a] : g_approvals) {
+            if (op && !token::inScope(*op, a.app, token::groupOf(d, a.app))) continue;
+            // decided entries linger 10 min for context, then drop off the list
+            if (a.status != "pending" && now - a.created > 600) continue;
+            list.push_back(approvalJson(id, a));
+        }
+        res.set_content(list.dump(), "application/json");
+    });
+
+    // Human decision from the dashboard: operator+ whose scope covers the app.
+    svr.Post("/api/approvals/decide", [dataDir, requireRole, currentOp, parseBody](const httplib::Request& req, httplib::Response& res) {
+        if (!requireRole(req, res, 2)) return;
+        Json body;
+        if (!parseBody(req, res, body)) return;
+        string id = body.value("id", "");
+        bool approve = body.value("approve", false);
+        auto op = currentOp(req);
+        {
+            lock_guard<mutex> lock(g_approvalsMutex);
+            auto it = g_approvals.find(id);
+            if (it == g_approvals.end()) { res.status = 404; res.set_content("unknown approval id", "text/plain"); return; }
+            if (op && !token::inScope(*op, it->second.app,
+                                      token::groupOf(dataDir.string(), it->second.app))) {
+                res.status = 404; res.set_content("unknown approval id", "text/plain"); return;
+            }
+        }
+        string err;
+        if (!decideApproval(dataDir, id, approve, op ? op->name : "operator", &err)) {
+            res.status = 409;
+            res.set_content(err, "text/plain");
+            return;
+        }
+        Json out = {{"ok", true}};
+        {
+            lock_guard<mutex> lock(g_approvalsMutex);
+            auto it = g_approvals.find(id);
+            if (it != g_approvals.end()) out["approval"] = approvalJson(id, it->second);
+        }
+        res.set_content(out.dump(), "application/json");
     });
 
     svr.Get("/api/admin/operators", [dataDir, requireRole](const httplib::Request& req, httplib::Response& res) {
@@ -3603,6 +3967,9 @@ int cmdServe(const vector<string>& args) {
     // provisioned-but-quiet app still shows, matching the settings Apps list).
     loadAppRegistry(dataDir);
     loadKnownAgents(dataDir);
+    loadApprovals(dataDir);
+    g_autoApprove = opt.autoApprove;
+    g_approvalTtlSec = opt.approvalTtlSec;
 
     // svr.listen() blocks; a watcher thread turns the signal flag into stop().
     thread stopWatcher([&svr]() {
@@ -3631,6 +3998,42 @@ int cmdServe(const vector<string>& args) {
         }
     });
 
+    // Approval sweeper: expire overdue pending entries, and pick up decisions
+    // the `anchorbolt approvals` CLI drops as one file per decision under
+    // approval-decisions/ (single writer per file — no shared-file races with
+    // our own approvals.json rewrites).
+    thread approvalSweeper([dataDir]() {
+        fs::path decDir = dataDir / "approval-decisions";
+        while (!g_stop) {
+            for (int i = 0; i < 20 && !g_stop; ++i)
+                this_thread::sleep_for(chrono::milliseconds(100));
+            error_code ec;
+            for (auto& e : fs::directory_iterator(decDir, ec)) {
+                if (e.path().extension() != ".json") continue;
+                string id = e.path().stem().string();
+                Json d;
+                try { ifstream in(e.path()); d = Json::parse(in); } catch (...) {}
+                fs::remove(e.path(), ec);
+                if (!d.is_object()) continue;
+                string err;
+                decideApproval(dataDir, id, d.value("decision", "") == "approve",
+                               d.value("by", "cli"), &err);
+            }
+            bool dirty = false;
+            {
+                lock_guard<mutex> lock(g_approvalsMutex);
+                int64_t now = time(nullptr);
+                for (auto& [id, a] : g_approvals) {
+                    if (a.status == "pending" && now > a.expires) {
+                        a.status = "expired";
+                        dirty = true;
+                    }
+                }
+                if (dirty) flushApprovals(dataDir);
+            }
+        }
+    });
+
     logNotice("anchorbolt") << "fleet server on http://localhost:" << opt.port
                             << " (ws " << opt.wsPort << ", data " << dataDir.string()
                             << ")";
@@ -3649,6 +4052,7 @@ int cmdServe(const vector<string>& args) {
     stopWatcher.join();
     pruner.join();
     registrar.join();
+    approvalSweeper.join();
     flushAppRegistry(dataDir);   // final snapshot so nothing since the last flush is lost
     g_agents.hub.stop();
 
@@ -3662,4 +4066,130 @@ int cmdServe(const vector<string>& args) {
     }
     logNotice("anchorbolt") << "fleet server stopped";
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// `anchorbolt approvals` — server-machine CLI over the same data directory.
+// list reads approvals.json; approve/deny drop a one-file-per-decision intent
+// under approval-decisions/ that the running serve's sweeper applies (so the
+// execution — which needs the agent WS — always happens inside serve), then
+// poll for the outcome. Ids accept unique prefixes ("ap-3f" or just "3f");
+// with exactly one pending entry the id can be omitted entirely.
+int cmdApprovals(const std::vector<std::string>& args) {
+    string dataDir = "anchorbolt-data";
+    vector<string> rest;
+    for (size_t i = 0; i < args.size(); ++i) {
+        if (args[i] == "--data" && i + 1 < args.size()) dataDir = args[++i];
+        else rest.push_back(args[i]);
+    }
+    auto load = [&]() -> Json {
+        ifstream in(fs::path(dataDir) / "approvals.json");
+        if (!in) return Json::object();
+        try { return Json::parse(in); } catch (...) { return Json::object(); }
+    };
+    auto fmtAge = [](int64_t s) -> string {
+        if (s < 0) s = 0;
+        if (s < 60) return to_string(s) + "s";
+        if (s < 3600) return to_string(s / 60) + "m";
+        return to_string(s / 3600) + "h";
+    };
+    auto actionOf = [](const Json& e) {
+        string a = e.value("action", "");
+        return a == "call" ? "call " + e.value("tool", "?") : a;
+    };
+    auto resultText = [](const Json& e) -> string {
+        if (!e.contains("result") || !e["result"].is_object()) return "";
+        const Json& r = e["result"];
+        for (auto& c : r.value("content", Json::array()))
+            if (c.value("type", "") == "text") return c.value("text", "");
+        return "";
+    };
+
+    Json all = load();
+    string verb = rest.empty() ? "list" : rest[0];
+
+    if (verb == "list") {
+        int64_t now = time(nullptr);
+        vector<pair<string, Json>> rows;
+        for (auto& [id, e] : all.items()) {
+            string st = e.value("status", "");
+            // pending always; decided entries only for 10 min of context
+            if (st != "pending" && now - e.value("created", (int64_t)0) > 600) continue;
+            rows.push_back({id, e});
+        }
+        sort(rows.begin(), rows.end(), [](auto& a, auto& b) {
+            return a.second.value("created", (int64_t)0) < b.second.value("created", (int64_t)0);
+        });
+        if (rows.empty()) { cout << "no pending approvals" << endl; return 0; }
+        printf("%-11s %-5s %-24s %-28s %-10s %s\n",
+               "ID", "AGE", "APP", "ACTION", "BY", "STATUS");
+        for (auto& [id, e] : rows) {
+            string st = e.value("status", "");
+            string tail = st == "pending"
+                ? "expires " + fmtAge(e.value("expires", (int64_t)0) - now)
+                : st + (e.contains("decidedBy") ? " by " + e["decidedBy"].get<string>() : "");
+            printf("%-11s %-5s %-24s %-28s %-10s %s\n", id.c_str(),
+                   fmtAge(now - e.value("created", (int64_t)0)).c_str(),
+                   e.value("app", "").c_str(), actionOf(e).c_str(),
+                   e.value("requestedBy", "").c_str(), tail.c_str());
+        }
+        return 0;
+    }
+
+    if (verb == "approve" || verb == "deny") {
+        // Resolve the target among pending entries: unique prefix, or the only one.
+        string want = rest.size() > 1 ? rest[1] : "";
+        vector<string> hits;
+        for (auto& [id, e] : all.items()) {
+            if (e.value("status", "") != "pending") continue;
+            if (want.empty() || id.rfind(want, 0) == 0 ||
+                id.rfind("ap-" + want, 0) == 0) hits.push_back(id);
+        }
+        if (hits.empty()) {
+            cerr << (want.empty() ? "no pending approvals" : "no pending approval matches '" + want + "'") << endl;
+            return 1;
+        }
+        if (hits.size() > 1) {
+            cerr << "ambiguous: " << hits.size() << " pending approvals match";
+            if (!want.empty()) cerr << " '" << want << "'";
+            cerr << " — run 'anchorbolt approvals list'" << endl;
+            return 1;
+        }
+        string id = hits[0];
+        Json entry = all[id];
+        fs::path decDir = fs::path(dataDir) / "approval-decisions";
+        error_code ec;
+        fs::create_directories(decDir, ec);
+        {
+            ofstream out(decDir / (id + ".json"));
+            if (!out) { cerr << "cannot write to " << decDir.string() << endl; return 1; }
+            out << Json{{"decision", verb == "approve" ? "approve" : "deny"},
+                        {"by", "cli"}}.dump() << "\n";
+        }
+        cout << (verb == "approve" ? "approving " : "denying ") << id << ": "
+             << actionOf(entry) << " on " << entry.value("app", "")
+             << " (requested by " << entry.value("requestedBy", "") << ")" << endl;
+        // Wait for the running serve to pick the decision up and (on approve)
+        // execute; the sweeper polls every 2s.
+        for (int i = 0; i < 15; i++) {
+            this_thread::sleep_for(chrono::seconds(1));
+            Json cur = load();
+            if (!cur.contains(id)) continue;
+            string st = cur[id].value("status", "");
+            if (st == "pending") continue;
+            cout << st;
+            if (st == "approved") {
+                string txt = resultText(cur[id]);
+                if (!txt.empty()) cout << " — " << txt;
+            }
+            cout << endl;
+            return 0;
+        }
+        cerr << "decision written but serve did not pick it up (is `anchorbolt serve` running with --data "
+             << dataDir << "?)" << endl;
+        return 1;
+    }
+
+    cerr << "usage: anchorbolt approvals [list | approve [id] | deny [id]] [--data <dir>]" << endl;
+    return 1;
 }
