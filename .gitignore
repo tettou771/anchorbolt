@@ -40,3 +40,6 @@ Thumbs.db
 secrets.*
 *.url
 anchorbolt.token.json
+
+# serve default data dir — tokens, logs, screenshots, webhook URLs (secrets)
+anchorbolt-data/
