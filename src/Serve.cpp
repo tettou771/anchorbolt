@@ -3129,17 +3129,31 @@ int cmdServe(const vector<string>& args) {
             res.set_content("empty body", "text/plain");
             return;
         }
+        // Dedup: a static screen re-encodes to byte-identical JPEG (deterministic
+        // encoder, no EXIF). Skip storing a frame equal to the last one — the
+        // stored frames become change points, and the scrubber's "newest frame
+        // at or before t" holds the last one across the gap, which is exactly
+        // what was on screen. Liveness is untouched (heartbeats are a separate
+        // stream). On a server restart the first push always stores (memory is
+        // empty), costing at most one redundant frame.
+        bool dup = false;
         {
             lock_guard<mutex> lock(g_appsMutex);
             auto& st = g_apps[id];
-            st.thumb.assign(req.body.begin(), req.body.end());
-            ++st.thumbSeq;
+            dup = st.thumb.size() == req.body.size() &&
+                  memcmp(st.thumb.data(), req.body.data(), req.body.size()) == 0;
+            if (!dup) {
+                st.thumb.assign(req.body.begin(), req.body.end());
+                ++st.thumbSeq;
+            }
         }
-        fs::path dir = dataDir / id / "thumbs";
-        error_code ec;
-        fs::create_directories(dir, ec);
-        ofstream out(dir / (getTimestampString("%Y%m%d-%H%M%S") + ".jpg"), ios::binary);
-        out.write(req.body.data(), (streamsize)req.body.size());
+        if (!dup) {
+            fs::path dir = dataDir / id / "thumbs";
+            error_code ec;
+            fs::create_directories(dir, ec);
+            ofstream out(dir / (getTimestampString("%Y%m%d-%H%M%S") + ".jpg"), ios::binary);
+            out.write(req.body.data(), (streamsize)req.body.size());
+        }
         res.set_content("ok", "text/plain");
     });
 
@@ -3159,17 +3173,25 @@ int cmdServe(const vector<string>& args) {
             res.set_content("empty body", "text/plain");
             return;
         }
+        // Dedup per image name (same rule as thumbnails above).
+        bool dup = false;
         {
             lock_guard<mutex> lock(g_appsMutex);
             auto& slot = g_apps[id].images[name];
-            slot.jpeg.assign(req.body.begin(), req.body.end());
-            ++slot.seq;
+            dup = slot.jpeg.size() == req.body.size() &&
+                  memcmp(slot.jpeg.data(), req.body.data(), req.body.size()) == 0;
+            if (!dup) {
+                slot.jpeg.assign(req.body.begin(), req.body.end());
+                ++slot.seq;
+            }
         }
-        fs::path dir = dataDir / id / "images" / name;
-        error_code ec;
-        fs::create_directories(dir, ec);
-        ofstream out(dir / (getTimestampString("%Y%m%d-%H%M%S") + ".jpg"), ios::binary);
-        out.write(req.body.data(), (streamsize)req.body.size());
+        if (!dup) {
+            fs::path dir = dataDir / id / "images" / name;
+            error_code ec;
+            fs::create_directories(dir, ec);
+            ofstream out(dir / (getTimestampString("%Y%m%d-%H%M%S") + ".jpg"), ios::binary);
+            out.write(req.body.data(), (streamsize)req.body.size());
+        }
         res.set_content("ok", "text/plain");
     });
 

@@ -35,6 +35,13 @@ ntfy / uptime-kuma presets + templated webhook, at-least-once per-sink queues);
 settings page (Apps / Operators tabs, operator & agent mint/revoke UI) + 6-digit
 pairing/login codes; fleet `/mcp` for AI; live view + remote control.
 
+Instant screenshot download in the detail view (live -> relayed full-res PNG,
+offline -> last thumbnail fallback); ingest-time image dedup (a frame equal to
+the previous one is not stored — thumbnails AND statusImage streams, per name —
+so static screens stop bloating disk/zip; the scrubber's "newest frame at or
+before t" holds the last one across the gap, so playback is unchanged and no log
+is needed to reconstruct the picture).
+
 This session: fleet push over https (tcxCurl) + ws-url derived from `--server`
 (`wss://host/ws` convention); **`--id` abolished** — server-assigned, derived
 from the token via `/api/whoami`; **secure by default** — no agent open mode;
