@@ -55,6 +55,8 @@ static void printHelp(bool verbose) {
         "  anchorbolt token agent new|revoke <app-id>      [--data <dir>]\n"
         "  anchorbolt token operator new <name> --role viewer|operator|admin [--scope a,app:b]\n"
         "  anchorbolt token operator revoke <name>\n"
+        "  anchorbolt token renew <name>             re-mint an operator's token, keeping its\n"
+        "                                            role + scope (recovery / rotation)\n"
         "  anchorbolt token list                     mint/revoke tokens (server side)\n"
         "\n"
         "START OPTIONS  (flags > ANCHORBOLT_TOKEN env > config file > defaults)\n"

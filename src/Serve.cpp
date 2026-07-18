@@ -975,8 +975,11 @@ const char* kDashboardHtml = R"HTML(<!DOCTYPE html>
   #dScrubPlay { background: #191c22; color: #9aa3b2; border: 1px solid #2a2e36;
                 border-radius: 5px; font-size: 11px; padding: 2px 9px; cursor: pointer; flex: none; }
   #dScrubPlay:hover { color: #d4d7dd; }
-  #dScrubTime { font: 11px ui-monospace, Menlo, monospace; color: #7d838e;
-                flex: none; min-width: 34px; text-align: right; }
+  #dScrubTime { font: 11px ui-monospace, Menlo, monospace; color: #9aa3b2;
+                flex: none; min-width: 108px; text-align: right;
+                background: #191c22; border: 1px solid #2a2e36; border-radius: 5px;
+                padding: 2px 7px; }
+  #dScrubTime.live { color: #3fb950; border-color: #2b4a35; }
   #dValues { display: flex; flex-wrap: wrap; gap: 8px; }
   #dValues:empty { display: none; }
   .chip { background: #242832; border: 1px solid #323844; border-radius: 6px;
@@ -1097,7 +1100,7 @@ R"HTML(
               padding: 4vh 16px; overflow-y: auto; z-index: 20; }
   #settings[hidden] { display: none; }
   #sPanel { background: #1b1e24; border: 1px solid #323844; border-radius: 12px;
-            width: min(820px, 100%); margin-bottom: 4vh; }
+            width: min(960px, 100%); margin-bottom: 4vh; }
   .sTabs { display: flex; gap: 4px; margin: 0 12px; }
   .sTab { background: none; border: 1px solid #2a2e36; color: #9aa3b2;
           border-radius: 6px; font-size: 12px; padding: 3px 14px; cursor: pointer; }
@@ -1112,7 +1115,7 @@ R"HTML(
                text-transform: uppercase; letter-spacing: .05em; padding: 4px 8px; }
   .sTable td { padding: 4px 8px; border-top: 1px solid #23262d; vertical-align: middle;
                overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .sTable td.acts { overflow: visible; white-space: normal; }
+  .sTable td.acts { overflow: visible; white-space: nowrap; }
   .sTable input, .sTable select, .sRow input, .sRow select {
       background: #191c22; border: 1px solid #2a2e36; border-radius: 5px;
       color: #d4d7dd; font-size: 12px; padding: 3px 8px; }
@@ -1168,7 +1171,7 @@ R"HTML(
 
     <div id="pApps" class="sPane">
       <table class="sTable">
-        <colgroup><col style="width:34%"><col style="width:30%"><col style="width:16%"><col></colgroup>
+        <colgroup><col style="width:26%"><col style="width:24%"><col style="width:14%"><col></colgroup>
         <thead><tr><th>app</th><th>group</th><th>token</th><th></th></tr></thead>
         <tbody id="sApps"></tbody>
       </table>
@@ -1351,10 +1354,30 @@ let detailId = null;
 let dThumbSeq = -1;
 
 // ---- screenshot scrubber ----
+// The slider is spaced by TIME, not by frame count, so a gap with no screenshots
+// reads as a gap (the image just doesn't change through it) instead of looking
+// like a normal interval where nothing happened.
 let thumbLive = true;    // false while a past frame is pinned by the slider
-let thumbTimes = [];     // YYYYMMDD-HHMMSS of stored frames for the shown day
-let scrubDate = '';      // '' = today (slider's max = live); else a past day (all static)
+let thumbTimes = [];     // YYYYMMDD-HHMMSS ascending
+let thumbEpochs = [];    // ms, parallel to thumbTimes
+let scrubDate = '';      // '' = today (slider's max = live); else a past day (static)
 let scrubPlay = null;
+
+function tsEpoch(ts) {
+  return new Date(+ts.slice(0, 4), +ts.slice(4, 6) - 1, +ts.slice(6, 8),
+                  +ts.slice(9, 11), +ts.slice(11, 13), +ts.slice(13, 15)).getTime();
+}
+function frameAt(t) {                       // newest frame at or before time t; -1 if none
+  let idx = -1;
+  for (let i = 0; i < thumbEpochs.length && thumbEpochs[i] <= t; i++) idx = i;
+  return idx;
+}
+function showFrame(i) {
+  if (i < 0 || i >= thumbTimes.length) return;
+  const img = document.querySelector('#dThumbWrap img');
+  img.src = '/api/thumb/' + encodeURIComponent(detailId) + '?ts=' + thumbTimes[i];
+  img.hidden = false;
+}
 
 // date '' = today (newest = live); a YYYY-MM-DD past day is all historical.
 async function loadThumbTimes(id, date = '') {
@@ -1362,30 +1385,29 @@ async function loadThumbTimes(id, date = '') {
   thumbTimes = [];
   const q = date ? '?date=' + encodeURIComponent(date) : '';
   try { thumbTimes = (await (await fetch('/api/thumbtimes/' + encodeURIComponent(id) + q)).json()).times || []; } catch {}
+  thumbEpochs = thumbTimes.map(tsEpoch);
   const sc = document.getElementById('dScrub');
-  sc.max = Math.max(0, thumbTimes.length - 1);
-  sc.value = sc.max;
-  document.getElementById('dScrubWrap').hidden = thumbTimes.length < 1;
-  if (date) {                              // a past day has no live end — pin its last frame
-    thumbLive = false;
-    if (thumbTimes.length) {
-      const img = document.querySelector('#dThumbWrap img');
-      img.src = '/api/thumb/' + encodeURIComponent(id) + '?ts=' + thumbTimes[thumbTimes.length - 1];
-      img.hidden = false;
-    }
-  } else {
-    thumbLive = true;
+  const has = thumbTimes.length > 0;
+  document.getElementById('dScrubWrap').hidden = !has;
+  if (has) {
+    sc.min = thumbEpochs[0];
+    sc.max = thumbEpochs[thumbEpochs.length - 1];
+    sc.step = Math.max(1000, Math.floor((sc.max - sc.min) / 800));
+    sc.value = sc.max;                      // newest
   }
+  if (date) { thumbLive = false; if (has) showFrame(thumbTimes.length - 1); }
+  else { thumbLive = true; }
   updateScrubLabel();
 }
 
 function updateScrubLabel() {
   const sc = document.getElementById('dScrub');
-  const atEnd = +sc.value >= +sc.max;
-  const ts = thumbTimes[+sc.value];
-  document.getElementById('dScrubTime').textContent =
-    (!scrubDate && (atEnd || !ts)) ? 'live'
-      : (ts ? ts.slice(9, 11) + ':' + ts.slice(11, 13) : '—');
+  const badge = document.getElementById('dScrubTime');
+  if (!scrubDate && +sc.value >= +sc.max) { badge.textContent = 'live'; badge.classList.add('live'); return; }
+  badge.classList.remove('live');
+  const ts = thumbTimes[frameAt(+sc.value)] || thumbTimes[0];
+  const day = scrubDate || 'today';
+  badge.textContent = ts ? day + ' ' + ts.slice(9, 11) + ':' + ts.slice(11, 13) : day;
 }
 
 function stopScrubPlay() {
@@ -1396,15 +1418,13 @@ function stopScrubPlay() {
 
 document.getElementById('dScrub').addEventListener('input', () => {
   const sc = document.getElementById('dScrub');
-  const idx = +sc.value;
-  const img = document.querySelector('#dThumbWrap img');
-  if (!scrubDate && idx >= +sc.max) {                 // today's newest = live
+  const t = +sc.value;
+  if (!scrubDate && t >= +sc.max) {         // today's newest = live
     thumbLive = true;
-    dThumbSeq = -1;                                    // force a live refresh next poll
-  } else if (thumbTimes[idx]) {
+    dThumbSeq = -1;                          // force a live refresh next poll
+  } else {
     thumbLive = false;
-    img.src = '/api/thumb/' + encodeURIComponent(detailId) + '?ts=' + thumbTimes[idx];
-    img.hidden = false;
+    showFrame(frameAt(t));
   }
   updateScrubLabel();
 });
@@ -1413,11 +1433,13 @@ document.getElementById('dScrubPlay').addEventListener('click', () => {
   if (scrubPlay) { stopScrubPlay(); return; }
   if (thumbTimes.length < 2) return;
   document.getElementById('dScrubPlay').innerHTML = '&#10073;&#10073;';   // pause glyph
+  const sc = document.getElementById('dScrub');
+  // Timelapse steps frame-by-frame (skipping gaps), moving the time slider to
+  // each frame's timestamp; loops back to the first at the end.
+  let i = Math.max(0, frameAt(+sc.value));
   scrubPlay = setInterval(() => {
-    const sc = document.getElementById('dScrub');
-    let v = +sc.value + 1;
-    if (v > +sc.max) v = 0;                            // loop the day
-    sc.value = v;
+    i = (i + 1) % thumbTimes.length;
+    sc.value = thumbEpochs[i];
     sc.dispatchEvent(new Event('input'));
   }, 200);                                             // ~5 fps timelapse
 });
@@ -1428,6 +1450,18 @@ function fmtUptime(s) {
   return h > 0 ? `${h}h${m}m` : m > 0 ? `${m}m${s % 60}s` : `${s}s`;
 }
 
+// Coarse "how long ago" — sec/min/hours/days/weeks/months/years, one unit.
+function fmtAgo(s) {
+  s = Math.floor(s);
+  if (s < 60) return s + ' sec';
+  const m = Math.floor(s / 60);        if (m < 60) return m + (m === 1 ? ' min' : ' mins');
+  const h = Math.floor(m / 60);        if (h < 24) return h + (h === 1 ? ' hour' : ' hours');
+  const d = Math.floor(h / 24);        if (d < 7)  return d + (d === 1 ? ' day' : ' days');
+  if (d < 30) { const w = Math.floor(d / 7);   return w + (w === 1 ? ' week' : ' weeks'); }
+  if (d < 365) { const mo = Math.floor(d / 30); return mo + (mo === 1 ? ' month' : ' months'); }
+  const y = Math.floor(d / 365);       return y + (y === 1 ? ' year' : ' years');
+}
+
 function statsLine(app) {
   if (!app.reported) return 'waiting for first report';
   const h = app.health || {};
@@ -1435,7 +1469,7 @@ function statsLine(app) {
   if (h.fps !== undefined) parts.push(h.fps.toFixed(0) + ' fps');
   if (h.width) parts.push(h.width + 'x' + h.height);
   if (h.uptimeSec !== undefined) parts.push('up ' + fmtUptime(h.uptimeSec));
-  if (app.ageSec > STALE_SEC) parts.push('last seen ' + Math.floor(app.ageSec) + 's ago');
+  if (app.ageSec > STALE_SEC) parts.push('last seen ' + fmtAgo(app.ageSec) + ' ago');
   return parts.join(' · ');
 }
 
@@ -1445,7 +1479,7 @@ function wallStats(app) {
   const h = app.health || {};
   const parts = [];
   if (h.uptimeSec !== undefined) parts.push('up ' + fmtUptime(h.uptimeSec));
-  if (app.ageSec > STALE_SEC) parts.push('last seen ' + Math.floor(app.ageSec) + 's ago');
+  if (app.ageSec > STALE_SEC) parts.push('last seen ' + fmtAgo(app.ageSec) + ' ago');
   return parts.join(' · ');
 }
 
@@ -1455,7 +1489,7 @@ function card(app) {
   el.id = 'app-' + app.id;
   el.innerHTML = `
     <div class="thumbWrap"><span class="none">no thumbnail</span><img hidden>
-      <div class="offlay" hidden><span class="who"></span><span class="ago"></span></div></div>
+      <div class="offlay" hidden><span class="who"></span></div></div>
     <div class="meta">
       <span class="name"><span class="dot"></span><span class="label"></span><span class="abadge" hidden></span></span>
       <span class="stats"></span>
@@ -2187,10 +2221,7 @@ async function refresh() {
     // Offline: the last screenshot is blurred (CSS) with a text overlay on top.
     const off = el.querySelector('.offlay');
     off.hidden = !offline;
-    if (offline) {
-      off.querySelector('.who').textContent = app.id;
-      off.querySelector('.ago').textContent = wallStats(app) || 'offline';
-    }
+    if (offline) off.querySelector('.who').textContent = app.id;   // name only; last-seen is in the meta below
     const badge = el.querySelector('.abadge');
     badge.hidden = !(app.alerts > 0);
     if (app.alerts > 0) badge.textContent = '\u26a0 ' + app.alerts;

@@ -265,6 +265,14 @@ bool revokeOperator(const string& dataDir, const string& name) {
     return true;
 }
 
+// Re-mint an existing operator's token, keeping its role + scope unchanged (so a
+// recovery can't accidentally change the role). Empty if the operator is unknown.
+string renewOperator(const string& dataDir, const string& name) {
+    Json ops = loadRegistry(operatorsPath(dataDir));
+    if (!ops.contains(name) || !ops[name].is_object()) return "";
+    return mintOperator(dataDir, name, ops[name].value("role", "viewer"), scopeVec(ops[name]));
+}
+
 bool setOperatorScope(const string& dataDir, const string& name,
                       const vector<string>& scope) {
     Json ops = loadRegistry(operatorsPath(dataDir));
@@ -382,6 +390,24 @@ int cmdToken(const vector<string>& args) {
         else rest.push_back(args[i]);
     }
     if (rest.empty()) return usage();
+
+    // token renew <operator-name> — re-mint keeping role + scope.
+    if (rest[0] == "renew") {
+        if (rest.size() < 2) {
+            cerr << "usage: anchorbolt token renew <operator-name>" << endl;
+            return 1;
+        }
+        string tok = token::renewOperator(dataDir, rest[1]);
+        if (tok.empty()) {
+            cerr << "no operator named '" << rest[1] << "'. Create one with:\n"
+                 << "  anchorbolt token operator new " << rest[1]
+                 << " --role viewer|operator|admin" << endl;
+            return 1;
+        }
+        cout << "renewed operator '" << rest[1] << "' (role + scope unchanged):\n\n  "
+             << tok << "\n\nshown once — paste it into the dashboard login." << endl;
+        return 0;
+    }
 
     // token list — both classes in one view.
     if (rest[0] == "list") {

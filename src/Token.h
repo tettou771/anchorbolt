@@ -91,6 +91,10 @@ std::string mintOperator(const std::string& dataDir, const std::string& name,
                          const std::string& role,
                          const std::vector<std::string>& scope);
 
+// Re-mint an operator's token keeping its role + scope (recovery without the
+// risk of changing the role). Returns the new token, or empty if not found.
+std::string renewOperator(const std::string& dataDir, const std::string& name);
+
 // Remove an operator (and, implicitly, all their sessions — verifyOperator
 // resolves sessions through operators.json, so an absent operator is dead).
 bool revokeOperator(const std::string& dataDir, const std::string& name);
