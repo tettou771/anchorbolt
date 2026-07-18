@@ -30,6 +30,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <set>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -194,12 +195,20 @@ void loadAppRegistry(const fs::path& dataDir) {
     auto nowSteady = chrono::steady_clock::now();
     int64_t nowUnix = (int64_t)time(nullptr);
     error_code ec;
+    // A venue whose token was revoked can never report again — don't resurrect
+    // it as an un-fulfillable card. Keep it only if it still holds a token, or
+    // it was explicitly hidden (a kept-but-off-wall app).
+    set<string> agentIds;
+    for (auto& a : token::listAgents(dataDir.string()))
+        agentIds.insert(a.value("id", ""));
     lock_guard<mutex> lock(g_appsMutex);
     for (auto& [id, e] : reg.items()) {
         if (!e.is_object()) continue;
+        bool hidden = e.value("hidden", false);
+        if (!hidden && !agentIds.count(id)) continue;   // revoked & not hidden -> drop
         auto& st = g_apps[id];
         st.lastSeenUnix = e.value("lastSeen", (int64_t)0);
-        st.hidden = e.value("hidden", false);
+        st.hidden = hidden;
         st.health = e.value("health", Json::object());
         int64_t age = nowUnix - st.lastSeenUnix;
         if (st.lastSeenUnix > 0 && age >= 0)
@@ -2843,8 +2852,17 @@ int cmdServe(const vector<string>& args) {
         if (!requireRole(req, res, 3)) return;
         Json body;
         if (!parseBody(req, res, body)) return;
-        bool ok = token::revokeAgent(dataDir.string(), body.value("id", ""));
+        string id = body.value("id", "");
+        bool ok = token::revokeAgent(dataDir.string(), id);
         if (!ok) { res.status = 404; res.set_content("no such agent", "text/plain"); return; }
+        // Revoke = decommission: drop it from the wall now (it can't report
+        // again) unless it was deliberately hidden. Persist the removal.
+        {
+            lock_guard<mutex> lock(g_appsMutex);
+            auto it = g_apps.find(id);
+            if (it != g_apps.end() && !it->second.hidden) g_apps.erase(it);
+        }
+        flushAppRegistry(dataDir);
         res.set_content("ok", "text/plain");
     });
 
