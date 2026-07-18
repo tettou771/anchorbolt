@@ -293,9 +293,46 @@ no matter how many venues connect. Roles apply: viewers get the read-only tools;
 `restart_app` and mutating `app_call` need operator (and a mutating tool exists
 only if the app registered it).
 
+### Approval queue
+
+Mutating `/mcp` calls (`restart_app`, any `app_call` that is not `tc_get_*`) do
+not execute directly: they queue for **human approval**. The call waits ~20 s
+for a decision — approvals often happen while someone is at the dashboard —
+then returns a pending ticket (`ap-xxxxxx`) that the AI polls with the
+read-only `get_approval` tool. Approved → the action executes inside serve and
+the result lands on the ticket; denied → `denied by <name>`; undecided past
+`--approval-ttl` (default 900 s) → expired. Read tools are never queued.
+
+Two ways to decide, both human-only — the `/mcp` surface deliberately has no
+approve tool, so an AI cannot approve its own request:
+
+- **Dashboard:** an `approvals N` capsule appears in the header for operators
+  whose scope covers the app; the panel lists pending entries with
+  Approve / Deny.
+- **Server machine:** `anchorbolt approvals list | approve [id] | deny [id]`.
+  Ids accept unique prefixes (`approve 3f`); with exactly one pending entry the
+  id can be omitted. CLI decisions are written one-file-per-decision under
+  `approval-decisions/` and picked up by serve's sweeper (~2 s), so the CLI
+  never races serve's own `approvals.json` writes and execution — which needs
+  the agent WebSocket — always happens inside serve.
+
+The queue lives in `approvals.json` and survives a serve restart. To find the
+data directory without `--data`, the CLI reads the **runtime pointer** serve
+writes at startup — `serve.json` (`dataDir`, `port`, `pid`) in the platform
+state dir (`~/.local/state/anchorbolt/` on Linux, `~/Library/Logs/anchorbolt/`
+on macOS, `%LOCALAPPDATA%\anchorbolt\` on Windows). Resolution order: explicit
+`--data` > `./anchorbolt-data` > the pointer (trusted only while its directory
+still exists; it is rewritten on every serve start and never deleted, so the
+CLI keeps working against the queue file even while serve is down). Note the
+pointer is per-user: run the CLI as the same user as the serve process.
+
+`serve --auto-approve` restores direct execution (e.g. a trusted LAN where the
+20 s wait is not worth it).
+
 > **Open-mode caution:** with no operators registered, `/mcp` grants everyone
 > admin — which means remote restart to anyone with the URL. Register an
-> operator admin token *before* exposing the server publicly.
+> operator admin token *before* exposing the server publicly. The approval
+> queue still applies in open mode, but anyone at the dashboard can approve.
 
 ---
 

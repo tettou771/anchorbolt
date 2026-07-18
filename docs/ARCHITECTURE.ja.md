@@ -152,7 +152,20 @@ claude mcp add --transport http anchorbolt https://ops.example.com/mcp \
 
 ツール：`list_apps`、`search_logs`、`tail_logs`、`get_events`、`get_health_history`、`list_screenshots`、`get_screenshot`（本物の MCP イメージブロックを返すので、アシスタントはインスタレーションを*見る*ことができます）、`restart_app`、そして各アプリ自身の MCP ツールへの `app_list_tools` / `app_call` パススルー。パススルーは、すべてのアプリのツールをフリートのツール一覧にミラーするのではなく、会場を引数に取る2つの固定プロキシを使います——だから、何台の会場が接続しても一覧は固定のままです。ロールは適用されます：viewer には読み取り専用のツールが与えられ、`restart_app` や変更を伴う `app_call` には operator が必要です（変更を伴うツールはアプリが登録したときにだけ存在します）。
 
-> **オープンモードの注意：** オペレーターが1人も登録されていないと、`/mcp` は全員に admin を与えます——つまり、URL を知っている誰もがリモート再起動できてしまいます。サーバーを公に公開する*前に*、オペレーターの admin トークンを登録してください。
+### 承認キュー
+
+変更を伴う `/mcp` 呼び出し（`restart_app` と、`tc_get_*` 以外の `app_call`）は直接実行されません：**人間の承認**を待つキューに入ります。呼び出しは約20秒だけ決定を待ち——誰かがダッシュボードにいるとき、承認は数秒で済むことが多いので——未決なら pending チケット（`ap-xxxxxx`）を返します。AI は読み取り専用の `get_approval` ツールでそれをポーリングします。承認 → アクションは serve の内部で実行され、結果がチケットに載る。拒否 → `denied by <名前>`。`--approval-ttl`（デフォルト 900 秒）を過ぎても未決なら失効。読み取りツールは決してキューされません。
+
+決定の方法は2つ、どちらも人間専用です——`/mcp` 側には意図的に approve ツールが存在しないので、AI が自分のリクエストを自己承認することは構造的にできません：
+
+- **ダッシュボード：** スコープがそのアプリを含む operator 以上に、ヘッダーへ `approvals N` カプセルが現れます。パネルで Approve / Deny。
+- **サーバーマシン：** `anchorbolt approvals list | approve [id] | deny [id]`。ID は一意なプレフィックスで指定できます（`approve 3f`）。pending が1件だけなら ID は省略可能です。CLI の決定は `approval-decisions/` 以下に1決定1ファイルで書かれ、serve のスイーパー（約2秒周期）が拾います——だから CLI が serve 自身の `approvals.json` 書き込みと競合することはなく、実行（エージェントの WebSocket が必要）は常に serve の内部で行われます。
+
+キューは `approvals.json` に永続化され、serve の再起動を生き延びます。`--data` なしでデータディレクトリを見つけるために、CLI は serve が起動時に書く**ランタイムポインター**——プラットフォームの状態ディレクトリ（Linux は `~/.local/state/anchorbolt/`、macOS は `~/Library/Logs/anchorbolt/`、Windows は `%LOCALAPPDATA%\anchorbolt\`）内の `serve.json`（`dataDir`・`port`・`pid`）——を読みます。解決順は：明示的な `--data` > `./anchorbolt-data` > ポインター（そのディレクトリが実在する間だけ信用されます。serve の起動ごとに書き直され、削除はされないので、serve が停止していてもキューのファイルに対して CLI は動き続けます）。ポインターはユーザーごとです：CLI は serve プロセスと同じユーザーで実行してください。
+
+`serve --auto-approve` で従来の直接実行に戻せます（20秒の待ちが割に合わない、信頼できる LAN など）。
+
+> **オープンモードの注意：** オペレーターが1人も登録されていないと、`/mcp` は全員に admin を与えます——つまり、URL を知っている誰もがリモート再起動できてしまいます。サーバーを公に公開する*前に*、オペレーターの admin トークンを登録してください。承認キューはオープンモードでも機能しますが、ダッシュボードにいる誰もが承認できてしまいます。
 
 ---
 
