@@ -1101,7 +1101,11 @@ R"HTML(
   #settings[hidden] { display: none; }
   #sPanel { background: #1b1e24; border: 1px solid #323844; border-radius: 12px;
             width: min(960px, 100%); margin-bottom: 4vh; }
-  .sTabs { display: flex; gap: 4px; margin: 0 12px; }
+  .sHead { display: flex; align-items: center; gap: 16px; padding: 14px 18px;
+           border-bottom: 1px solid #2a2e36; }
+  .sHead h2 { margin: 0; font-size: 18px; }
+  .sHead #sClose { margin-left: auto; }
+  .sTabs { display: flex; gap: 4px; }
   .sTab { background: none; border: 1px solid #2a2e36; color: #9aa3b2;
           border-radius: 6px; font-size: 12px; padding: 3px 14px; cursor: pointer; }
   .sTab:hover { color: #d4d7dd; }
@@ -1115,7 +1119,7 @@ R"HTML(
                text-transform: uppercase; letter-spacing: .05em; padding: 4px 8px; }
   .sTable td { padding: 4px 8px; border-top: 1px solid #23262d; vertical-align: middle;
                overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .sTable td.acts { overflow: visible; white-space: nowrap; }
+  .sTable td.acts { overflow: visible; white-space: nowrap; text-align: right; }
   .sTable input, .sTable select, .sRow input, .sRow select {
       background: #191c22; border: 1px solid #2a2e36; border-radius: 5px;
       color: #d4d7dd; font-size: 12px; padding: 3px 8px; }
@@ -1159,7 +1163,7 @@ R"HTML(
 
 <div id="settings" hidden>
   <div id="sPanel">
-    <div class="dhead">
+    <div class="sHead">
       <h2>Settings</h2>
       <div class="sTabs">
         <button class="sTab active" data-pane="pApps">Apps</button>
@@ -1171,7 +1175,7 @@ R"HTML(
 
     <div id="pApps" class="sPane">
       <table class="sTable">
-        <colgroup><col style="width:26%"><col style="width:24%"><col style="width:14%"><col></colgroup>
+        <colgroup><col style="width:40%"><col style="width:18%"><col style="width:12%"><col></colgroup>
         <thead><tr><th>app</th><th>group</th><th>token</th><th></th></tr></thead>
         <tbody id="sApps"></tbody>
       </table>
@@ -1462,6 +1466,16 @@ function fmtAgo(s) {
   const y = Math.floor(d / 365);       return y + (y === 1 ? ' year' : ' years');
 }
 
+// Absolute wall-clock of the last report (from ageSec), e.g. 2026-07-18 11:00:00.
+function lastSeenStamp(ageSec) {
+  const d = new Date(Date.now() - ageSec * 1000);
+  const p = n => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' '
+       + p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+}
+
+// Detail view: the absolute last-seen matters (until when was it visible), so
+// show the timestamp with the relative age in parens.
 function statsLine(app) {
   if (!app.reported) return 'waiting for first report';
   const h = app.health || {};
@@ -1469,7 +1483,8 @@ function statsLine(app) {
   if (h.fps !== undefined) parts.push(h.fps.toFixed(0) + ' fps');
   if (h.width) parts.push(h.width + 'x' + h.height);
   if (h.uptimeSec !== undefined) parts.push('up ' + fmtUptime(h.uptimeSec));
-  if (app.ageSec > STALE_SEC) parts.push('last seen ' + fmtAgo(app.ageSec) + ' ago');
+  if (app.ageSec > STALE_SEC)
+    parts.push('last seen ' + lastSeenStamp(app.ageSec) + ' (' + fmtAgo(app.ageSec) + ' ago)');
   return parts.join(' · ');
 }
 
