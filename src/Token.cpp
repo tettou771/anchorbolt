@@ -77,6 +77,14 @@ int usage() {
     return 1;
 }
 
+// A scope word that means "unrestricted": "all" (any case) or "*".
+bool isGlobalScopeWord(const string& s) {
+    if (s == "*") return true;
+    if (s.size() != 3) return false;
+    return (s[0] == 'a' || s[0] == 'A') && (s[1] == 'l' || s[1] == 'L') &&
+           (s[2] == 'l' || s[2] == 'L');
+}
+
 // Split a comma-separated --scope value into trimmed, non-empty entries.
 vector<string> parseScopeArg(const string& csv) {
     vector<string> out;
@@ -86,6 +94,10 @@ vector<string> parseScopeArg(const string& csv) {
         else if (c != ' ') cur.push_back(c);
     }
     if (!cur.empty()) out.push_back(cur);
+    // "all" (any case) or "*" means unrestricted — the same as no --scope. Treat
+    // it as a global scope (empty) instead of a literal group named "all", which
+    // would match no app and hide everything.
+    for (const auto& s : out) if (isGlobalScopeWord(s)) return {};
     return out;
 }
 
@@ -234,6 +246,7 @@ int roleRank(const string& role) {
 bool inScope(const Operator& op, const string& appId, const string& group) {
     if (op.scope.empty()) return true;  // unscoped operator sees everything
     for (const auto& s : op.scope) {
+        if (isGlobalScopeWord(s)) return true;  // "all"/"*" stored on an old token
         if (!group.empty() && s == group) return true;
         if (s == "app:" + appId) return true;
     }
