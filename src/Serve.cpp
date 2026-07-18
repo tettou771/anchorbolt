@@ -2788,7 +2788,7 @@ document.addEventListener('keydown', e => {
 function showSettingsPane(pane) {
   for (const t of document.querySelectorAll('.sTab'))
     t.classList.toggle('active', t.dataset.pane === pane);
-  for (const id of ['pApps', 'pOps']) byId(id).hidden = (id !== pane);
+  for (const id of ['pApps', 'pOps', 'pNotify']) byId(id).hidden = (id !== pane);
 }
 for (const t of document.querySelectorAll('.sTab'))
   t.addEventListener('click', () => showSettingsPane(t.dataset.pane));
