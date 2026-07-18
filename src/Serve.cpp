@@ -37,6 +37,8 @@
 #include <thread>
 
 #include "DataDir.h"
+#include "Sink.h"
+#include <tcxCurl.h>    // sink test button: one direct delivery, outcome reported
 
 using namespace std;
 using namespace tc;
@@ -46,9 +48,9 @@ namespace {
 
 // Decode standard base64 (agents ship live frames as base64 text — see the
 // note in the WS onMessage frame handler for why text, not binary). Skips
-// padding and whitespace. Mirrors fromBase64() in Start.cpp; core has toBase64
+// padding and whitespace. Mirrors b64decode() in Start.cpp; core has toBase64
 // but no decoder.
-vector<unsigned char> fromBase64(const string& s) {
+vector<unsigned char> b64decode(const string& s) {
     auto val = [](char c) -> int {
         if (c >= 'A' && c <= 'Z') return c - 'A';
         if (c >= 'a' && c <= 'z') return c - 'a' + 26;
@@ -81,6 +83,7 @@ struct ServeOptions {
                               // independent of any venue's local --log-keep
     bool   autoApprove = false;  // execute mutating /mcp calls directly (no queue)
     int    approvalTtlSec = 900; // pending approvals expire after this
+    int    offlineAfterSec = 120; // heartbeat silence before the offline event
 };
 
 struct ImageSlot {
@@ -102,6 +105,7 @@ struct AppState {
     chrono::steady_clock::time_point lastSeen{};
     int64_t  lastSeenUnix = 0;                      // wall-clock last report (0 = never); persisted
     bool     hidden = false;                        // hidden from the wall (restorable)
+    bool     notifiedOffline = false;               // offline event fired (notify sinks)
     vector<unsigned char> thumb;                    // latest JPEG
     uint64_t thumbSeq = 0;                          // bumped per upload (cache busting)
     map<string, ImageSlot> images;                  // custom statusImage uploads
@@ -151,6 +155,69 @@ bool g_autoApprove = false;
 int  g_approvalTtlSec = 900;
 
 fs::path approvalsPath(const fs::path& dataDir) { return dataDir / "approvals.json"; }
+
+// ---- serve-side notify (sinks) --------------------------------------------
+// Same engine as the venue's `sinks` config, configured fleet-wide in ONE
+// place: <dataDir>/sinks.json (settings "Notify" tab edits it). Each sink can
+// scope to groups / "app:<id>" — an app:<id>-only sink behaves like the same
+// sink configured on that venue. Events: everything venues push (restart/up/
+// down/update/stop/alert) plus serve-only approval / offline / online.
+shared_ptr<Notifier> g_serveNotifier;
+mutex g_serveNotifierMutex;
+
+fs::path sinksPath(const fs::path& dataDir) { return dataDir / "sinks.json"; }
+
+// (Re)build the notifier from sinks.json. Returns how many sinks are armed.
+int loadServeSinks(const fs::path& dataDir) {
+    Json arr = Json::array();
+    {
+        ifstream in(sinksPath(dataDir));
+        if (in) {
+            try {
+                Json j = Json::parse(in);
+                if (j.is_array()) arr = j;
+                else if (j.is_object() && j["sinks"].is_array()) arr = j["sinks"];
+            } catch (...) {
+                logWarning("anchorbolt") << "sinks.json is not valid JSON; notify disabled";
+            }
+        }
+    }
+    auto cfgs = parseSinks(arr, dataDir);
+    // uptime-kuma needs one monitor per venue: allow it only when scoped to
+    // exactly one app (then it beats while THAT app's heartbeats are fresh —
+    // venue parity). Broader scopes have no sound "healthy" semantics here.
+    for (auto it = cfgs.begin(); it != cfgs.end();) {
+        if (it->heartbeat &&
+            !(it->scope.size() == 1 && it->scope[0].rfind("app:", 0) == 0)) {
+            logWarning("anchorbolt") << "sink '" << it->name
+                << "' skipped: uptime-kuma on the server needs scope [\"app:<id>\"]";
+            it = cfgs.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    int armed = (int)cfgs.size();
+    shared_ptr<Notifier> fresh =
+        cfgs.empty() ? nullptr : make_shared<Notifier>(std::move(cfgs), "fleet");
+    shared_ptr<Notifier> old;
+    {
+        lock_guard<mutex> lock(g_serveNotifierMutex);
+        old = std::exchange(g_serveNotifier, fresh);
+    }
+    if (old) old->flushAndStop();
+    return armed;
+}
+
+// Fire a fleet-level event into the sinks (no-op when none configured).
+void serveNotify(const fs::path& dataDir, const string& app,
+                 const string& event, const string& msg) {
+    shared_ptr<Notifier> n;
+    {
+        lock_guard<mutex> lock(g_serveNotifierMutex);
+        n = g_serveNotifier;
+    }
+    if (n) n->notify(event, msg, app, token::groupOf(dataDir.string(), app));
+}
 
 // Persist the queue (caller holds g_approvalsMutex). Decided entries are kept
 // so `get_approval` / the CLI can report the outcome; pruneData ages the file's
@@ -564,6 +631,7 @@ bool parseArgs(const vector<string>& args, ServeOptions& opt) {
         else if (a == "--keep-days")         { auto v = next("--keep-days"); if (!v) return false; opt.keepDays = stoi(*v); }
         else if (a == "--auto-approve")      { opt.autoApprove = true; }
         else if (a == "--approval-ttl")      { auto v = next("--approval-ttl"); if (!v) return false; opt.approvalTtlSec = stoi(*v); }
+        else if (a == "--offline-after")     { auto v = next("--offline-after"); if (!v) return false; opt.offlineAfterSec = stoi(*v); }
         else {
             cerr << "anchorbolt serve: unknown option '" << a << "'" << endl;
             return false;
@@ -716,6 +784,10 @@ Json enqueueApproval(const fs::path& dataDir, Approval a) {
     }
     logNotice("anchorbolt") << "approval " << id << " queued: " << a.action
                             << " on " << a.app << " (by " << a.requestedBy << ")";
+    serveNotify(dataDir, a.app, "approval",
+                (a.action == "call" ? "call " + a.tool : a.action) +
+                " requested by " + a.requestedBy + " (" + id +
+                ") — approve on the dashboard or `anchorbolt approvals`");
     for (int i = 0; i < 40 && !g_stop; i++) {
         this_thread::sleep_for(chrono::milliseconds(500));
         lock_guard<mutex> lock(g_approvalsMutex);
@@ -1369,6 +1441,8 @@ R"HTML(
   .sBtn.danger:hover { background: #3a2222; }
   .sRow { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 10px; }
   .sNote { color: #7d838e; font-size: 12px; margin-top: 6px; }
+  .sHelpLink { color: #79b8ff; font-size: 12px; text-decoration: none; }
+  .sHelpLink:hover { text-decoration: underline; }
   .sReveal { background: #101216; border: 1px solid #2b4a35; border-radius: 6px;
              color: #4ecb71; font: 12px ui-monospace, Menlo, monospace;
              padding: 8px 10px; margin-top: 8px; word-break: break-all; }
@@ -1409,6 +1483,7 @@ R"HTML(
       <div class="sTabs">
         <button class="sTab active" data-pane="pApps">Apps</button>
         <button class="sTab" data-pane="pOps">Operators</button>
+        <button class="sTab" data-pane="pNotify">Notify</button>
       </div>
       <span style="flex:1"></span>
       <button id="sClose" title="close" style="background:none;border:none;color:#7d838e;font-size:22px;cursor:pointer;line-height:1">&times;</button>
@@ -1456,6 +1531,26 @@ R"HTML(
         <button class="sBtn" id="sShareAdd">Create link</button>
       </div>
       <div class="sReveal" id="sShareOut" hidden></div>
+    </div>
+
+    <div id="pNotify" class="sPane" hidden>
+      <table class="sTable">
+        <colgroup><col style="width:13%"><col style="width:41%"><col style="width:15%"><col style="width:15%"><col></colgroup>
+        <thead><tr><th>preset</th><th>webhook url</th><th>events</th><th>scope</th><th></th></tr></thead>
+        <tbody id="sSinks"></tbody>
+      </table>
+      <div class="sRow">
+        <button class="sBtn" id="sSinkAdd">Add</button>
+        <button class="sBtn" id="sSinkSave">Save all</button>
+        <span style="flex:1"></span>
+        <a class="sHelpLink" href="/help/notify" target="_blank" rel="noopener">How to get a webhook URL &nearr;</a>
+      </div>
+      <div class="sNote">Fleet-wide notifications, one place for every venue.
+        <b>events</b>: comma list of restart, up, down, update, stop, alert,
+        approval, offline, online — blank = all. <b>scope</b>: groups /
+        <code>app:&lt;id&gt;</code> like operator scope — blank = every app.
+        A venue's own <code>sinks</code> config keeps working independently.</div>
+      <div class="sReveal" id="sSinkOut" hidden></div>
     </div>
   </div>
 </div>
@@ -2703,11 +2798,106 @@ async function openSettings() {
   byId('sOpToken').hidden = true;
   byId('sPairOut').hidden = true;
   byId('sShareOut').hidden = true;
+  byId('sSinkOut').hidden = true;
   showSettingsPane('pApps');
   loadSettingsApps();
   loadSettingsOps();
   loadSettingsShares();
+  loadSettingsSinks();
 }
+
+)HTML"
+R"HTML(// ---- Notify tab: fleet-wide webhook sinks (sinks.json) --------------------
+// Rows are edited in place; Save all posts the whole array and re-arms the
+// notifier. Test fires the ROW AS EDITED (not as saved) so a URL can be
+// verified before committing.
+let sinkRows = [];   // plain config objects backing the table
+
+function sinkRowEl(cfg, idx) {
+  const tr = document.createElement('tr');
+  const presets = ['slack', 'discord', 'ntfy', 'uptime-kuma', ''];
+  const sel = document.createElement('select');
+  sel.replaceChildren(...presets.map(p =>
+    new Option(p === '' ? 'generic' : p, p, false, (cfg.preset || '') === p)));
+  sel.addEventListener('change', () => { cfg.preset = sel.value; });
+  const url = Object.assign(document.createElement('input'),
+                            {value: cfg.url || '', placeholder: 'https://hooks...'});
+  url.style.width = '95%';
+  url.addEventListener('input', () => { cfg.url = url.value.trim(); });
+  const ev = Object.assign(document.createElement('input'),
+                           {value: (cfg.events || []).join(','), placeholder: 'all'});
+  ev.style.width = '90%';
+  ev.addEventListener('input', () => {
+    cfg.events = ev.value.split(',').map(s => s.trim()).filter(Boolean);
+    if (!cfg.events.length) delete cfg.events;
+  });
+  const sc = Object.assign(document.createElement('input'),
+                           {value: (cfg.scope || []).join(','), placeholder: 'all apps'});
+  sc.style.width = '90%';
+  sc.addEventListener('input', () => {
+    cfg.scope = sc.value.split(',').map(s => s.trim()).filter(Boolean);
+    if (!cfg.scope.length) delete cfg.scope;
+  });
+  const test = Object.assign(document.createElement('button'),
+                             {className: 'sBtn', textContent: 'Test'});
+  test.addEventListener('click', async () => {
+    test.disabled = true; test.textContent = '...';
+    let r;
+    try { r = await (await stPost('/api/admin/sinks/test', cfg)).json(); }
+    catch { r = { ok: false, error: 'request failed' }; }
+    test.disabled = false; test.textContent = 'Test';
+    const out = byId('sSinkOut');
+    out.hidden = false;
+    out.textContent = r.ok ? 'test delivered (' + (r.status || '?') + ')'
+                           : 'test FAILED: ' + (r.error || 'unknown');
+  });
+  const del = Object.assign(document.createElement('button'),
+                            {className: 'sBtn', textContent: '×', title: 'remove'});
+  del.addEventListener('click', () => { sinkRows.splice(idx, 1); renderSinkRows(); });
+  for (const el of [sel, url, ev, sc]) {
+    const td = document.createElement('td');
+    td.appendChild(el);
+    tr.appendChild(td);
+  }
+  const acts = document.createElement('td');
+  acts.className = 'acts';
+  acts.append(test, del);
+  tr.appendChild(acts);
+  return tr;
+}
+
+function renderSinkRows() {
+  const tb = byId('sSinks');
+  if (!sinkRows.length) {
+    tb.replaceChildren(stMsg(5, 'no sinks yet — Add one, Test it, then Save all'));
+    return;
+  }
+  tb.replaceChildren(...sinkRows.map(sinkRowEl));
+}
+
+async function loadSettingsSinks() {
+  try { sinkRows = await (await fetch('/api/admin/sinks')).json(); } catch { sinkRows = []; }
+  if (!Array.isArray(sinkRows)) sinkRows = [];
+  renderSinkRows();
+}
+
+byId('sSinkAdd').addEventListener('click', () => {
+  sinkRows.push({ preset: 'slack', url: '' });
+  renderSinkRows();
+});
+
+byId('sSinkSave').addEventListener('click', async () => {
+  const out = byId('sSinkOut');
+  out.hidden = false;
+  try {
+    const r = await (await stPost('/api/admin/sinks', sinkRows)).json();
+    out.textContent = 'saved — ' + r.armed + ' sink(s) armed';
+  } catch {
+    out.textContent = 'save failed';
+  }
+});
+)HTML"
+R"HTML(
 
 // One "Apps" table over every app-id this server knows: the union of apps
 // that have reported and app-ids that hold an agent token (a venue can be
@@ -2885,6 +3075,77 @@ setInterval(refresh, 3000);
 </html>
 )HTML";
 
+// Webhook setup guide behind /help/notify — kept deliberately short: each
+// service is three steps ending in "paste the URL". A Slack-specific connect
+// button was considered and rejected: webhook creation happens inside Slack's
+// own admin UI either way, so a button can't shorten anything.
+const char* kNotifyHelpHtml = R"HTML(<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AnchorBolt — webhook setup</title>
+<style>
+  body { background: #16181d; color: #d4d7dd; margin: 0 auto; max-width: 720px;
+         padding: 32px 20px 64px;
+         font: 14px/1.7 -apple-system, "Segoe UI", Roboto, sans-serif; }
+  h1 { font-size: 20px; letter-spacing: .03em; }
+  h2 { font-size: 16px; margin-top: 32px; border-bottom: 1px solid #2a2e36;
+       padding-bottom: 6px; }
+  ol { padding-left: 22px; }
+  li { margin: 6px 0; }
+  code { background: #23262d; border-radius: 4px; padding: 1px 6px;
+         font: 12px ui-monospace, "SF Mono", Menlo, monospace; }
+  a { color: #79b8ff; }
+  .muted { color: #7d838e; font-size: 13px; }
+</style>
+</head>
+<body>
+<h1>Getting a webhook URL</h1>
+<p>Every notify sink boils down to one thing: a URL AnchorBolt can POST to.
+Create it in the service below, paste it into the <b>webhook url</b> field on
+the Notify tab, hit <b>Test</b>, then <b>Save all</b>.</p>
+
+<h2>Slack</h2>
+<ol>
+  <li>Open <a href="https://api.slack.com/apps" target="_blank" rel="noopener">api.slack.com/apps</a>
+      &rarr; <b>Create New App</b> &rarr; From scratch, pick your workspace.</li>
+  <li>In the app: <b>Incoming Webhooks</b> &rarr; toggle <b>On</b> &rarr;
+      <b>Add New Webhook to Workspace</b> &rarr; choose the channel.</li>
+  <li>Copy the generated <code>https://hooks.slack.com/services/...</code> URL.</li>
+</ol>
+
+<h2>Discord</h2>
+<ol>
+  <li>Server settings of the target channel &rarr; <b>Integrations</b> &rarr;
+      <b>Webhooks</b> &rarr; <b>New Webhook</b>.</li>
+  <li>Pick the channel, then <b>Copy Webhook URL</b>
+      (<code>https://discord.com/api/webhooks/...</code>).</li>
+</ol>
+
+<h2>ntfy (no account needed)</h2>
+<ol>
+  <li>Pick a topic name nobody would guess, e.g. <code>myfleet-x7k2q9</code>.</li>
+  <li>The URL is just <code>https://ntfy.sh/&lt;topic&gt;</code>.</li>
+  <li>Subscribe to the same topic in the ntfy phone app / web app.</li>
+</ol>
+
+<h2>Uptime Kuma</h2>
+<ol>
+  <li>Add a monitor of type <b>Push</b>; Kuma shows a push URL
+      (<code>.../api/push/&lt;token&gt;</code>). Paste that.</li>
+  <li>Scope the sink to exactly one app (<code>app:&lt;id&gt;</code>) — Kuma
+      gets pinged while that venue's heartbeats stay fresh and alerts when
+      they stop.</li>
+</ol>
+
+<p class="muted">The webhook URL is a secret: anyone holding it can post to
+your channel. It is stored on the server (sinks.json in the data directory)
+and shown only on the admin Notify tab.</p>
+</body>
+</html>
+)HTML";
+
 } // namespace
 
 int cmdServe(const vector<string>& args) {
@@ -3009,7 +3270,7 @@ int cmdServe(const vector<string>& args) {
                 if (it == g_agents.byClient.end()) return;
                 app = it->second;
             }
-            auto jpg = fromBase64(data);
+            auto jpg = b64decode(data);
             if (jpg.empty()) return;
             lock_guard<mutex> lock(g_appsMutex);
             auto& st = g_apps[app];
@@ -3235,6 +3496,87 @@ int cmdServe(const vector<string>& args) {
         res.set_content(out.dump(), "application/json");
     });
 
+    // Notify sinks (settings "Notify" tab): the raw sinks.json array. Admin
+    // only — webhook URLs are secrets, and admins are the ones who manage them.
+    svr.Get("/api/admin/sinks", [dataDir, requireRole](const httplib::Request& req, httplib::Response& res) {
+        if (!requireRole(req, res, 3)) return;
+        Json arr = Json::array();
+        ifstream in(sinksPath(dataDir));
+        if (in) {
+            try {
+                Json j = Json::parse(in);
+                if (j.is_array()) arr = j;
+                else if (j.is_object() && j["sinks"].is_array()) arr = j["sinks"];
+            } catch (...) {}
+        }
+        res.set_content(arr.dump(), "application/json");
+    });
+
+    // Replace the whole sink list and re-arm the notifier immediately.
+    svr.Post("/api/admin/sinks", [dataDir, requireRole, parseBody](const httplib::Request& req, httplib::Response& res) {
+        if (!requireRole(req, res, 3)) return;
+        Json body;
+        if (!parseBody(req, res, body)) return;
+        if (!body.is_array()) { res.status = 400; res.set_content("expected a JSON array", "text/plain"); return; }
+        {
+            ofstream out(sinksPath(dataDir));
+            out << body.dump(2) << "\n";
+        }
+        int n = loadServeSinks(dataDir);
+        res.set_content(Json{{"ok", true}, {"armed", n}}.dump(), "application/json");
+    });
+
+    // Fire a "test" event through ONE sink config (as posted, not as saved) so
+    // a URL can be verified before committing it. Synchronous: waits for the
+    // delivery attempt and reports whether it went out.
+    svr.Post("/api/admin/sinks/test", [dataDir, requireRole, parseBody](const httplib::Request& req, httplib::Response& res) {
+        if (!requireRole(req, res, 3)) return;
+        Json body;
+        if (!parseBody(req, res, body)) return;
+        auto cfgs = parseSinks(Json::array({body}), dataDir);
+        if (cfgs.empty()) { res.status = 400; res.set_content("invalid sink (missing url?)", "text/plain"); return; }
+        const SinkConfig& c = cfgs[0];
+        // One direct, synchronous delivery so the outcome can be REPORTED —
+        // the whole point of a test button. Heartbeat (kuma) sinks get one
+        // ?status=up ping; event sinks get a rendered "test" event.
+        tcx::curl::HttpClient cli;
+        cli.setBaseUrl(c.url);
+        cli.setTimeout(5);
+        cli.setFollowRedirects(true);
+        tcx::curl::HttpResponse r;
+        if (c.heartbeat) {
+            string sep = c.url.find('?') == string::npos ? "?" : "&";
+            r = cli.request(c.method, sep + "status=up&msg=test", "", c.contentType);
+        } else {
+            string tmplBody = c.bodyTemplate;
+            bool js = c.contentType.find("json") != string::npos;
+            auto sub = [&](const char* key, const string& v) {
+                string esc = v;
+                if (js) {
+                    string o;
+                    for (char ch : esc) {
+                        if (ch == '"' || ch == '\\') { o += '\\'; o += ch; }
+                        else if (ch == '\n') o += "\\n";
+                        else o += ch;
+                    }
+                    esc = o;
+                }
+                for (size_t pos = 0; (pos = tmplBody.find(key, pos)) != string::npos;
+                     pos += esc.size())
+                    tmplBody.replace(pos, strlen(key), esc);
+            };
+            sub("{{app}}", "test");
+            sub("{{event}}", "test");
+            sub("{{msg}}", "test notification from AnchorBolt");
+            sub("{{time}}", getTimestampString("%Y-%m-%dT%H:%M:%S"));
+            r = cli.request(c.method, "", tmplBody, c.contentType);
+        }
+        res.set_content(Json{{"ok", r.ok()},
+                            {"status", r.statusCode},
+                            {"error", r.ok() ? "" : (r.statusCode ? "HTTP " + to_string(r.statusCode) : r.error)}}.dump(),
+                        "application/json");
+    });
+
     svr.Get("/api/admin/operators", [dataDir, requireRole](const httplib::Request& req, httplib::Response& res) {
         if (!requireRole(req, res, 3)) return;
         res.set_content(dumpSafeS(token::listOperators(dataDir.string())), "application/json");
@@ -3435,6 +3777,12 @@ int cmdServe(const vector<string>& args) {
 
     svr.Get("/", [](const httplib::Request&, httplib::Response& res) {
         res.set_content(kDashboardHtml, "text/html");
+    });
+
+    // Webhook setup guide, linked from the settings Notify tab (opens in a new
+    // tab). Static documentation, no secrets — served without auth.
+    svr.Get("/help/notify", [](const httplib::Request&, httplib::Response& res) {
+        res.set_content(kNotifyHelpHtml, "text/html");
     });
 
     // Agent push: health JSON. Body = get_health result + {"app": "<id>"}.
@@ -3764,6 +4112,10 @@ int cmdServe(const vector<string>& args) {
             LogLine line{st.nextAlertSeq++, a.value("at", now), ev, a.value("text", "")};
             if (line.text.empty()) continue;
             out << Json({{"at", line.at}, {"event", ev}, {"text", line.text}}).dump() << "\n";
+            // Fan out to serve-side sinks too (fleet-wide notify config); the
+            // venue's own sinks fire independently — both configured = both
+            // deliver, by design.
+            serveNotify(dataDir, id, ev, line.text);
             st.alerts.push_back(std::move(line));
             if (st.alerts.size() > 100) st.alerts.pop_front();
             if (ev == "restart" || ev == "down" || ev == "alert") ++st.unackedAlerts;
@@ -3978,6 +4330,8 @@ int cmdServe(const vector<string>& args) {
     // keeps its data. Best-effort; left behind on unclean exit, which is fine —
     // consumers only trust it if the directory still exists.
     datadir::writeServePointer(dataDir, opt.port);
+    if (int n = loadServeSinks(dataDir))
+        logNotice("anchorbolt") << "notify: " << n << " sink(s) armed (sinks.json)";
 
     // svr.listen() blocks; a watcher thread turns the signal flag into stop().
     thread stopWatcher([&svr]() {
@@ -4003,6 +4357,53 @@ int cmdServe(const vector<string>& args) {
             for (int i = 0; i < 300 && !g_stop; ++i)
                 this_thread::sleep_for(chrono::milliseconds(100));
             flushAppRegistry(dataDir);
+        }
+    });
+
+    // Offline/online watcher for the notify sinks: a venue that stops
+    // heartbeating can't report its own death — only serve can see the
+    // silence. First pass only baselines (a serve restart must not re-announce
+    // every long-gone venue); transitions after that fire offline / online.
+    // Fresh apps also feed per-app uptime-kuma sinks.
+    thread offlineWatcher([dataDir, opt]() {
+        bool baseline = true;
+        while (!g_stop) {
+            vector<pair<string, int>> events;   // (id, 0=offline 1=online 2=tick)
+            {
+                lock_guard<mutex> lock(g_appsMutex);
+                auto now = chrono::steady_clock::now();
+                for (auto& [id, st] : g_apps) {
+                    bool reported = st.lastSeen != chrono::steady_clock::time_point{};
+                    if (!reported) continue;
+                    bool offline =
+                        now - st.lastSeen > chrono::seconds(opt.offlineAfterSec);
+                    if (baseline) {
+                        st.notifiedOffline = offline;
+                    } else if (offline != st.notifiedOffline) {
+                        st.notifiedOffline = offline;
+                        events.push_back({id, offline ? 0 : 1});
+                    }
+                    if (!offline) events.push_back({id, 2});
+                }
+            }
+            baseline = false;
+            for (auto& [id, kind] : events) {
+                if (kind == 0) {
+                    serveNotify(dataDir, id, "offline",
+                                "no heartbeat for " + to_string(opt.offlineAfterSec) + "s");
+                } else if (kind == 1) {
+                    serveNotify(dataDir, id, "online", "heartbeat resumed");
+                } else {
+                    shared_ptr<Notifier> n;
+                    {
+                        lock_guard<mutex> lk(g_serveNotifierMutex);
+                        n = g_serveNotifier;
+                    }
+                    if (n) n->healthyTick(id);
+                }
+            }
+            for (int i = 0; i < 100 && !g_stop; ++i)
+                this_thread::sleep_for(chrono::milliseconds(100));
         }
     });
 
@@ -4061,6 +4462,15 @@ int cmdServe(const vector<string>& args) {
     pruner.join();
     registrar.join();
     approvalSweeper.join();
+    offlineWatcher.join();
+    {
+        shared_ptr<Notifier> n;
+        {
+            lock_guard<mutex> lock(g_serveNotifierMutex);
+            n = std::exchange(g_serveNotifier, nullptr);
+        }
+        if (n) n->flushAndStop();   // queued events still get out on shutdown
+    }
     flushAppRegistry(dataDir);   // final snapshot so nothing since the last flush is lost
     g_agents.hub.stop();
 

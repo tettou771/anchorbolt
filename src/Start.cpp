@@ -178,7 +178,7 @@ optional<Json> callTool(httplib::Client& cli, const string& name,
 
 // Decode standard base64 (tc_get_screenshot ships its images this way; core has
 // toBase64 but no decoder yet). Skips padding and whitespace.
-vector<unsigned char> fromBase64(const string& s) {
+vector<unsigned char> b64decode(const string& s) {
     auto val = [](char c) -> int {
         if (c >= 'A' && c <= 'Z') return c - 'A';
         if (c >= 'a' && c <= 'z') return c - 'a' + 26;
@@ -2118,14 +2118,14 @@ int cmdStart(const vector<string>& args) {
                                                {"width", opt.thumbWidth},
                                                {"quality", opt.thumbQuality}})) {
                             if (t->contains("data") && (*t)["data"].is_string()) {
-                                auto jpg = fromBase64((*t)["data"].get<string>());
+                                auto jpg = b64decode((*t)["data"].get<string>());
                                 if (!jpg.empty()) push->thumbnail(jpg);
                             }
                         }
                         for (const auto& n : imageNames) {
                             if (auto t = callTool(cli, "tc_get_status_image", {{"name", n}})) {
                                 if (t->contains("data") && (*t)["data"].is_string()) {
-                                    auto jpg = fromBase64((*t)["data"].get<string>());
+                                    auto jpg = b64decode((*t)["data"].get<string>());
                                     if (!jpg.empty()) push->image(n, jpg);
                                 }
                             }

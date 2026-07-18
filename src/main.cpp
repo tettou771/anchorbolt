@@ -128,7 +128,14 @@ static void printHelp(bool verbose) {
         "                     approval — dashboard Approvals badge, or on this machine\n"
         "                     'anchorbolt approvals list|approve [id]|deny [id]'\n"
         "                     (unique id prefixes ok; id optional when one pending).\n"
-        "  --approval-ttl <sec>  pending approvals expire after this (default 900)\n";
+        "  --approval-ttl <sec>  pending approvals expire after this (default 900)\n"
+        "  --offline-after <sec> heartbeat silence before a venue counts as offline\n"
+        "                     for notify sinks (default 120)\n"
+        "\n"
+        "  Fleet-wide notifications: <data>/sinks.json (edited on the dashboard's\n"
+        "  Notify tab; same engine + presets as the venue-side 'sinks' config, plus\n"
+        "  per-sink 'scope' [groups / app:<id>] and serve-only events approval /\n"
+        "  offline / online).\n";
 }
 
 int main(int argc, char* argv[]) {

@@ -54,6 +54,16 @@ string hostOf(const string& url) {
 
 } // namespace
 
+bool sinkCovers(const SinkConfig& cfg, const string& app, const string& group) {
+    if (cfg.scope.empty()) return true;
+    for (const auto& s : cfg.scope) {
+        if (s == "all" || s == "All" || s == "ALL" || s == "*") return true;
+        if (s == "app:" + app) return true;
+        if (!group.empty() && s == group) return true;
+    }
+    return false;
+}
+
 vector<SinkConfig> parseSinks(const Json& arr, const fs::path& configDir) {
     vector<SinkConfig> out;
     if (!arr.is_array()) return out;
@@ -103,6 +113,9 @@ vector<SinkConfig> parseSinks(const Json& arr, const fs::path& configDir) {
         if (j.contains("events") && j["events"].is_array()) {
             for (auto& e : j["events"]) c.events.push_back(e.get<string>());
         }
+        if (j.contains("scope") && j["scope"].is_array()) {
+            for (auto& s : j["scope"]) if (s.is_string()) c.scope.push_back(s.get<string>());
+        }
         if (!c.heartbeat && c.bodyTemplate.empty()) {
             c.bodyTemplate =
                 R"({"app":"{{app}}","event":"{{event}}","msg":"{{msg}}","time":"{{time}}"})";
@@ -125,10 +138,16 @@ Notifier::~Notifier() {
 }
 
 void Notifier::notify(const string& event, const string& msg) {
-    Pending p{event, msg, getTimestampString("%Y-%m-%dT%H:%M:%S")};
+    notify(event, msg, "", "");
+}
+
+void Notifier::notify(const string& event, const string& msg,
+                      const string& app, const string& group) {
+    Pending p{event, msg, getTimestampString("%Y-%m-%dT%H:%M:%S"), app};
     lock_guard<mutex> lock(mutex_);
     for (auto& s : sinks_) {
         if (s.cfg.heartbeat || !wants(s, event)) continue;
+        if (!app.empty() && !sinkCovers(s.cfg, app, group)) continue;
         s.queue.push_back(p);
         if (s.queue.size() > 100) s.queue.pop_front();  // bounded; oldest goes
     }
@@ -138,6 +157,16 @@ void Notifier::notify(const string& event, const string& msg) {
 void Notifier::healthyTick() {
     lock_guard<mutex> lock(mutex_);
     lastHealthy_ = chrono::steady_clock::now();
+}
+
+void Notifier::healthyTick(const string& app) {
+    lock_guard<mutex> lock(mutex_);
+    for (auto& s : sinks_) {
+        if (s.cfg.heartbeat && s.cfg.scope.size() == 1 &&
+            s.cfg.scope[0] == "app:" + app) {
+            s.lastHealthyScoped = chrono::steady_clock::now();
+        }
+    }
 }
 
 bool Notifier::wants(const SinkState& s, const string& event) const {
@@ -156,7 +185,7 @@ bool Notifier::send(SinkState& s, const Pending& p) {
     auto sub = [&](const char* key, const string& v) {
         replaceAll(body, key, json ? jsonEscape(v) : v);
     };
-    sub("{{app}}", appId_);
+    sub("{{app}}", p.app.empty() ? appId_ : p.app);
     sub("{{event}}", p.event);
     sub("{{msg}}", p.msg);
     sub("{{time}}", p.time);
@@ -241,8 +270,12 @@ void Notifier::worker() {
                 bool healthyNow;
                 {
                     lock_guard<mutex> lock(mutex_);
-                    healthyNow = lastHealthy_.time_since_epoch().count() != 0 &&
-                                 now - lastHealthy_ < chrono::seconds(30);
+                    // Venue path feeds the global tick; serve's per-app kuma
+                    // sinks feed the scoped one. Either being fresh counts.
+                    healthyNow = (lastHealthy_.time_since_epoch().count() != 0 &&
+                                  now - lastHealthy_ < chrono::seconds(30)) ||
+                                 (s.lastHealthyScoped.time_since_epoch().count() != 0 &&
+                                  now - s.lastHealthyScoped < chrono::seconds(30));
                 }
                 if (healthyNow && now - s.lastBeat >= chrono::seconds(s.cfg.intervalSec)) {
                     s.lastBeat = now;
