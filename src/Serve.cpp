@@ -1026,27 +1026,20 @@ const char* kDashboardHtml = R"HTML(<!DOCTYPE html>
   #dLog .ll.sup  { color: #7ea6d9; }
   #dLog .ll .lt  { color: #565c66; margin-right: 8px; }
   #dLog .empty   { color: #4a4f59; padding: 12px; }
-  #dShot { background: #1b2733; color: #7ea6d9; border: 1px solid #2c4257;
+  /* View actions (safe): Screenshot, Live — blue (see #dLiveBtn below). */
+  #dShot { background: #1c2a3a; color: #79b8ff; border: 1px solid #2c405a;
            border-radius: 6px; font-size: 12px; padding: 4px 12px;
            cursor: pointer; flex: none; }
-  #dShot:hover { background: #223244; }
+  #dShot:hover { background: #223449; }
   #dShot:disabled { opacity: .45; cursor: default; }
   #dShot[hidden] { display: none; }
-  #dRestart { background: #33251a; color: #e0a06a; border: 1px solid #55402c;
+  /* Mutating actions (all risky): Update, Roll back, Restart — orange. */
+  #dUpdate, #dRollback, #dRestart {
+              background: #33251a; color: #e0a06a; border: 1px solid #55402c;
               border-radius: 6px; font-size: 12px; padding: 4px 12px;
               cursor: pointer; flex: none; }
-  #dRestart:hover { background: #40301f; }
-  #dRestart:disabled { opacity: .45; cursor: default; }
-  #dUpdate { background: #1a2f22; color: #4ecb71; border: 1px solid #2b4a35;
-             border-radius: 6px; font-size: 12px; padding: 4px 12px;
-             cursor: pointer; flex: none; }
-  #dUpdate:hover { background: #223c2b; }
-  #dUpdate:disabled { opacity: .45; cursor: default; }
-  #dRollback { background: none; color: #7d838e; border: 1px solid #323844;
-               border-radius: 6px; font-size: 12px; padding: 4px 10px;
-               cursor: pointer; flex: none; }
-  #dRollback:hover { color: #d4d7dd; }
-  #dRollback:disabled { opacity: .45; cursor: default; }
+  #dUpdate:hover, #dRollback:hover, #dRestart:hover { background: #40301f; }
+  #dUpdate:disabled, #dRollback:disabled, #dRestart:disabled { opacity: .45; cursor: default; }
   #dConsole { background: #101216; border: 1px solid #262b34; border-radius: 8px;
               padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
   #dConsole .row { display: flex; gap: 8px; }
@@ -1231,10 +1224,10 @@ R"HTML(
       <div class="dTitleRow">
         <span class="dot" id="dDot"></span>
         <h2 id="dTitle"></h2>
-        <button id="dShot" title="grab a screenshot now and download it" hidden>Screenshot</button>
         <button id="dClose" title="close">&times;</button>
       </div>
       <div class="dBtnRow" id="dBtns" hidden>
+        <button id="dShot" title="grab a screenshot now and download it">Screenshot</button>
         <button id="dLiveBtn" title="live view + remote control">Live</button>
         <button id="dUpdate" title="git pull + build + restart on the venue machine">Update</button>
         <button id="dRollback" title="restore the previous binary">Roll back</button>
@@ -1701,9 +1694,6 @@ async function renderDetail() {
   const caps = (app.health && app.health.caps) || {};
   const canOperate = myRole !== 'viewer';   // null (open mode) / operator / admin
   document.getElementById('dBtns').hidden = !app.live || !canOperate;
-  // Screenshot rides the title row (not the live-gated button row): live venues
-  // give a fresh full-res grab, offline ones fall back to the last thumbnail.
-  document.getElementById('dShot').hidden = !canOperate;
   document.getElementById('dUpdate').hidden = !caps.update;
   document.getElementById('dRollback').hidden = !caps.update;
   const h = app.health || {};
@@ -1849,9 +1839,9 @@ function fileStamp() {
        + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds());
 }
 
-// Instant screenshot -> download. A live venue relays tc_get_screenshot for a
-// fresh full-res PNG; offline (or on any relay failure) we fall back to the last
-// thumbnail already on the server, so a click always yields a file.
+// Instant screenshot -> download. The button lives in the live-gated row, so it
+// relays tc_get_screenshot for a fresh full-res PNG; on any relay failure it
+// falls back to the last thumbnail on the server, so a click always yields a file.
 document.getElementById('dShot').addEventListener('click', async () => {
   if (!detailId) return;
   const id = detailId;
