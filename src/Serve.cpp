@@ -1026,6 +1026,12 @@ const char* kDashboardHtml = R"HTML(<!DOCTYPE html>
   #dLog .ll.sup  { color: #7ea6d9; }
   #dLog .ll .lt  { color: #565c66; margin-right: 8px; }
   #dLog .empty   { color: #4a4f59; padding: 12px; }
+  #dShot { background: #1b2733; color: #7ea6d9; border: 1px solid #2c4257;
+           border-radius: 6px; font-size: 12px; padding: 4px 12px;
+           cursor: pointer; flex: none; }
+  #dShot:hover { background: #223244; }
+  #dShot:disabled { opacity: .45; cursor: default; }
+  #dShot[hidden] { display: none; }
   #dRestart { background: #33251a; color: #e0a06a; border: 1px solid #55402c;
               border-radius: 6px; font-size: 12px; padding: 4px 12px;
               cursor: pointer; flex: none; }
@@ -1225,6 +1231,7 @@ R"HTML(
       <div class="dTitleRow">
         <span class="dot" id="dDot"></span>
         <h2 id="dTitle"></h2>
+        <button id="dShot" title="grab a screenshot now and download it" hidden>Screenshot</button>
         <button id="dClose" title="close">&times;</button>
       </div>
       <div class="dBtnRow" id="dBtns" hidden>
@@ -1471,7 +1478,7 @@ function lastSeenStamp(ageSec) {
   const d = new Date(Date.now() - ageSec * 1000);
   const p = n => String(n).padStart(2, '0');
   return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' '
-       + p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+       + p(d.getHours()) + ':' + p(d.getMinutes());
 }
 
 // Detail view: the absolute last-seen matters (until when was it visible), so
@@ -1694,6 +1701,9 @@ async function renderDetail() {
   const caps = (app.health && app.health.caps) || {};
   const canOperate = myRole !== 'viewer';   // null (open mode) / operator / admin
   document.getElementById('dBtns').hidden = !app.live || !canOperate;
+  // Screenshot rides the title row (not the live-gated button row): live venues
+  // give a fresh full-res grab, offline ones fall back to the last thumbnail.
+  document.getElementById('dShot').hidden = !canOperate;
   document.getElementById('dUpdate').hidden = !caps.update;
   document.getElementById('dRollback').hidden = !caps.update;
   const h = app.health || {};
@@ -1824,6 +1834,47 @@ document.getElementById('dRollback').addEventListener('click', async () => {
   btn.disabled = true;
   showResult(await sendCommand(detailId, { action: 'rollback' }));
   setTimeout(() => { btn.disabled = false; }, 3000);
+});
+
+function triggerDownload(href, filename) {
+  const a = document.createElement('a');
+  a.href = href; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+}
+
+// Compact timestamp for filenames, e.g. 20260718-110000.
+function fileStamp() {
+  const d = new Date(), p = n => String(n).padStart(2, '0');
+  return d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '-'
+       + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds());
+}
+
+// Instant screenshot -> download. A live venue relays tc_get_screenshot for a
+// fresh full-res PNG; offline (or on any relay failure) we fall back to the last
+// thumbnail already on the server, so a click always yields a file.
+document.getElementById('dShot').addEventListener('click', async () => {
+  if (!detailId) return;
+  const id = detailId;
+  const btn = document.getElementById('dShot');
+  const app = lastApps.find(a => a.id === id);
+  btn.disabled = true;
+  btn.textContent = 'Grabbing...';
+  try {
+    if (app && app.live) {
+      const r = await sendCommand(id, { action: 'call', tool: 'tc_get_screenshot', args: { format: 'png' } });
+      if (r.ok && r.result && r.result.data && r.result.mimeType) {
+        const ext = r.result.mimeType.indexOf('jpeg') >= 0 ? 'jpg' : 'png';
+        triggerDownload('data:' + r.result.mimeType + ';base64,' + r.result.data,
+                        id + '-' + fileStamp() + '.' + ext);
+        return;
+      }
+    }
+    // fallback: latest stored thumbnail (JPEG); cache-bust so it's the newest
+    triggerDownload('/api/thumb/' + encodeURIComponent(id) + '?dl=' + Date.now(),
+                    id + '-' + fileStamp() + '-thumb.jpg');
+  } finally {
+    if (detailId === id) { btn.disabled = false; btn.textContent = 'Screenshot'; }
+  }
 });
 
 async function loadTools(id) {
