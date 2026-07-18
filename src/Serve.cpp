@@ -4083,6 +4083,14 @@ int cmdApprovals(const std::vector<std::string>& args) {
         if (args[i] == "--data" && i + 1 < args.size()) dataDir = args[++i];
         else rest.push_back(args[i]);
     }
+    // A missing data dir would silently read as "no pending approvals" — the
+    // usual cause is running from a different cwd than serve; say so instead.
+    if (!fs::exists(dataDir)) {
+        cerr << "data directory not found: " << dataDir << "\n"
+             << "pass the same --data your serve uses, e.g.\n"
+             << "  anchorbolt approvals list --data ~/anchorbolt-data" << endl;
+        return 1;
+    }
     auto load = [&]() -> Json {
         ifstream in(fs::path(dataDir) / "approvals.json");
         if (!in) return Json::object();
