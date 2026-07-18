@@ -221,6 +221,59 @@ void loadAppRegistry(const fs::path& dataDir) {
     }
 }
 
+// Parse a thumbnail name "YYYYMMDD-HHMMSS..." to a unix time (local), 0 on fail.
+int64_t parseStampName(const string& n) {
+    if (n.size() < 15 || n[8] != '-') return 0;
+    try {
+        struct tm t{};
+        t.tm_year = stoi(n.substr(0, 4)) - 1900;
+        t.tm_mon  = stoi(n.substr(4, 2)) - 1;
+        t.tm_mday = stoi(n.substr(6, 2));
+        t.tm_hour = stoi(n.substr(9, 2));
+        t.tm_min  = stoi(n.substr(11, 2));
+        t.tm_sec  = stoi(n.substr(13, 2));
+        t.tm_isdst = -1;
+        return (int64_t)mktime(&t);
+    } catch (...) { return 0; }
+}
+
+// Every provisioned venue (an agent token in tokens.json) is a known app, even
+// if it hasn't reported to this build yet — so the wall matches the settings
+// Apps list. Seed a g_apps entry for each; ones the registry already filled keep
+// their state. For the rest, recover last-seen + the last screenshot from the
+// venue's own stored thumbnails (a known app, not a directory scan) so it shows
+// as an offline card; a venue with no history stays "waiting for first report".
+void loadKnownAgents(const fs::path& dataDir) {
+    Json agents = token::listAgents(dataDir.string());
+    auto nowSteady = chrono::steady_clock::now();
+    int64_t nowUnix = (int64_t)time(nullptr);
+    error_code ec;
+    lock_guard<mutex> lock(g_appsMutex);
+    for (auto& a : agents) {
+        string id = a.value("id", "");
+        if (id.empty()) continue;
+        auto& st = g_apps[id];
+        if (st.lastSeenUnix != 0) continue;   // registry already gave it real state
+        fs::path latest; string latestName;
+        for (auto& f : fs::directory_iterator(dataDir / id / "thumbs", ec)) {
+            string n = f.path().filename().string();
+            if (n.size() == 19 && n.compare(15, 4, ".jpg") == 0 && n > latestName) {
+                latestName = n; latest = f.path();
+            }
+        }
+        if (latest.empty()) continue;         // no history -> waiting for first report
+        int64_t ts = parseStampName(latestName);
+        if (ts > 0 && ts <= nowUnix) {
+            st.lastSeenUnix = ts;
+            st.lastSeen = nowSteady - chrono::seconds(nowUnix - ts);
+        }
+        ifstream tin(latest, ios::binary);
+        string data((istreambuf_iterator<char>(tin)), istreambuf_iterator<char>());
+        st.thumb.assign(data.begin(), data.end());
+        st.thumbSeq = 1;
+    }
+}
+
 atomic<bool> g_stop{false};
 void onSignal(int) { g_stop = true; }
 
@@ -3412,8 +3465,11 @@ int cmdServe(const vector<string>& args) {
     signal(SIGINT, onSignal);
     signal(SIGTERM, onSignal);
 
-    // Bring known apps back as offline cards so the wall survives a restart.
+    // Bring known apps back so the wall survives a restart: registry first
+    // (last-seen + health + thumbnail), then every token-holding venue (so a
+    // provisioned-but-quiet app still shows, matching the settings Apps list).
     loadAppRegistry(dataDir);
+    loadKnownAgents(dataDir);
 
     // svr.listen() blocks; a watcher thread turns the signal flag into stop().
     thread stopWatcher([&svr]() {
