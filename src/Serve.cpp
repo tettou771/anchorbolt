@@ -38,6 +38,7 @@
 
 #include "DataDir.h"
 #include "Sink.h"
+#include "Version.h"
 #include <tcxCurl.h>    // sink test button: one direct delivery, outcome reported
 
 using namespace std;
@@ -3389,7 +3390,7 @@ int cmdServe(const vector<string>& args) {
         if (method == "initialize") {
             reply["result"] = {{"protocolVersion", rpc["params"].value("protocolVersion", "2024-11-05")},
                                {"capabilities", {{"tools", Json::object()}}},
-                               {"serverInfo", {{"name", "anchorbolt"}, {"version", "0.0.1"}}}};
+                               {"serverInfo", {{"name", "anchorbolt"}, {"version", kAnchorboltVersion}}}};
         } else if (method == "tools/list") {
             reply["result"] = fleetToolsList();
         } else if (method == "tools/call") {

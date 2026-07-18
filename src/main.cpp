@@ -9,6 +9,7 @@
 #include "Start.h"
 #include "Serve.h"
 #include "Token.h"
+#include "Version.h"
 
 #include <algorithm>
 #include <iostream>
@@ -154,7 +155,8 @@ int main(int argc, char* argv[]) {
         return 0;
     }
     if (cmd == "-v" || cmd == "--version" || cmd == "version") {
-        cout << "AnchorBolt 0.0.1 (TrussC " << tc::getVersion() << ")" << endl;
+        cout << "AnchorBolt " << kAnchorboltVersion
+             << " (TrussC " << tc::getVersion() << ")" << endl;
         return 0;
     }
     if (cmd == "start") {
