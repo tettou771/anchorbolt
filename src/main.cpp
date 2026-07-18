@@ -1,6 +1,6 @@
 // =============================================================================
 // anchorbolt — TrussC installation ops tool
-//   start: kiosk mode — venue-side supervisor (spawn app, watchdog, thumbnails, sinks)
+//   start: kiosk mode — venue-side supervisor (spawn app, watchdog, thumbnails, notifications)
 //   serve: fleet server (dashboard, storage, WS hub)
 // One binary, both ends of the protocol. Uses TrussC as a library (no window).
 // =============================================================================
@@ -19,7 +19,7 @@
 using namespace std;
 
 // Short help by default; the full reference is behind --help --verbose so the
-// everyday flags aren't buried under watchdog/thumbnail/sink/update tuning.
+// everyday flags aren't buried under watchdog/thumbnail/notify/update tuning.
 static void printHelp(bool verbose) {
     if (!verbose) {
         cout <<
@@ -45,7 +45,7 @@ static void printHelp(bool verbose) {
             "  anchorbolt approvals [list|approve [id]|deny [id]]   decide queued AI calls\n"
             "\n"
             "Run 'anchorbolt --help --verbose' for every option (watchdog, thumbnails,\n"
-            "remote update, command-channel routing over a tunnel, webhook sinks, ...).\n";
+            "remote update, command-channel routing over a tunnel, webhook notifications, ...).\n";
         return;
     }
     cout <<
@@ -69,10 +69,11 @@ static void printHelp(bool verbose) {
         "                     Keys: app, args, cwd, server, port, wsPort, denyUpdate,\n"
         "                     update, wsUrl, grace, watchdogTimeout,\n"
         "                     log{dir,keepDays}, thumb{interval,width,quality}, tokenFile,\n"
-        "                     sinks (webhook notifications, see below). A 'token' key is\n"
+        "                     notify (webhook notifications, see below; legacy key\n"
+        "                     'sinks' still accepted). A 'token' key is\n"
         "                     refused — keep secrets in tokenFile or the env, not in a\n"
         "                     config that lands in git.\n"
-        "                     sinks: [{preset: slack|discord|ntfy|uptime-kuma, url|urlEnv|\n"
+        "                     notify: [{preset: slack|discord|ntfy|uptime-kuma, url|urlEnv|\n"
         "                     urlFile, events?: [restart,up,down,update,stop,alert], body?,\n"
         "                     method?, contentType?, interval?}] — ONE templated HTTP\n"
         "                     engine ({{app}} {{event}} {{msg}} {{time}}); presets prefill\n"
@@ -131,7 +132,7 @@ static void printHelp(bool verbose) {
         "                     (unique id prefixes ok; id optional when one pending).\n"
         "  --approval-ttl <sec>  pending approvals expire after this (default 900)\n"
         "  --offline-after <sec> heartbeat silence before an app counts as offline\n"
-        "                     for notify sinks (default 120)\n"
+        "                     for notify webhooks (default 120)\n"
         "\n"
         "  Fleet-wide notifications: <data>/sinks.json (edited on the dashboard's\n"
         "  Notify tab; same engine + presets as the venue-side 'sinks' config, plus\n"

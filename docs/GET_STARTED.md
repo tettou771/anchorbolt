@@ -133,7 +133,7 @@ everything.
 
 ## 5. Get notified (Slack, ntfy, …)
 
-Add a `sinks` array to the app's config file on the venue machine. Presets
+Add a `notify` array to the app's config file on the venue machine. Presets
 fill in the templating for you:
 
 ```jsonc
@@ -141,7 +141,7 @@ fill in the templating for you:
 {
   "app": "./bin/myApp.app/Contents/MacOS/myApp",
   "server": "https://ops.example.com",
-  "sinks": [
+  "notify": [
     { "preset": "slack", "urlFile": "slack.url" },
     { "preset": "ntfy",  "url": "https://ntfy.sh/my-app-alerts" }
   ]
@@ -165,13 +165,13 @@ button pressed:
 mcp::alert("IR camera disconnected!");
 ```
 
-That message flows to the same sinks and to the dashboard's event list.
+That message flows to the same notification webhooks and to the dashboard's event list.
 
 ---
 
 ## 6. Fleet-wide notifications — the Notify tab
 
-Step 5 configured sinks on one machine. The server can notify for the whole
+Step 5 configured notifications on one machine. The server can notify for the whole
 fleet instead: open the gear icon → **Notify** tab. Sinks added here are
 stored in `config/notify.json` on the server and fire for every app — no
 per-machine config to keep in sync.
@@ -179,15 +179,15 @@ per-machine config to keep in sync.
 The same presets apply — **slack**, **discord**, **ntfy**, **uptime-kuma** —
 plus **generic**, which reveals a JSON body template with `{{app}}`,
 `{{event}}`, `{{msg}}` and `{{time}}` placeholders for anything else. Each
-sink takes two filters:
+entry takes two filters:
 
 - **events** — which of `restart`, `up`, `down`, `update`, `stop`, `alert` to
   send, plus three only the server can produce: `approval` (a queued AI
   action, step 9), and `offline` / `online` — the server noticing an app's
   heartbeats went silent and came back (`--offline-after`, default 120 s).
   That last pair is the one thing a dead machine can't report about itself.
-- **scope** — group names or `app:<id>` entries; blank = all apps. A sink
-  scoped to a single `app:<id>` behaves like the same sink configured on that
+- **scope** — group names or `app:<id>` entries; blank = all apps. An entry
+  scoped to a single `app:<id>` behaves like the same notification configured on that
   app's machine.
 
 Every row has a **Test** button that fires the webhook immediately and reports
@@ -303,7 +303,7 @@ from; `anchorbolt start` next to an `anchorbolt.json` picks it up automatically:
   "server": "https://ops.example.com",
   "tokenFile": "osaka.token",
   "watchdogTimeout": 10,
-  "sinks": [ { "preset": "slack", "urlFile": "slack.url" } ]
+  "notify": [ { "preset": "slack", "urlFile": "slack.url" } ]
 }
 ```
 

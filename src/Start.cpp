@@ -1153,7 +1153,12 @@ bool loadConfig(const fs::path& path, StartOptions& opt) {
         opt.thumbWidth       = t.value("width", opt.thumbWidth);
         opt.thumbQuality     = t.value("quality", opt.thumbQuality);
     }
-    if (c.contains("sinks")) {
+    // "notify" is the user-facing key (matches the dashboard's Notify tab and
+    // the server's notify.json); "sinks" — the engine's internal name — keeps
+    // working so existing configs don't break.
+    if (c.contains("notify")) {
+        opt.sinks = parseSinks(c["notify"], path.parent_path());
+    } else if (c.contains("sinks")) {
         opt.sinks = parseSinks(c["sinks"], path.parent_path());
     }
     if (c.contains("tokenFile")) {
@@ -1672,7 +1677,7 @@ static void printConfigTemplate() {
         "  \"watchdogTimeout\": 10,\n"
         "\n"
         "  // Webhook notifications. Keep secret URLs in urlFile/urlEnv, never inline.\n"
-        "  \"sinks\": [\n"
+        "  \"notify\": [\n"
         "    // { \"preset\": \"slack\", \"urlFile\": \"slack.url\" },\n"
         "    // { \"preset\": \"ntfy\",  \"url\": \"https://ntfy.sh/my-venue-alerts\" }\n"
         "  ]\n"

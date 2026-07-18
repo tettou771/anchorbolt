@@ -17,7 +17,7 @@ choices are what they are. For step-by-step usage see the
 - [Authentication](#authentication)
 - [Fleet MCP (AI operations)](#fleet-mcp-ai-operations)
 - [App-published status and alerts](#app-published-status-and-alerts)
-- [Notifications (sinks)](#notifications-sinks)
+- [Notifications](#notifications)
 - [Platform notes](#platform-notes)
 - [Design decisions](#design-decisions)
 
@@ -145,7 +145,7 @@ anchorbolt-data/
 │   ├── apps.json            #   {app-id: {token: <sha256>, group, hidden}} — the one roster
 │   ├── operators.json       #   operator accounts (role, hash, scope)
 │   ├── shares.json          #   share links
-│   └── notify.json          #   fleet-wide notification sinks (the Notify tab)
+│   └── notify.json          #   fleet-wide notifications (the Notify tab)
 ├── state/                   # machine-made — `rm -rf state/` is safe
 │   ├── sessions.json  codes.json  approvals.json  apps-health.json
 │   └── approval-decisions/
@@ -376,40 +376,41 @@ void tcApp::setup() {
     mcp::status("scene",         [&] { return sceneName; });     // shown as-is
     mcp::statusGraph("visitors", [&] { return visitorCount; });  // plotted over time
     mcp::statusImage("entranceCam", [&] { return camPixels; });  // e.g. a webcam
-    mcp::alert("IR camera disconnected!");                        // → sinks + dashboard
+    mcp::alert("IR camera disconnected!");                        // → notifications + dashboard
 }
 ```
 
 `status` values ride every heartbeat; `statusImage` streams are fetched on the
 thumbnail interval; `alert` is drained from the standard `tc_get_alerts` tool
-and fanned out to the notification sinks and the dashboard event list. It is
+and fanned out to the notification webhooks and the dashboard event list. It is
 deliberately named **alert**, not notify — raise it for events a human should
 hear about, not as a message bus.
 
 ---
 
-## Notifications (sinks)
+## Notifications
 
-One templated webhook engine delivers every outbound notification: a sink is a
-URL plus an optional body template with `{{app}}` `{{event}}` `{{msg}}`
+One templated webhook engine delivers every outbound notification: each entry
+(internally a "sink") is a URL plus an optional body template with `{{app}}` `{{event}}` `{{msg}}`
 `{{time}}` placeholders; presets (slack / discord / ntfy / uptime-kuma) just
-prefill it. Delivery is at-least-once with per-sink queues and backoff — a
+prefill it. Delivery is at-least-once with a queue and backoff per destination — a
 network outage holds events until it heals; a 4xx drops the event (a bad
 webhook URL must not retry forever).
 
 The engine runs in **two places**, and they are independent by design (both
 configured = both deliver):
 
-- **Venue side** — the `sinks` array in the app's `anchorbolt.json`. Works
+- **Venue side** — the `notify` array in the app's `anchorbolt.json`
+  (the legacy `sinks` key still works). Works
   with no server at all; this is the local-first path.
 - **Server side** — `config/notify.json`, edited on the dashboard's **Notify**
-  tab (admin). One place for the whole fleet, which is the point: each sink
+  tab (admin). One place for the whole fleet, which is the point: each entry
   takes a `scope` (group names / `app:<id>`, operator-scope semantics, blank =
   every app), so "client A's Slack hears only client A's apps" is one field,
-  and a sink scoped to a single `app:<id>` behaves like the same sink
-  configured on that app's machine.
+  and an entry scoped to a single `app:<id>` behaves like the same
+  notification configured on that app's machine.
 
-Server-side sinks hear everything apps push (`restart` / `up` / `down` /
+Server-side entries hear everything apps push (`restart` / `up` / `down` /
 `update` / `stop` / `alert`, fanned out at the ingest point) **plus three
 events only the server can know**:
 
@@ -420,7 +421,7 @@ events only the server can know**:
   pass, so a serve restart never re-announces long-gone apps.
 
 uptime-kuma on the server requires a scope of exactly one `app:<id>` — it
-beats while that app's heartbeats stay fresh, matching a venue-side kuma sink.
+beats while that app's heartbeats stay fresh, matching a venue-side kuma entry.
 Broader kuma scopes have no sound "healthy" semantics and are rejected at load
 with a warning.
 
@@ -472,8 +473,8 @@ it terminates at a reverse proxy, not in AnchorBolt.
 **One templated webhook engine, not per-service adapters.** Slack, Discord,
 ntfy, Kuma and any generic endpoint are the same HTTP POST with a body
 template; presets just prefill it. Adding a service is adding a preset, not an
-adapter. The same engine runs on the venue machine (per-app `sinks` in
-`anchorbolt.json`) and on the server (fleet-wide sinks in `config/notify.json`,
+adapter. The same engine runs on the venue machine (per-app `notify` in
+`anchorbolt.json`) and on the server (fleet-wide entries in `config/notify.json`,
 the dashboard's Notify tab).
 
 **Notifications are one-way; interaction lives in the dashboard.** Webhooks
