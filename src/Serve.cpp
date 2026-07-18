@@ -3102,7 +3102,13 @@ int cmdServe(const vector<string>& args) {
         Json line = {{"at", getTimestampString("%Y-%m-%dT%H:%M:%S")}, {"health", body}};
         ofstream out(dir / ("heartbeat-" + getTimestampString("%Y-%m-%d") + ".jsonl"), ios::app);
         out << line.dump() << "\n";
-        res.set_content("ok", "text/plain");
+        // Tell the venue whether we currently hold its command-channel WS. The
+        // heartbeat is HTTP (independent of the WS), so it still reaches us when
+        // the WS is half-open — e.g. after a serve restart or a dropped tunnel,
+        // where the venue's socket looks Open but we have no record of it. The
+        // venue reconnects on wsConnected=false, restoring live/control.
+        res.set_content(Json{{"ok", true}, {"wsConnected", g_agents.live(id)}}.dump(),
+                        "application/json");
     });
 
     // Agent push: latest thumbnail as raw JPEG bytes (no base64 on the wire).

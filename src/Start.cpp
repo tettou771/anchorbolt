@@ -477,10 +477,21 @@ public:
         if (!token.empty()) cli_.setBearerToken(token);
     }
 
-    void heartbeat(Json health) {
+    // Returns the server's view of our command-channel WS (wsConnected): a value
+    // only when the heartbeat succeeds and the server reports the field, nullopt
+    // if the push failed or the server is too old to report it (so a missing
+    // field never triggers a reconnect on its own).
+    optional<bool> heartbeat(Json health) {
         health["app"] = appId_;
         auto res = cli_.request("POST", "/api/heartbeat", dumpSafe(health), "application/json");
         report(res.statusCode == 200, "heartbeat");
+        if (res.statusCode != 200) return nullopt;
+        try {
+            Json b = Json::parse(res.body);
+            if (b.contains("wsConnected") && b["wsConnected"].is_boolean())
+                return b["wsConnected"].get<bool>();
+        } catch (...) {}
+        return nullopt;
     }
 
     void thumbnail(const vector<unsigned char>& jpg) {
@@ -714,6 +725,7 @@ public:
         }
 
         openL_ = ws_.onOpen.listen([this]() {
+            openSinceMs_ = nowMs();
             wsSend(Json({{"type", "hello"},
                          {"app", opt_.appId},
                          {"token", opt_.token}}).dump());
@@ -733,6 +745,20 @@ public:
             ws_.connect(url_);
         }
     }
+
+    // We believe the socket is Open, and it has been long enough that a fresh
+    // handshake would have completed on the server. If the server nonetheless
+    // reports no command channel for us, the socket is half-open (serve restart
+    // or a dropped tunnel that never delivered a TCP FIN) — maintain() can't see
+    // this because the state is still Open. The grace avoids tearing down a
+    // socket the server simply hasn't finished registering yet.
+    bool staleOpen() const {
+        return ws_.getState() == tcx::websocket::WebSocketClient::State::Open &&
+               nowMs() - openSinceMs_ > 8000;
+    }
+
+    // Drop a stale socket; the next maintain() reconnects it.
+    void forceReconnect() { ws_.disconnect(); }
 
     void shutdown() {
         stopLive("shutdown");
@@ -758,6 +784,10 @@ private:
 
     static int64_t nowNs() {
         return chrono::duration_cast<chrono::nanoseconds>(
+                   chrono::steady_clock::now().time_since_epoch()).count();
+    }
+    static int64_t nowMs() {
+        return chrono::duration_cast<chrono::milliseconds>(
                    chrono::steady_clock::now().time_since_epoch()).count();
     }
 
@@ -952,6 +982,7 @@ private:
     string url_;
     tcx::websocket::WebSocketClient ws_;
     EventListener openL_, msgL_, closeL_;
+    atomic<int64_t> openSinceMs_{0};     // steady-clock ms of the last onOpen (for staleOpen)
 
     // Live view: a dedicated screenshot streamer over the same WebSocket.
     mutex sendMutex_;                    // serializes all ws_.send() callers
@@ -2077,7 +2108,18 @@ int cmdStart(const vector<string>& args) {
                                 hb["custom"] = *s;
                         }
                     }
-                    push->heartbeat(hb);
+                    optional<bool> serverSeesWs = push->heartbeat(hb);
+                    // Heartbeat reached the server but it holds no command-channel
+                    // WS for us, while we still think ours is Open: it's half-open
+                    // (serve restart / dropped tunnel). Force a reconnect so the
+                    // live/control features come back without waiting for a TCP FIN
+                    // that may never arrive.
+                    if (channel && serverSeesWs.has_value() && !*serverSeesWs &&
+                        channel->staleOpen()) {
+                        logWarning("anchorbolt")
+                            << "server has no command channel for us; reconnecting";
+                        channel->forceReconnect();
+                    }
 
                     auto now = chrono::steady_clock::now();
                     if (opt.thumbIntervalSec > 0 &&
