@@ -1120,9 +1120,10 @@ const char* kDashboardHtml = R"HTML(<!DOCTYPE html>
   .abadge { background: #4a1d1d; color: #ff8a80; border: 1px solid #7a3030;
             border-radius: 10px; font-size: 11px; padding: 0 8px; flex: none;
             margin-left: 6px; }
-  .gbadge { background: #232834; color: #8fa3bf; border: 1px solid #333a48;
-            border-radius: 4px; font-size: 10px; font-weight: 500;
-            padding: 1px 6px; flex: none; margin-right: 6px; }
+  /* Group tag: plain muted text ("[test] Name") — a boxed capsule read as a
+     clickable button, which it is not. */
+  .gbadge { color: #7d838e; font-weight: 500; font-size: .85em;
+            flex: none; margin-right: 6px; }
   #dEvWrap { background: #101216; border: 1px solid #262b34; border-radius: 8px; }
   #dEvHead { display: flex; align-items: center; gap: 10px; padding: 8px 12px;
              border-bottom: 1px solid #21252d; }
@@ -1997,7 +1998,7 @@ async function renderDetail() {
   document.getElementById('dTitle').textContent = app.id;
   const dg = document.getElementById('dGroup');
   dg.hidden = !app.group;
-  if (app.group) dg.textContent = app.group;
+  if (app.group) dg.textContent = '[' + app.group + ']';
   // The action buttons ride the command channel, so they only make sense when
   // the agent's WS is connected and the operator can act. Update/Rollback show
   // only if the venue allows update (it advertises this); Restart is always
@@ -2586,7 +2587,7 @@ async function refresh() {
     el.querySelector('.label').textContent = app.id;
     const gb = el.querySelector('.gbadge');
     gb.hidden = !app.group;
-    if (app.group) gb.textContent = app.group;
+    if (app.group) gb.textContent = '[' + app.group + ']';
     el.querySelector('.stats').textContent = wallStats(app);
     // Offline: the last screenshot is blurred (CSS) with a text overlay on top.
     const off = el.querySelector('.offlay');
