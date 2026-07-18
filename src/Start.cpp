@@ -1679,7 +1679,7 @@ static void printConfigTemplate() {
         "  // Webhook notifications. Keep secret URLs in urlFile/urlEnv, never inline.\n"
         "  \"notify\": [\n"
         "    // { \"preset\": \"slack\", \"urlFile\": \"slack.url\" },\n"
-        "    // { \"preset\": \"ntfy\",  \"url\": \"https://ntfy.sh/my-venue-alerts\" }\n"
+        "    // { \"preset\": \"ntfy\",  \"url\": \"https://ntfy.sh/my-app-alerts\" }\n"
         "  ]\n"
         "}\n";
 }
