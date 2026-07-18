@@ -3,6 +3,13 @@
 Full settled design lives in TrussC `docs/ROADMAP.md` (kiosk / fleet entries).
 This file tracks what's left, roughly in priority order.
 
+## At v1.0.0
+
+- **Drop the legacy-layout support**: delete `migrateDataDir` and every
+  `newLayout()` gate in the path helpers (Token.cpp / Serve.cpp) — 1.0 assumes
+  the v0.8.1 layout. Release note: "upgrading from a pre-0.8.1 data dir: start
+  any 0.8.x/0.9.x serve once to migrate, then upgrade."
+
 ## Deferred / out of scope for now
 
 - **`tc::fromBase64` — core side DONE (TrussC dev, 2026-07-18)**: header +
