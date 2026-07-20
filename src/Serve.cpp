@@ -1537,6 +1537,17 @@ R"HTML(
   .sTable input, .sTable select, .sRow input, .sRow select {
       background: #191c22; border: 1px solid #2a2e36; border-radius: 5px;
       color: #d4d7dd; font-size: 12px; padding: 3px 8px; }
+  /* Round red delete: one glyph instead of another word in a wall of text.
+     Same palette as the old Revoke button. */
+  .sXBtn { width: 24px; height: 24px; border-radius: 50%; background: #2a1c1c;
+           color: #ff8a80; border: 1px solid #5a2c2c; cursor: pointer;
+           font-size: 14px; line-height: 1; padding: 0; flex: none;
+           display: inline-flex; align-items: center; justify-content: center;
+           vertical-align: middle; }
+  .sXBtn:hover { background: #3a2222; }
+  .sTable td.acts button + button { margin-left: 6px; }
+  /* Footer row = the "create new" entry, aligned to the same columns. */
+  .sTable tfoot td { padding: 10px 8px 4px; border-top: 1px solid #2a2e36; }
   .sBtn { background: #1c2a3a; color: #79b8ff; border: 1px solid #2c405a;
           border-radius: 5px; font-size: 12px; padding: 3px 10px; cursor: pointer; }
   .sBtn:hover { background: #223449; }
@@ -1597,11 +1608,12 @@ R"HTML(
         <colgroup><col style="width:40%"><col style="width:18%"><col style="width:12%"><col></colgroup>
         <thead><tr><th>app</th><th>group</th><th>token</th><th></th></tr></thead>
         <tbody id="sApps"></tbody>
+        <tfoot><tr>
+          <td><input id="sPairApp" placeholder="app-id for a new pairing code" style="width:92%"></td>
+          <td></td><td></td>
+          <td class="acts"><button class="sBtn" id="sPairBtn">Create</button></td>
+        </tr></tfoot>
       </table>
-      <div class="sRow">
-        <input id="sPairApp" placeholder="app-id for a new pairing code">
-        <button class="sBtn" id="sPairBtn">Pairing code</button>
-      </div>
       <div class="sNote">A pairing code lets an app's machine run
         <code>anchorbolt start --pair &lt;code&gt;</code> to fetch its token — no
         <code>tc-...</code> string is copied by hand.</div>
@@ -1613,13 +1625,14 @@ R"HTML(
         <colgroup><col style="width:20%"><col style="width:13%"><col style="width:31%"><col style="width:14%"><col></colgroup>
         <thead><tr><th>name</th><th>role</th><th>scope</th><th>created</th><th></th></tr></thead>
         <tbody id="sOps"></tbody>
+        <tfoot><tr>
+          <td><input id="sOpName" placeholder="new operator name" style="width:92%"></td>
+          <td><select id="sOpRole" style="width:96%"><option value="viewer">viewer</option><option value="operator">operator</option><option value="admin">admin</option></select></td>
+          <td><input id="sOpScope" placeholder="scope — blank = all" style="width:92%"></td>
+          <td></td>
+          <td class="acts"><button class="sBtn" id="sOpAdd">Create</button></td>
+        </tr></tfoot>
       </table>
-      <div class="sRow">
-        <input id="sOpName" placeholder="new operator name">
-        <select id="sOpRole"><option value="viewer">viewer</option><option value="operator">operator</option><option value="admin">admin</option></select>
-        <input id="sOpScope" placeholder="scope (e.g. osaka,app:special) — blank = all">
-        <button class="sBtn" id="sOpAdd">Create</button>
-      </div>
       <div class="sReveal" id="sOpToken" hidden></div>
 
       <h4 class="sSub">Share links &mdash; read-only, no login</h4>
@@ -1627,12 +1640,13 @@ R"HTML(
         <colgroup><col style="width:46%"><col style="width:22%"><col style="width:16%"><col></colgroup>
         <thead><tr><th>scope</th><th>expires</th><th>created</th><th></th></tr></thead>
         <tbody id="sShares"></tbody>
+        <tfoot><tr>
+          <td><input id="sShareScope" placeholder="scope — blank = all" style="width:92%"></td>
+          <td><input id="sShareDays" type="number" min="0" placeholder="days (0 = never)" style="width:90%"></td>
+          <td></td>
+          <td class="acts"><button class="sBtn" id="sShareAdd">Create</button></td>
+        </tr></tfoot>
       </table>
-      <div class="sRow">
-        <input id="sShareScope" placeholder="scope (e.g. osaka,app:special) — blank = all">
-        <input id="sShareDays" type="number" min="0" placeholder="days (0 = never)" style="width:130px; flex:none">
-        <button class="sBtn" id="sShareAdd">Create link</button>
-      </div>
       <div class="sReveal" id="sShareOut" hidden></div>
     </div>
 
@@ -1644,7 +1658,7 @@ R"HTML(
       </table>
       <div class="sRow">
         <button class="sBtn" id="sSinkAdd">Add</button>
-        <button class="sBtn" id="sSinkSave">Save all</button>
+        <button class="sBtn" id="sSinkSave" hidden>Save all</button>
         <span style="flex:1"></span>
         <a class="sHelpLink" href="/help/notify" target="_blank" rel="noopener">How to get a webhook URL &nearr;</a>
       </div>
@@ -2935,6 +2949,28 @@ R"HTML(// ---- Notify tab: fleet-wide webhook sinks (sinks.json) ---------------
 // verified before committing.
 let sinkRows = [];   // plain config objects backing the table
 
+// The working copy is saved per row: any edit marks the row dirty and reveals
+// a Save button beside Test; deletes confirm and persist immediately. "Save
+// all" only appears while something is dirty.
+function markSinkDirty(cfg) { cfg._dirty = true; renderSinkButtons(); }
+
+function cleanSinkRows() {
+  return sinkRows.map(c => { const o = { ...c }; delete o._dirty; return o; });
+}
+
+async function saveSinks(note) {
+  const out = byId('sSinkOut');
+  out.hidden = false;
+  try {
+    const r = await (await stPost('/api/admin/sinks', cleanSinkRows())).json();
+    sinkRows.forEach(c => delete c._dirty);
+    out.textContent = (note || 'saved') + ' — ' + r.armed + ' sink(s) armed';
+    renderSinkRows();
+  } catch {
+    out.textContent = 'save failed';
+  }
+}
+
 function sinkRowEl(cfg, idx) {
   const tr = document.createElement('tr');
   const presets = ['slack', 'discord', 'ntfy', 'uptime-kuma', ''];
@@ -2944,18 +2980,20 @@ function sinkRowEl(cfg, idx) {
   sel.addEventListener('change', () => {
     cfg.preset = sel.value;
     if (cfg.preset) delete cfg.body;   // a stale body would override the preset
+    cfg._dirty = true;
     renderSinkRows();
   });
   const url = Object.assign(document.createElement('input'),
                             {value: cfg.url || '', placeholder: 'https://hooks...'});
   url.style.width = '95%';
-  url.addEventListener('input', () => { cfg.url = url.value.trim(); });
+  url.addEventListener('input', () => { cfg.url = url.value.trim(); markSinkDirty(cfg); });
   const ev = Object.assign(document.createElement('input'),
                            {value: (cfg.events || []).join(','), placeholder: 'all'});
   ev.style.width = '90%';
   ev.addEventListener('input', () => {
     cfg.events = ev.value.split(',').map(s => s.trim()).filter(Boolean);
     if (!cfg.events.length) delete cfg.events;
+    markSinkDirty(cfg);
   });
   const sc = Object.assign(document.createElement('input'),
                            {value: (cfg.scope || []).join(','), placeholder: 'all apps'});
@@ -2963,7 +3001,12 @@ function sinkRowEl(cfg, idx) {
   sc.addEventListener('input', () => {
     cfg.scope = sc.value.split(',').map(s => s.trim()).filter(Boolean);
     if (!cfg.scope.length) delete cfg.scope;
+    markSinkDirty(cfg);
   });
+  const save = Object.assign(document.createElement('button'),
+                             {className: 'sBtn sinkSave', textContent: 'Save'});
+  save.hidden = !cfg._dirty;
+  save.addEventListener('click', () => saveSinks());
   const test = Object.assign(document.createElement('button'),
                              {className: 'sBtn', textContent: 'Test'});
   test.addEventListener('click', async () => {
@@ -2978,8 +3021,13 @@ function sinkRowEl(cfg, idx) {
                            : 'test FAILED: ' + (r.error || 'unknown');
   });
   const del = Object.assign(document.createElement('button'),
-                            {className: 'sBtn', textContent: '×', title: 'remove'});
-  del.addEventListener('click', () => { sinkRows.splice(idx, 1); renderSinkRows(); });
+                            {className: 'sXBtn', textContent: '×', title: 'remove this notification'});
+  del.addEventListener('click', () => {
+    const what = (cfg.preset || 'generic') + (cfg.url ? ' → ' + cfg.url : '');
+    if (!confirm('Remove this notification?\n' + what)) return;
+    sinkRows.splice(idx, 1);
+    saveSinks('removed');   // deletes persist immediately
+  });
   for (const el of [sel, url, ev, sc]) {
     const td = document.createElement('td');
     td.appendChild(el);
@@ -2987,9 +3035,22 @@ function sinkRowEl(cfg, idx) {
   }
   const acts = document.createElement('td');
   acts.className = 'acts';
-  acts.append(test, del);
+  acts.append(save, test, del);
   tr.appendChild(acts);
   return tr;
+}
+
+// Re-sync only the per-row Save buttons + "Save all" visibility (cheap; the
+// full renderSinkRows would drop input focus mid-typing).
+function renderSinkButtons() {
+  const rows = byId('sSinks').querySelectorAll('tr');
+  let i = 0;
+  for (const cfg of sinkRows) {
+    const btn = rows[i] && rows[i].querySelector('.sinkSave');
+    if (btn) btn.hidden = !cfg._dirty;
+    i += cfg.preset ? 1 : 2;   // generic rows have a body sub-row
+  }
+  byId('sSinkSave').hidden = !sinkRows.some(c => c._dirty);
 }
 
 // A generic sink gets a second row: the JSON body template with the four
@@ -3007,6 +3068,7 @@ function sinkBodyRowEl(cfg) {
   body.addEventListener('input', () => {
     cfg.body = body.value.trim();
     if (!cfg.body) delete cfg.body;
+    markSinkDirty(cfg);
   });
   td.appendChild(body);
   tr.appendChild(td);
@@ -3016,7 +3078,8 @@ function sinkBodyRowEl(cfg) {
 function renderSinkRows() {
   const tb = byId('sSinks');
   if (!sinkRows.length) {
-    tb.replaceChildren(stMsg(5, 'no sinks yet — Add one, Test it, then Save all'));
+    tb.replaceChildren(stMsg(5, 'no notifications yet — Add one and Test it'));
+    byId('sSinkSave').hidden = true;
     return;
   }
   tb.replaceChildren(...sinkRows.flatMap((cfg, i) => {
@@ -3024,6 +3087,7 @@ function renderSinkRows() {
     if (!cfg.preset) rows.push(sinkBodyRowEl(cfg));
     return rows;
   }));
+  byId('sSinkSave').hidden = !sinkRows.some(c => c._dirty);
 }
 
 async function loadSettingsSinks() {
@@ -3033,20 +3097,11 @@ async function loadSettingsSinks() {
 }
 
 byId('sSinkAdd').addEventListener('click', () => {
-  sinkRows.push({ preset: 'slack', url: '' });
+  sinkRows.push({ preset: 'slack', url: '', _dirty: true });
   renderSinkRows();
 });
 
-byId('sSinkSave').addEventListener('click', async () => {
-  const out = byId('sSinkOut');
-  out.hidden = false;
-  try {
-    const r = await (await stPost('/api/admin/sinks', sinkRows)).json();
-    out.textContent = 'saved — ' + r.armed + ' sink(s) armed';
-  } catch {
-    out.textContent = 'save failed';
-  }
-});
+byId('sSinkSave').addEventListener('click', () => saveSinks());
 )HTML"
 R"HTML(
 
@@ -3091,7 +3146,7 @@ async function loadSettingsApps() {
     const tdX = document.createElement('td'); tdX.className = 'acts'; tdX.append(pc);
     // Hide/Show on the wall (restorable, not a delete).
     const hb = document.createElement('button');
-    hb.className = 'sBtn'; hb.textContent = a.hidden ? 'Show' : 'Hide'; hb.style.marginLeft = '4px';
+    hb.className = 'sBtn'; hb.textContent = a.hidden ? 'Show' : 'Hide';
     hb.addEventListener('click', async () => {
       await stPost('/api/admin/app/hide', { app: a.id, hidden: !a.hidden });
       loadSettingsApps();
@@ -3099,7 +3154,7 @@ async function loadSettingsApps() {
     tdX.append(hb);
     if (a.hash !== null) {
       const rv = document.createElement('button');
-      rv.className = 'sBtn danger'; rv.textContent = 'Revoke'; rv.style.marginLeft = '4px';
+      rv.className = 'sXBtn'; rv.textContent = '×'; rv.title = 'Revoke this token';
       rv.addEventListener('click', async () => {
         if (!confirm('Revoke the token for "' + a.id + '"? It stops authenticating on its next push.')) return;
         await stPost('/api/admin/agent/revoke', { id: a.id });
@@ -3123,12 +3178,14 @@ async function loadSettingsOps() {
     const si = document.createElement('input');
     si.value = (o.scope || []).join(','); si.placeholder = 'all'; si.style.width = '62%';
     const sset = document.createElement('button');
-    sset.className = 'sBtn'; sset.textContent = 'Set'; sset.style.marginLeft = '4px';
+    sset.className = 'sBtn'; sset.textContent = 'Set'; sset.style.marginLeft = '6px';
     sset.addEventListener('click', async () => {
       await stPost('/api/admin/operator/scope', { name: o.name, scope: si.value.trim() });
       sset.textContent = 'Set!'; setTimeout(() => sset.textContent = 'Set', 1200);
     });
-    const tdS = document.createElement('td'); tdS.className = 'acts'; tdS.append(si, sset);
+    // Plain cell (not .acts): the input starts at the column's left edge, in
+    // line with the SCOPE header and the tfoot's new-entry field.
+    const tdS = document.createElement('td'); tdS.append(si, sset);
     const lc = document.createElement('button');
     lc.className = 'sBtn'; lc.textContent = 'Login code';
     lc.addEventListener('click', async () => {
@@ -3137,7 +3194,7 @@ async function loadSettingsOps() {
         stReveal('sOpToken', 'login code for ' + o.name + ': ' + j.code + '  (valid 10 min)'); }
     });
     const rv = document.createElement('button');
-    rv.className = 'sBtn danger'; rv.textContent = 'Revoke'; rv.style.marginLeft = '4px';
+    rv.className = 'sXBtn'; rv.textContent = '×'; rv.title = 'Revoke this operator';
     rv.addEventListener('click', async () => {
       if (!confirm('Revoke operator "' + o.name + '"? Their sessions die immediately.')) return;
       await stPost('/api/admin/operator/revoke', { name: o.name });
@@ -3175,7 +3232,7 @@ async function loadSettingsShares() {
   tb.replaceChildren(...shares.map(s => {
     const tr = document.createElement('tr');
     const rv = document.createElement('button');
-    rv.className = 'sBtn danger'; rv.textContent = 'Revoke';
+    rv.className = 'sXBtn'; rv.textContent = '×'; rv.title = 'Revoke this share link';
     rv.addEventListener('click', async () => {
       if (!confirm('Revoke this share link? It stops working immediately.')) return;
       await stPost('/api/admin/share/revoke', { id: s.id });
