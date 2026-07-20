@@ -417,9 +417,35 @@ events only the server can know**:
 
 - **`approval`** — a mutating AI call entered the approval queue.
 - **`offline` / `online`** — heartbeat silence past `--offline-after`
-  (default 120 s) and its recovery. A machine that dies can't report its own
+  (default 60 s) and its recovery. A machine that dies can't report its own
   death; only the server sees the silence. The watcher baselines on its first
   pass, so a serve restart never re-announces long-gone apps.
+
+### What actually pages you, and when
+
+The failure classes deliberately map to different signals, so a webhook means
+"come look" and nothing else:
+
+| what happened | who can tell | signal |
+|---|---|---|
+| app crashed or hung | the supervisor (it's still alive) | `restart` / `down` events, ⚠ badge — within seconds |
+| OS / UPS shutdown (planned) | the supervisor, on its way out | a quiet gray `stop` event; **the `offline` that follows is NOT notified** |
+| power cut, kernel panic, vanished network | nobody on the machine | `offline` after `--offline-after` of silence, marked `(no stop received — unexpected)` |
+
+The middle row is the subtle one. A graceful shutdown (systemd/launchd sends
+SIGTERM — a UPS-initiated shutdown takes this same path, no app code needed)
+fires a `stop` event before the silence starts. The server remembers it: when
+the offline threshold later passes, a silence that was *announced by a clean
+stop* turns the wall dot red but sends **no** webhook (the matching `online`
+on reboot is equally quiet). A silence with no stop on record is the scary
+kind, and that one notifies. So a nightly powered-down installation stays
+silent in your Slack, while a tripped breaker pages you.
+
+The trade-off, stated honestly: if a machine shuts down cleanly and then
+*fails to come back*, no webhook fires — the red dot on the wall is the only
+sign. If you need a hard guarantee for "it must be up by 10:00", point an
+uptime-kuma monitor (scope `app:<id>`) at it — Kuma alerts on the absence of
+pushes on its own schedule, independent of this logic.
 
 uptime-kuma on the server requires a scope of exactly one `app:<id>` — it
 beats while that app's heartbeats stay fresh, matching a venue-side kuma entry.
@@ -445,7 +471,7 @@ level can't masquerade as a failure at the next.
 | hang watchdog (restart) | 10 s wall-clock | wall-clock since the last healthy reply — HTTP timeouts can't stretch it |
 | boot grace | 120 s | heavy apps (shader warmup, model loads) routinely need more than 15 s for their first healthy reply |
 | push HTTP timeout (venue → server) | 10 s | measured on Raspberry-Pi-class boxes over a tunnel: 2 s produced false "unreachable" streaks — a *late* reply is not a *dead* server. The push runs on the supervision cadence, so one slow round-trip must stay smaller than the layers above |
-| `offline` status (red dot AND notify event) | `--offline-after` 60 s | ONE threshold: the wall shows the server's offline verdict — the same flag that fires the notification — so "red" and "you got paged" are a single state. A machine that died can't report it; only sustained silence shows it. ~20 missed heartbeats keeps a tunnel flap from paging anyone, while a real crash reaches you sooner via the down/restart notifications |
+| `offline` status (red dot AND notify event) | `--offline-after` 60 s | ONE threshold: the wall shows the server's offline verdict — the same flag that fires the notification — so "red" and "you got paged" are a single state. A machine that died can't report it; only sustained silence shows it. ~20 missed heartbeats keeps a tunnel flap from paging anyone, while a real crash reaches you sooner via the down/restart notifications. A silence announced by a clean `stop` (planned shutdown) turns the dot red but does not notify — see the Notifications section |
 | approval wait | ~20 s, then a ticket (TTL 900 s) | most approvals happen while someone is at the dashboard; past that the AI polls `get_approval` instead of holding a connection |
 
 When tuning: keep `poll < push timeout < offline`, and remember the

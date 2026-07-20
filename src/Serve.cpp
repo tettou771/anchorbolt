@@ -106,7 +106,9 @@ struct AppState {
     chrono::steady_clock::time_point lastSeen{};
     int64_t  lastSeenUnix = 0;                      // wall-clock last report (0 = never); persisted
     bool     hidden = false;                        // hidden from the wall (restorable)
-    bool     notifiedOffline = false;               // offline event fired (notify sinks)
+    bool     notifiedOffline = false;               // offline state (red dot; may be quiet)
+    bool     offlineQuiet = false;                  // this offline followed a clean stop
+    int64_t  lastStopUnix = 0;                      // last clean 'stop' event; persisted
     vector<unsigned char> thumb;                    // latest JPEG
     uint64_t thumbSeq = 0;                          // bumped per upload (cache busting)
     map<string, ImageSlot> images;                  // custom statusImage uploads
@@ -342,7 +344,8 @@ void flushAppRegistry(const fs::path& dataDir) {
         lock_guard<mutex> lock(g_appsMutex);
         for (auto& [id, st] : g_apps) {
             if (st.lastSeenUnix == 0) continue;  // never reported
-            reg[id] = {{"lastSeen", st.lastSeenUnix}, {"health", st.health}};
+            reg[id] = {{"lastSeen", st.lastSeenUnix}, {"health", st.health},
+                       {"lastStop", st.lastStopUnix}};
         }
     }
     error_code ec;
@@ -378,6 +381,7 @@ void loadAppRegistry(const fs::path& dataDir) {
         if (!hidden && !agentIds.count(id)) continue;   // revoked & not hidden -> drop
         auto& st = g_apps[id];
         st.lastSeenUnix = e.value("lastSeen", (int64_t)0);
+        st.lastStopUnix = e.value("lastStop", (int64_t)0);
         st.hidden = hidden;
         st.health = e.value("health", Json::object());
         int64_t age = nowUnix - st.lastSeenUnix;
@@ -4405,6 +4409,10 @@ int cmdServe(const vector<string>& args) {
             // Fan out to serve-side sinks too (fleet-wide notify config); the
             // app's own sinks fire independently — both configured = both
             // deliver, by design.
+            // A clean 'stop' announces the silence that follows: remember it
+            // so the offline watcher can tell a planned shutdown from a power
+            // cut.
+            if (ev == "stop") st.lastStopUnix = (int64_t)time(nullptr);
             serveNotify(dataDir, id, ev, line.text);
             st.alerts.push_back(std::move(line));
             if (st.alerts.size() > 100) st.alerts.pop_front();
@@ -4666,7 +4674,9 @@ int cmdServe(const vector<string>& args) {
     thread offlineWatcher([dataDir, opt]() {
         bool baseline = true;
         while (!g_stop) {
-            vector<pair<string, int>> events;   // (id, 0=offline 1=online 2=tick)
+            // kinds: 0 = offline (announced by a clean stop -> quiet),
+            //        1 = offline unexpected, 2 = online, 3 = kuma tick
+            vector<pair<string, int>> events;
             {
                 lock_guard<mutex> lock(g_appsMutex);
                 auto now = chrono::steady_clock::now();
@@ -4677,19 +4687,34 @@ int cmdServe(const vector<string>& args) {
                         now - st.lastSeen > chrono::seconds(opt.offlineAfterSec);
                     if (baseline) {
                         st.notifiedOffline = offline;
+                        st.offlineQuiet = offline;   // never re-announce across a serve restart
                     } else if (offline != st.notifiedOffline) {
                         st.notifiedOffline = offline;
-                        events.push_back({id, offline ? 0 : 1});
+                        if (offline) {
+                            // A clean 'stop' at/after the last heartbeat announced
+                            // this silence (UPS / OS shutdown): red dot, no page.
+                            // No stop -> power cut / crash / vanished network.
+                            st.offlineQuiet = st.lastStopUnix >= st.lastSeenUnix - 15;
+                            events.push_back({id, st.offlineQuiet ? 0 : 1});
+                        } else {
+                            // online: only worth a page if the offline paged.
+                            events.push_back({id, st.offlineQuiet ? 0 : 2});
+                            st.offlineQuiet = false;
+                        }
                     }
-                    if (!offline) events.push_back({id, 2});
+                    if (!offline) events.push_back({id, 3});
                 }
             }
             baseline = false;
             for (auto& [id, kind] : events) {
                 if (kind == 0) {
-                    serveNotify(dataDir, id, "offline",
-                                "no heartbeat for " + to_string(opt.offlineAfterSec) + "s");
+                    // quiet transition — the record lives in the log, not a webhook
+                    logNotice("anchorbolt") << id << " offline/online after a clean stop; not notifying";
                 } else if (kind == 1) {
+                    serveNotify(dataDir, id, "offline",
+                                "no heartbeat for " + to_string(opt.offlineAfterSec) +
+                                "s (no stop received — unexpected)");
+                } else if (kind == 2) {
                     serveNotify(dataDir, id, "online", "heartbeat resumed");
                 } else {
                     shared_ptr<Notifier> n;

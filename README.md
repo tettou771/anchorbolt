@@ -34,7 +34,8 @@ and notification parts work for any program you can launch.
   at a glance, grouped into tabs.
 - **Logs, always** — the app's logs are collected locally and shipped to your
   server, surviving hours of network outage and reconnecting where it left off.
-- **Notifications** — a crash, a hang, or an app-raised alert lands in Slack /
+- **Notifications** — only when it matters: a crash, a hang, an app-raised
+  alert, or a machine going silent *without* a clean shutdown lands in Slack /
   Discord / ntfy / Uptime Kuma, or a red badge on the wall.
 - **Remote update** — press a button to `git pull` + rebuild on the venue
   machine while the app keeps running; it only switches over if the build
