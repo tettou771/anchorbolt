@@ -2513,19 +2513,22 @@ function tcButton(domBtn) { return [0, 2, 1][domBtn] ?? 0; }
 let liveDown = null;   // in-progress press: { start, sx, sy, pressSent, button }
 const liveImg = document.getElementById('dLiveImg');
 
-liveImg.addEventListener('mousedown', e => {
+// Pointer events (not mouse events) so a touchscreen drag also becomes a drag.
+// setPointerCapture on the img keeps pointermove flowing even when the finger
+// leaves the frame — so window-level listeners aren't needed for completion.
+liveImg.addEventListener('pointerdown', e => {
   if (!ctlOn()) return;
   e.preventDefault();
+  liveImg.setPointerCapture(e.pointerId);
   liveDown = { start: liveToApp(e), sx: e.clientX, sy: e.clientY,
-               pressSent: false, button: tcButton(e.button) };
+               pressSent: false, button: tcButton(e.button),
+               pointerId: e.pointerId };
 });
-// Track on window so a drag that leaves the frame still completes. Throttled
-// like the hover path: unthrottled pointermove would flood the command channel
-// (one HTTP POST per event), freezing the live-view IMG refresh in the same
-// browser tab.
+// Throttled to 50ms. Unthrottled, a fast drag flooded the command channel
+// (one HTTP POST per event) and stalled the live-view IMG refresh.
 let lastDragSent = 0;
-window.addEventListener('mousemove', e => {
-  if (!liveDown) return;
+liveImg.addEventListener('pointermove', e => {
+  if (!liveDown || e.pointerId !== liveDown.pointerId) return;
   if (!liveDown.pressSent) {
     // Click vs drag: only once the pointer travels a few px is it a drag
     // (press at the origin, then move); a still press+release stays a click.
@@ -2543,14 +2546,13 @@ window.addEventListener('mousemove', e => {
   sendCommand(detailId, { action: 'call', tool: 'tc_mouse_move',
                           args: { x: p.x, y: p.y, button: liveDown.button } });
 });
-// Hover passthrough: forward plain pointer movement (no button) as
-// tc_mouse_move so hover-reactive installations respond. Throttled to ~20/s
-// — the command channel is one HTTP POST per event, so an unthrottled hover
-// would flood it; 50ms keeps it responsive without the deluge. Drags are
-// handled by the window listener above, so skip while a press is in flight.
+// Hover passthrough: mouse/pen movement without a button. Throttled to ~20/s
+// — the command channel is one HTTP POST per event, so unthrottled hover
+// would flood it. Touch has no true hover; drags are handled above and
+// non-drag touch movement doesn't fire pointermove.
 let lastHoverSent = 0;
-liveImg.addEventListener('mousemove', e => {
-  if (!ctlOn() || liveDown) return;
+liveImg.addEventListener('pointermove', e => {
+  if (!ctlOn() || liveDown || e.pointerType === 'touch') return;
   const now = Date.now();
   if (now - lastHoverSent < 50) return;
   lastHoverSent = now;
@@ -2558,8 +2560,8 @@ liveImg.addEventListener('mousemove', e => {
   sendCommand(detailId, { action: 'call', tool: 'tc_mouse_move', args: { x: p.x, y: p.y } });
 });
 
-window.addEventListener('mouseup', e => {
-  if (!liveDown) return;
+function endPointer(e) {
+  if (!liveDown || e.pointerId !== liveDown.pointerId) return;
   const down = liveDown;
   liveDown = null;
   if (down.pressSent) {
@@ -2570,7 +2572,9 @@ window.addEventListener('mouseup', e => {
     sendCommand(detailId, { action: 'call', tool: 'tc_mouse_click',
                             args: { x: down.start.x, y: down.start.y, button: down.button } });
   }
-});
+}
+liveImg.addEventListener('pointerup', endPointer);
+liveImg.addEventListener('pointercancel', endPointer);
 
 // Keyboard passthrough as sokol keycodes — only while control is on and the
 // frame has focus. stopPropagation keeps Escape etc. from leaking to the
