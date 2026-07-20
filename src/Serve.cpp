@@ -1752,7 +1752,11 @@ R"HTML(
 
 )HTML"
 R"HTML(<script>
-const STALE_SEC = 10;
+// 30s = ~10 missed heartbeats (3s cadence). Generous on purpose: a slow
+// tunnel can block one push for up to 10s, and a red dot should mean
+// "needs attention", not "one packet was late" — a real crash reaches
+// you through the down/restart notifications anyway.
+const STALE_SEC = 30;
 let myRole = null;   // null = open mode (everything allowed)
 
 function showLogin() {
