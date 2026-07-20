@@ -474,7 +474,12 @@ public:
         // tcxCurl (libcurl + native TLS) so the push works over an https tunnel;
         // httplib here is built without OpenSSL and rejects https:// outright.
         cli_.setBaseUrl(url);
-        cli_.setTimeout(2);
+        // 10s (was 2s): a Cloudflare tunnel / TLS handshake occasionally spikes
+        // past 2s and the heartbeat timed out; enough consecutive timeouts
+        // starved the server past its 120s offline threshold and it fired a
+        // false 'offline' notification. 10s stays well under 120s so the
+        // supervisor still detects a genuinely dead endpoint quickly.
+        cli_.setTimeout(10);
         if (!token.empty()) cli_.setBearerToken(token);
     }
 
