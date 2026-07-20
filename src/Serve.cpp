@@ -1489,7 +1489,11 @@ const char* kDashboardHtml = R"HTML(<!DOCTYPE html>
                 display: flex; align-items: center; justify-content: center; }
   #dLiveImg { max-width: 100%; max-height: 100%; object-fit: contain;
               outline: none; display: block; }
-  #dLiveStage.ctl #dLiveImg { cursor: crosshair; }
+  /* touch-action:none on the img blocks the browser's gesture handling
+     (scroll/pinch) so a touchscreen drag reaches the remote-control JS
+     instead of panning the page. Only in ctl mode so passive viewing on
+     mobile keeps its native scroll. */
+  #dLiveStage.ctl #dLiveImg { cursor: crosshair; touch-action: none; }
   #dLiveStage.ctl { outline: 2px solid #55402c; outline-offset: -2px; }
 )HTML"
 R"HTML(
