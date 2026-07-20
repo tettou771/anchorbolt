@@ -1537,14 +1537,18 @@ R"HTML(
   .sTable input, .sTable select, .sRow input, .sRow select {
       background: #191c22; border: 1px solid #2a2e36; border-radius: 5px;
       color: #d4d7dd; font-size: 12px; padding: 3px 8px; }
-  /* Round red delete: one glyph instead of another word in a wall of text.
-     Same palette as the old Revoke button. */
-  .sXBtn { width: 24px; height: 24px; border-radius: 50%; background: #2a1c1c;
-           color: #ff8a80; border: 1px solid #5a2c2c; cursor: pointer;
-           font-size: 14px; line-height: 1; padding: 0; flex: none;
-           display: inline-flex; align-items: center; justify-content: center;
-           vertical-align: middle; }
-  .sXBtn:hover { background: #3a2222; }
+  /* Round delete: a filled bright-orange disc with a geometric cross drawn by
+     the two pseudo-element bars (rotated ±45°) — pixel-centered and truly
+     orthogonal, unlike a font's ×. */
+  .sXBtn { width: 20px; height: 20px; border-radius: 50%; background: #ff8a80;
+           border: none; cursor: pointer; padding: 0; flex: none;
+           position: relative; vertical-align: middle; }
+  .sXBtn::before, .sXBtn::after { content: ''; position: absolute;
+           top: 50%; left: 50%; width: 10px; height: 2px; border-radius: 1px;
+           background: #1a1c22; }
+  .sXBtn::before { transform: translate(-50%, -50%) rotate(45deg); }
+  .sXBtn::after  { transform: translate(-50%, -50%) rotate(-45deg); }
+  .sXBtn:hover { background: #ffa39a; }
   .sTable td.acts button + button { margin-left: 6px; }
   /* Footer row = the "create new" entry, aligned to the same columns. */
   .sTable tfoot td { padding: 10px 8px 4px; border-top: 1px solid #2a2e36; }
@@ -1609,9 +1613,9 @@ R"HTML(
         <thead><tr><th>app</th><th>group</th><th>token</th><th></th></tr></thead>
         <tbody id="sApps"></tbody>
         <tfoot><tr>
-          <td><input id="sPairApp" placeholder="app-id for a new pairing code" style="width:92%"></td>
-          <td></td><td></td>
-          <td class="acts"><button class="sBtn" id="sPairBtn">Create</button></td>
+          <td><input id="sPairApp" placeholder="app-id for a new pairing code" style="width:70%"><button
+            class="sBtn" id="sPairBtn" style="margin-left:6px">Create</button></td>
+          <td></td><td></td><td></td>
         </tr></tfoot>
       </table>
       <div class="sNote">A pairing code lets an app's machine run
@@ -1628,9 +1632,9 @@ R"HTML(
         <tfoot><tr>
           <td><input id="sOpName" placeholder="new operator name" style="width:92%"></td>
           <td><select id="sOpRole" style="width:96%"><option value="viewer">viewer</option><option value="operator">operator</option><option value="admin">admin</option></select></td>
-          <td><input id="sOpScope" placeholder="scope — blank = all" style="width:92%"></td>
-          <td></td>
-          <td class="acts"><button class="sBtn" id="sOpAdd">Create</button></td>
+          <td><input id="sOpScope" placeholder="scope — blank = all" style="width:62%"><button
+            class="sBtn" id="sOpAdd" style="margin-left:6px">Create</button></td>
+          <td></td><td></td>
         </tr></tfoot>
       </table>
       <div class="sReveal" id="sOpToken" hidden></div>
@@ -1642,9 +1646,9 @@ R"HTML(
         <tbody id="sShares"></tbody>
         <tfoot><tr>
           <td><input id="sShareScope" placeholder="scope — blank = all" style="width:92%"></td>
-          <td><input id="sShareDays" type="number" min="0" placeholder="days (0 = never)" style="width:90%"></td>
-          <td></td>
-          <td class="acts"><button class="sBtn" id="sShareAdd">Create</button></td>
+          <td><input id="sShareDays" type="number" min="0" placeholder="days (0 = never)" style="width:55%"><button
+            class="sBtn" id="sShareAdd" style="margin-left:6px">Create</button></td>
+          <td></td><td></td>
         </tr></tfoot>
       </table>
       <div class="sReveal" id="sShareOut" hidden></div>
@@ -3021,7 +3025,7 @@ function sinkRowEl(cfg, idx) {
                            : 'test FAILED: ' + (r.error || 'unknown');
   });
   const del = Object.assign(document.createElement('button'),
-                            {className: 'sXBtn', textContent: '×', title: 'remove this notification'});
+                            {className: 'sXBtn', title: 'remove this notification'});
   del.addEventListener('click', () => {
     const what = (cfg.preset || 'generic') + (cfg.url ? ' → ' + cfg.url : '');
     if (!confirm('Remove this notification?\n' + what)) return;
@@ -3154,7 +3158,7 @@ async function loadSettingsApps() {
     tdX.append(hb);
     if (a.hash !== null) {
       const rv = document.createElement('button');
-      rv.className = 'sXBtn'; rv.textContent = '×'; rv.title = 'Revoke this token';
+      rv.className = 'sXBtn'; rv.title = 'Revoke this token';
       rv.addEventListener('click', async () => {
         if (!confirm('Revoke the token for "' + a.id + '"? It stops authenticating on its next push.')) return;
         await stPost('/api/admin/agent/revoke', { id: a.id });
@@ -3194,7 +3198,7 @@ async function loadSettingsOps() {
         stReveal('sOpToken', 'login code for ' + o.name + ': ' + j.code + '  (valid 10 min)'); }
     });
     const rv = document.createElement('button');
-    rv.className = 'sXBtn'; rv.textContent = '×'; rv.title = 'Revoke this operator';
+    rv.className = 'sXBtn'; rv.title = 'Revoke this operator';
     rv.addEventListener('click', async () => {
       if (!confirm('Revoke operator "' + o.name + '"? Their sessions die immediately.')) return;
       await stPost('/api/admin/operator/revoke', { name: o.name });
@@ -3232,7 +3236,7 @@ async function loadSettingsShares() {
   tb.replaceChildren(...shares.map(s => {
     const tr = document.createElement('tr');
     const rv = document.createElement('button');
-    rv.className = 'sXBtn'; rv.textContent = '×'; rv.title = 'Revoke this share link';
+    rv.className = 'sXBtn'; rv.title = 'Revoke this share link';
     rv.addEventListener('click', async () => {
       if (!confirm('Revoke this share link? It stops working immediately.')) return;
       await stPost('/api/admin/share/revoke', { id: s.id });
