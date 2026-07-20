@@ -2503,15 +2503,23 @@ function liveToApp(e) {
   return { x, y };
 }
 
-let liveDown = null;   // in-progress press: { start, sx, sy, pressSent }
+// DOM MouseEvent.button (0:L, 1:M, 2:R) → sokol/tc convention (0:L, 1:R, 2:M).
+function tcButton(domBtn) { return [0, 2, 1][domBtn] ?? 0; }
+
+let liveDown = null;   // in-progress press: { start, sx, sy, pressSent, button }
 const liveImg = document.getElementById('dLiveImg');
 
 liveImg.addEventListener('mousedown', e => {
   if (!ctlOn()) return;
   e.preventDefault();
-  liveDown = { start: liveToApp(e), sx: e.clientX, sy: e.clientY, pressSent: false };
+  liveDown = { start: liveToApp(e), sx: e.clientX, sy: e.clientY,
+               pressSent: false, button: tcButton(e.button) };
 });
-// Track on window so a drag that leaves the frame still completes.
+// Track on window so a drag that leaves the frame still completes. Throttled
+// like the hover path: unthrottled pointermove would flood the command channel
+// (one HTTP POST per event), freezing the live-view IMG refresh in the same
+// browser tab.
+let lastDragSent = 0;
 window.addEventListener('mousemove', e => {
   if (!liveDown) return;
   if (!liveDown.pressSent) {
@@ -2520,10 +2528,16 @@ window.addEventListener('mousemove', e => {
     if (Math.abs(e.clientX - liveDown.sx) < 3 && Math.abs(e.clientY - liveDown.sy) < 3) return;
     liveDown.pressSent = true;
     sendCommand(detailId, { action: 'call', tool: 'tc_mouse_press',
-                            args: { x: liveDown.start.x, y: liveDown.start.y } });
+                            args: { x: liveDown.start.x, y: liveDown.start.y, button: liveDown.button } });
   }
+  const now = Date.now();
+  if (now - lastDragSent < 50) return;
+  lastDragSent = now;
   const p = liveToApp(e);
-  sendCommand(detailId, { action: 'call', tool: 'tc_mouse_move', args: { x: p.x, y: p.y } });
+  // button on tc_mouse_move promotes it to a drag on the app side; without it,
+  // the app's mouseDragged handler never fires (only mouseMoved does).
+  sendCommand(detailId, { action: 'call', tool: 'tc_mouse_move',
+                          args: { x: p.x, y: p.y, button: liveDown.button } });
 });
 // Hover passthrough: forward plain pointer movement (no button) as
 // tc_mouse_move so hover-reactive installations respond. Throttled to ~20/s
@@ -2546,10 +2560,11 @@ window.addEventListener('mouseup', e => {
   liveDown = null;
   if (down.pressSent) {
     const p = liveToApp(e);
-    sendCommand(detailId, { action: 'call', tool: 'tc_mouse_release', args: { x: p.x, y: p.y } });
+    sendCommand(detailId, { action: 'call', tool: 'tc_mouse_release',
+                            args: { x: p.x, y: p.y, button: down.button } });
   } else {
     sendCommand(detailId, { action: 'call', tool: 'tc_mouse_click',
-                            args: { x: down.start.x, y: down.start.y } });
+                            args: { x: down.start.x, y: down.start.y, button: down.button } });
   }
 });
 
