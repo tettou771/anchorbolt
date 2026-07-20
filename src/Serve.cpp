@@ -1321,12 +1321,13 @@ const char* kDashboardHtml = R"HTML(<!DOCTYPE html>
   .stale .dot, .dot.bad { background: #f85149; }
   #empty { color: #4a4f59; text-align: center; padding: 80px 20px; }
   /* Header capsules share one box so their heights line up exactly. */
-  #apprBtn, #gearBtn, #logoutBtn { background: none; border: 1px solid #2a2e36;
+  #shareBadge, #apprBtn, #gearBtn, #logoutBtn { background: none; border: 1px solid #2a2e36;
       color: #7d838e; border-radius: 5px; font-size: 11px; height: 24px;
       padding: 0 10px; box-sizing: border-box; display: inline-flex;
       align-items: center; gap: 5px; cursor: pointer; }
-  #apprBtn:hover, #gearBtn:hover, #logoutBtn:hover { color: #d4d7dd; }
-  #apprBtn[hidden], #gearBtn[hidden], #logoutBtn[hidden] { display: none; }
+  #shareBadge:hover, #apprBtn:hover, #gearBtn:hover, #logoutBtn:hover { color: #d4d7dd; }
+  #shareBadge[hidden], #apprBtn[hidden], #gearBtn[hidden], #logoutBtn[hidden] { display: none; }
+  #shareBadge { color: #8fd0ff; border-color: #2c495f; }
   #apprBtn { color: #e3b341; border-color: #55482a; }
   #apprPanel { position: fixed; top: 52px; right: 16px; width: 440px;
       max-height: 60vh; overflow-y: auto; background: #16181d;
@@ -1575,6 +1576,7 @@ R"HTML(
   <span class="sub" id="summary"></span>
   <span style="flex:1"></span>
   <span class="sub" id="who"></span>
+  <button id="shareBadge" hidden title="you opened a share link — your own login is untouched; click to return to it">shared view &times;</button>
   <button id="apprBtn" hidden title="queued AI calls awaiting approval">approvals <b id="apprN"></b></button>
   <button id="gearBtn" hidden title="settings">&#9881;</button>
   <button id="logoutBtn" hidden>logout</button>
@@ -1772,6 +1774,11 @@ document.getElementById('loginBtn').addEventListener('click', doLogin);
 document.getElementById('loginTok').addEventListener('keydown', e => {
   if (e.key === 'Enter') doLogin();
 });
+document.getElementById('shareBadge').addEventListener('click', async () => {
+  await fetch('/api/share/exit', { method: 'POST' });
+  location.reload();   // back to the login that was underneath
+});
+
 document.getElementById('logoutBtn').addEventListener('click', async () => {
   await fetch('/api/logout', { method: 'POST' });
   location.reload();
@@ -1795,6 +1802,8 @@ function applyRole(me) {
   }
   // The gear opens the settings page — admin only (or open mode).
   if (me.open || me.role === 'admin') document.getElementById('gearBtn').hidden = false;
+  // Share overlay with a real login underneath: offer the way back.
+  if (me.share && me.hasLogin) document.getElementById('shareBadge').hidden = false;
 }
 
 )HTML"
@@ -3392,13 +3401,23 @@ int cmdServe(const vector<string>& args) {
     // itself (HttpOnly — set by /api/login, sent automatically by <img> tags
     // too, which Authorization headers can't do); verification re-hashes per
     // request, so revoking an operator locks them out on their next poll.
-    auto cookieToken = [](const httplib::Request& req) -> string {
+    auto cookieNamed = [](const httplib::Request& req, const char* name) -> string {
         string c = req.get_header_value("Cookie");
-        size_t pos = c.find("abtoken=");
+        string key = string(name) + "=";
+        size_t pos = c.find(key);
         if (pos == string::npos) return "";
-        pos += 8;
+        pos += key.size();
         size_t end = c.find(';', pos);
         return c.substr(pos, end == string::npos ? string::npos : end - pos);
+    };
+    // Two cookies: abtoken is the real login (persistent), abshare is a share
+    // session (browser-session cookie) that OVERLAYS it while present — so
+    // opening a share link shows the shared view without forgetting who you
+    // are; exiting the share (or closing the browser) restores the login.
+    auto cookieToken = [cookieNamed, dataDir](const httplib::Request& req) -> string {
+        string sh = cookieNamed(req, "abshare");
+        if (!sh.empty() && token::verifyOperator(dataDir.string(), sh)) return sh;
+        return cookieNamed(req, "abtoken");
     };
     // Minimum-role gate: viewer=1 operator=2 admin=3. Open mode admits all.
     auto requireRole = [dataDir, cookieToken](const httplib::Request& req,
@@ -3529,10 +3548,24 @@ int cmdServe(const vector<string>& args) {
             res.set_content("invalid token", "text/plain");
             return;
         }
-        res.set_header("Set-Cookie", "abtoken=" + tok +
-                       "; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000");
+        // Share tokens land in their own SESSION cookie so a share link never
+        // overwrites the real login (see cookieToken); everything else is the
+        // persistent login cookie.
+        if (tok.rfind("sh-", 0) == 0) {
+            res.set_header("Set-Cookie", "abshare=" + tok +
+                           "; HttpOnly; SameSite=Lax; Path=/");
+        } else {
+            res.set_header("Set-Cookie", "abtoken=" + tok +
+                           "; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000");
+        }
         res.set_content(Json({{"name", op->name}, {"role", op->role}}).dump(),
                         "application/json");
+    });
+
+    // Drop only the share overlay: back to whoever was logged in underneath.
+    svr.Post("/api/share/exit", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Set-Cookie", "abshare=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0");
+        res.set_content("ok", "text/plain");
     });
 
 
@@ -3591,11 +3624,12 @@ int cmdServe(const vector<string>& args) {
 
     svr.Post("/api/logout", [](const httplib::Request&, httplib::Response& res) {
         res.set_header("Set-Cookie", "abtoken=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0");
+        res.set_header("Set-Cookie", "abshare=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0");
         res.set_content("ok", "text/plain");
     });
 
     // Who am I? Drives the login overlay and role-based UI hiding.
-    svr.Get("/api/me", [dataDir, cookieToken](const httplib::Request& req, httplib::Response& res) {
+    svr.Get("/api/me", [dataDir, cookieToken, cookieNamed](const httplib::Request& req, httplib::Response& res) {
         string d = dataDir.string();
         if (!token::operatorsEnabled(d)) {
             res.set_content(Json({{"open", true}}).dump(), "application/json");
@@ -3607,8 +3641,15 @@ int cmdServe(const vector<string>& args) {
             res.set_content("unauthorized", "text/plain");
             return;
         }
-        res.set_content(Json({{"open", false}, {"name", op->name}, {"role", op->role}}).dump(),
-                        "application/json");
+        Json me = {{"open", false}, {"name", op->name}, {"role", op->role}};
+        // Viewing through a share overlay? Say so, and whether a real login is
+        // waiting underneath (drives the "shared view — exit" capsule).
+        string sh = cookieNamed(req, "abshare");
+        if (!sh.empty() && token::verifyOperator(d, sh)) {
+            me["share"] = true;
+            me["hasLogin"] = token::verifyOperator(d, cookieNamed(req, "abtoken")).has_value();
+        }
+        res.set_content(me.dump(), "application/json");
     });
 
     // ---- admin (rank 3): groups, operators, agents, codes -------------------
