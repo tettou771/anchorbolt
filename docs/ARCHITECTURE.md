@@ -445,11 +445,10 @@ level can't masquerade as a failure at the next.
 | hang watchdog (restart) | 10 s wall-clock | wall-clock since the last healthy reply — HTTP timeouts can't stretch it |
 | boot grace | 120 s | heavy apps (shader warmup, model loads) routinely need more than 15 s for their first healthy reply |
 | push HTTP timeout (venue → server) | 10 s | measured on Raspberry-Pi-class boxes over a tunnel: 2 s produced false "unreachable" streaks — a *late* reply is not a *dead* server. The push runs on the supervision cadence, so one slow round-trip must stay smaller than the layers above |
-| wall stale mark (red dot) | 30 s | ~10 missed heartbeats, display-only. Red must mean "needs attention", not "one packet was late" — and a real crash reaches you sooner anyway, through the down/restart notifications |
-| `offline` / `online` notify events | `--offline-after` 120 s | a machine that died can't report it; only sustained silence shows it. Long enough that a tunnel flap doesn't page anyone |
+| `offline` status (red dot AND notify event) | `--offline-after` 60 s | ONE threshold: the wall shows the server's offline verdict — the same flag that fires the notification — so "red" and "you got paged" are a single state. A machine that died can't report it; only sustained silence shows it. ~20 missed heartbeats keeps a tunnel flap from paging anyone, while a real crash reaches you sooner via the down/restart notifications |
 | approval wait | ~20 s, then a ticket (TTL 900 s) | most approvals happen while someone is at the dashboard; past that the AI polls `get_approval` instead of holding a connection |
 
-When tuning: keep `poll < push timeout < stale < offline`, and remember the
+When tuning: keep `poll < push timeout < offline`, and remember the
 wall dot is cosmetic — supervision (restart) and notification (down/alert)
 each have their own clocks and fire regardless of what the dashboard shows.
 

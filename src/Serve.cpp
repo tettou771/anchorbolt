@@ -84,7 +84,7 @@ struct ServeOptions {
                               // independent of any app's local --log-keep
     bool   autoApprove = false;  // execute mutating /mcp calls directly (no queue)
     int    approvalTtlSec = 900; // pending approvals expire after this
-    int    offlineAfterSec = 120; // heartbeat silence before the offline event
+    int    offlineAfterSec = 60;  // heartbeat silence before offline (event + red dot)
 };
 
 struct ImageSlot {
@@ -1752,11 +1752,10 @@ R"HTML(
 
 )HTML"
 R"HTML(<script>
-// 30s = ~10 missed heartbeats (3s cadence). Generous on purpose: a slow
-// tunnel can block one push for up to 10s, and a red dot should mean
-// "needs attention", not "one packet was late" — a real crash reaches
-// you through the down/restart notifications anyway.
-const STALE_SEC = 30;
+// Red == offline: the wall shows the SERVER's offline verdict — the very
+// flag that fires the offline notification (--offline-after) — so the dot
+// and the page are one state, never two thresholds drifting apart. Real
+// crashes surface earlier anyway, via the restart/down incident badges.
 let myRole = null;   // null = open mode (everything allowed)
 
 function showLogin() {
@@ -2039,7 +2038,7 @@ function statsLine(app) {
   if (h.fps !== undefined) parts.push(h.fps.toFixed(0) + ' fps');
   if (h.width) parts.push(h.width + 'x' + h.height);
   if (h.uptimeSec !== undefined) parts.push('up ' + fmtUptime(h.uptimeSec));
-  if (app.ageSec > STALE_SEC)
+  if (app.offline)
     parts.push('last seen ' + lastSeenStamp(app.ageSec) + ' (' + fmtAgo(app.ageSec) + ' ago)');
   return parts.join(' · ');
 }
@@ -2050,7 +2049,7 @@ function wallStats(app) {
   const h = app.health || {};
   const parts = [];
   if (h.uptimeSec !== undefined) parts.push('up ' + fmtUptime(h.uptimeSec));
-  if (app.ageSec > STALE_SEC) parts.push('last seen ' + fmtAgo(app.ageSec) + ' ago');
+  if (app.offline) parts.push('last seen ' + fmtAgo(app.ageSec) + ' ago');
   return parts.join(' · ');
 }
 
@@ -2240,7 +2239,7 @@ async function renderDetail() {
   const app = lastApps.find(a => a.id === detailId);
   if (!app) return;
 
-  const stale = app.ageSec > STALE_SEC;
+  const stale = !!app.offline;
   document.getElementById('dDot').classList.toggle('bad', stale);
   document.getElementById('dTitle').textContent = app.id;
   const dg = document.getElementById('dGroup');
@@ -2847,8 +2846,8 @@ async function refresh() {
     let el = document.getElementById('app-' + app.id);
     if (!el) { el = card(app); grid.appendChild(el); }
 
-    const offline = app.reported && app.ageSec > STALE_SEC;
-    el.classList.toggle('stale', app.ageSec > STALE_SEC);
+    const offline = app.reported && app.offline;
+    el.classList.toggle('stale', !!app.offline);
     el.dataset.group = app.group || '';
     el.querySelector('.label').textContent = app.id;
     const gb = el.querySelector('.gbadge');
@@ -2876,7 +2875,7 @@ async function refresh() {
   }
   // Hidden apps are off the wall, so they don't count toward the summary either.
   const counted = apps.filter(a => !a.hidden);
-  const ok = counted.filter(a => a.reported && a.ageSec <= STALE_SEC).length;
+  const ok = counted.filter(a => a.reported && !a.offline).length;
   document.getElementById('summary').textContent =
     counted.length === 0 ? '' : `${ok}/${counted.length} healthy`;
 
@@ -4507,6 +4506,7 @@ int cmdServe(const vector<string>& args) {
                             {"thumbSeq", st.thumbSeq},
                             {"images", images},
                             {"live", g_agents.live(id)},
+                            {"offline", st.notifiedOffline},
                             {"hidden", st.hidden},
                             {"alerts", st.unackedAlerts},
                             {"health", st.health}});
