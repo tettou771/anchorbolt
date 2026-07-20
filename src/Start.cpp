@@ -74,7 +74,11 @@ struct StartOptions {
                                  // slowly (model load, external-API handshake).
                                  // Only defers the hang kill; a crash/exit still
                                  // restarts instantly.
-    string serverUrl;            // fleet server base URL (empty = no push)
+    string serverUrl;            // fleet server base URL (empty = no push; may be
+                                 // filled from the saved identity if neither
+                                 // --server nor --no-server is passed)
+    bool   noServer = false;     // --no-server: force local-only supervision
+                                 // regardless of what the token file remembers.
     string appId;                // id on the fleet server (default: binary name)
     string token;                // agent token (--token > ANCHORBOLT_TOKEN > tokenFile > pair file)
     string pairCode;             // --pair <code>: redeem for id+token, then persist
@@ -1015,6 +1019,7 @@ bool parseArgs(const vector<string>& args, StartOptions& opt) {
         else if (a == "--watchdog-timeout") { auto v = next("--watchdog-timeout"); if (!v) return false; opt.watchdogTimeoutSec = stoi(*v); }
         else if (a == "--log-keep") { auto v = next("--log-keep"); if (!v) return false; opt.logKeepDays = stoi(*v); }
         else if (a == "--server")   { auto v = next("--server");   if (!v) return false; opt.serverUrl = *v; }
+        else if (a == "--no-server") { opt.noServer = true; }
         else if (a == "--token")    { auto v = next("--token");    if (!v) return false; opt.token = *v; }
         else if (a == "--token-file") {
             auto v = next("--token-file");
@@ -1133,9 +1138,15 @@ bool loadConfig(const fs::path& path, StartOptions& opt) {
         for (auto& a : c["args"]) opt.appArgs.push_back(a.get<string>());
     }
     opt.cwd       = c.value("cwd", opt.cwd);
-    // No "id" key: on a fleet the id is server-assigned (derived from the token);
-    // local-only runs name their log dir from the binary.
-    opt.serverUrl = c.value("server", opt.serverUrl);
+    // No "id" or "server" key: id is server-assigned (from the token); the
+    // fleet URL is persisted in the private token file so it belongs to the
+    // installation, not the repo — like a git remote, not part of the commit.
+    // Use --server (once) or --no-server to opt out of joining a fleet.
+    if (c.contains("server")) {
+        cerr << "anchorbolt start: config's 'server' key is no longer read.\n"
+             << "The fleet URL is remembered per-install in the token file;\n"
+             << "pass --server <url> once (or --no-server) instead." << endl;
+    }
     if (c.contains("port")) { opt.port = c["port"].get<int>(); opt.portExplicit = true; }
     opt.wsPort    = c.value("wsPort", opt.wsPort);
     opt.wsUrl     = c.value("wsUrl", opt.wsUrl);
@@ -1212,17 +1223,48 @@ fs::path pairTokenFile(const fs::path& runPath) {
     return platformLogDir(key + "-" + hex) / "anchorbolt.token.json";
 }
 
-// Adopt a persisted {id, token} as a base: only fills fields nothing else set,
-// so config/env/flags all still win over it.
-void readPairTokenFile(const fs::path& file, StartOptions& opt) {
+// A persisted identity for one app install: {id, token, server, path}. Empty
+// fields mean "not saved". `server` is the last fleet this install was paired
+// with — used to (a) auto-fill --server on plain restarts and (b) refuse to
+// reuse a token against a *different* --server without an explicit re-pair.
+struct SavedIdentity {
+    string appId;
+    string token;
+    string serverUrl;
+    bool   loaded = false;   // false = file didn't exist / didn't parse
+};
+
+SavedIdentity loadPairTokenFile(const fs::path& file) {
+    SavedIdentity s;
     ifstream in(file);
-    if (!in) return;
+    if (!in) return s;
     Json j;
-    try { j = Json::parse(in); } catch (...) { return; }
-    if (opt.appId.empty() && j.contains("id") && j["id"].is_string())
-        opt.appId = j["id"].get<string>();
-    if (opt.token.empty() && j.contains("token") && j["token"].is_string())
-        opt.token = j["token"].get<string>();
+    try { j = Json::parse(in); } catch (...) { return s; }
+    s.loaded = true;
+    if (j.contains("id")     && j["id"].is_string())     s.appId     = j["id"].get<string>();
+    if (j.contains("token")  && j["token"].is_string())  s.token     = j["token"].get<string>();
+    if (j.contains("server") && j["server"].is_string()) s.serverUrl = j["server"].get<string>();
+    return s;
+}
+
+// Write {id, token, server, path} atomically (0600). Server is stored so a
+// plain `anchorbolt start` can reconnect to the same fleet on its own, and
+// so a later --server that disagrees can prompt for a re-pair.
+bool savePairTokenFile(const fs::path& file, const string& appId,
+                       const string& token, const string& serverUrl,
+                       const fs::path& runPath) {
+    error_code ec;
+    fs::create_directories(file.parent_path(), ec);
+    Json j = {{"id", appId}, {"token", token}, {"path", runPath.string()}};
+    if (!serverUrl.empty()) j["server"] = serverUrl;
+    { ofstream out(file, ios::trunc);
+      if (!out) return false;
+      out << j.dump(2) << "\n"; }
+#ifndef _WIN32
+    fs::permissions(file, fs::perms::owner_read | fs::perms::owner_write,
+                    fs::perm_options::replace, ec);
+#endif
+    return fs::exists(file, ec);
 }
 
 // Ask the fleet server which id this agent token authenticates (POST
@@ -1280,21 +1322,34 @@ bool stdinIsTty() {
 #endif
 }
 
-// Interactive onboarding: with a terminal attached but no token yet, ask for a
-// 6-digit pairing code (redeemed immediately) or an agent token (validated
-// later by whoami). Fills opt.token (+ opt.appId for the pairing path). Never
-// called without a TTY, so systemd/launchd runs stay non-interactive.
-bool promptOnboard(StartOptions& opt) {
+// Interactive onboarding: with a terminal attached, ask for a 6-digit pairing
+// code (redeemed immediately) or an agent token (validated later by whoami).
+// Fills opt.token (+ opt.appId for the pairing path). Never called without a
+// TTY, so systemd/launchd runs stay non-interactive.
+//
+// `intro` prints once above the prompt (empty = default onboarding message).
+// An empty FIRST line is treated as cancel — the caller keeps any existing
+// saved identity untouched. Later empty lines just re-prompt.
+bool promptOnboard(StartOptions& opt, const string& intro = "") {
+    if (!intro.empty()) cout << intro << flush;
     for (int attempt = 0; attempt < 3; ++attempt) {
-        cout << "This app has no token yet. Enter a 6-digit pairing code from the\n"
-                "dashboard, or paste an agent token (tc-...): " << flush;
+        if (intro.empty()) {
+            cout << "This app has no token yet. Enter a 6-digit pairing code from the\n"
+                    "dashboard, or paste an agent token (tc-...): " << flush;
+        } else {
+            cout << (attempt == 0 ? "Code or token (empty to cancel): "
+                                  : "Try again (empty to cancel): ") << flush;
+        }
         string line;
         if (!getline(cin, line)) return false;  // EOF / closed stdin
         // Trim surrounding whitespace.
         size_t a = line.find_first_not_of(" \t\r\n");
         size_t b = line.find_last_not_of(" \t\r\n");
         line = (a == string::npos) ? "" : line.substr(a, b - a + 1);
-        if (line.empty()) continue;
+        if (line.empty()) {
+            if (attempt == 0) return false;  // cancel: leave any saved identity intact
+            continue;
+        }
 
         bool sixDigits = line.size() == 6 &&
                          all_of(line.begin(), line.end(), [](char c){ return isdigit((unsigned char)c); });
@@ -1645,10 +1700,10 @@ void closeProc(Proc&) {}
 
 } // namespace
 
-// A commented anchorbolt.json to start from: write it out, tweak the app path
-// and server url, and run. The config parser allows // comments, so this
-// round-trips as-is. No "token"/"id" keys — the token is a secret (pair once,
-// or use tokenFile) and the id is assigned by the server.
+// A commented anchorbolt.json to start from: write it out, tweak the app path,
+// and run. The config parser allows // comments, so this round-trips as-is.
+// No "server"/"token"/"id" keys — those are per-install state (like a git
+// remote), not project spec: pass --server (once) or --no-server on the CLI.
 static void printConfigTemplate() {
     cout <<
         "{\n"
@@ -1657,13 +1712,13 @@ static void printConfigTemplate() {
         "  // Extra arguments handed to the app on launch.\n"
         "  \"args\": [\"--fullscreen\"],\n"
         "\n"
-        "  // --- fleet (drop this whole block for local-only auto-restart) ---\n"
-        "  // Fleet server to push heartbeats / logs / thumbnails to.\n"
-        "  \"server\": \"https://ops.example.com\",\n"
-        "  // The agent token is NOT stored here (it would leak via git). Pair once with\n"
-        "  //   anchorbolt start --pair <6-digit-code>\n"
-        "  // and the id+token persist privately (0600) outside the repo. Or point at a\n"
-        "  // gitignored file that holds the token:\n"
+        "  // --- fleet ---\n"
+        "  // The fleet URL and agent token are NOT stored here (URL is per-install,\n"
+        "  // like a git remote; token is a secret). Pair the machine once with\n"
+        "  //   anchorbolt start --server https://ops.example.com --pair <6-digit-code>\n"
+        "  // and later `anchorbolt start` alone reuses both (id/token/server persist\n"
+        "  // privately, 0600, outside the repo). Add --no-server to force local-only.\n"
+        "  // Or point at a gitignored file that holds a pre-minted token:\n"
         "  // \"tokenFile\": \"anchorbolt.token\",\n"
         "\n"
         "  // Command channel over a reverse proxy / tunnel: only needed if the WS hub\n"
@@ -1750,18 +1805,71 @@ int cmdStart(const vector<string>& args) {
     if (opt.cwd.empty()) opt.cwd = runPath.parent_path().string();
     opt.projectDir = deriveProjectDir(runPath, opt.cwd);
 
-    // Adopt a previously-paired identity BEFORE the binary-name fallback, so a
-    // plain restart reuses the server-assigned id. Lowest priority: fills only
-    // id/token that nothing else (config, env, flags, --pair) already set. The
-    // file is keyed by the binary name, so we don't need the paired id to find
-    // it. Skipped on the pairing run itself (we just got a fresh identity).
-    if (!pairArg) readPairTokenFile(pairTokenFile(runPath), opt);
+    // Load the previously-paired identity (id + token + server URL) if any.
+    // Skipped on the pairing run itself, where we just minted a fresh identity
+    // that will overwrite the file at the end.
+    SavedIdentity saved;
+    if (!pairArg) saved = loadPairTokenFile(pairTokenFile(runPath));
+
+    // Effective server URL:
+    //   --no-server > --server (or config) > saved > empty (local only).
+    // --no-server keeps the token file intact but forces this run local; a
+    // conflicting --server is a warn, not an error (so the more restrictive
+    // choice wins even if both are passed by accident).
+    if (opt.noServer) {
+        if (!opt.serverUrl.empty()) {
+            logWarning("anchorbolt")
+                << "--server " << opt.serverUrl
+                << " ignored: --no-server forces local-only supervision";
+        }
+        opt.serverUrl.clear();
+    } else if (opt.serverUrl.empty()) {
+        opt.serverUrl = saved.serverUrl;
+    }
+
+    // A saved token authenticates against exactly the server it was paired
+    // with. If --server pins us to a different fleet, we must NOT reuse the
+    // saved token silently (it'd 401 forever); ask for a fresh code/token
+    // instead. Skipped when --pair already minted a new identity.
+    const bool serverMismatch =
+        !pairArg && !opt.serverUrl.empty()
+        && !saved.serverUrl.empty() && saved.serverUrl != opt.serverUrl;
+
+    if (!pairArg && !serverMismatch) {
+        if (opt.appId.empty() && !saved.appId.empty()) opt.appId = saved.appId;
+        if (opt.token.empty() && !saved.token.empty()) opt.token = saved.token;
+    }
 
     // Fleet identity. Joining a fleet (--server) is secure by default: it needs
     // an agent token (from `token agent new` or a pairing code), and the id is
     // derived from that token server-side — never supplied by the app. A
     // token with no cached id resolves once via /api/whoami, then persists.
     bool resolvedId = false;
+
+    if (serverMismatch) {
+        string mismatchMsg =
+            "anchorbolt start: this app was paired with " + saved.serverUrl +
+            "\n  but --server is " + opt.serverUrl +
+            ".\n  The saved token won't authenticate against a different fleet.\n";
+        if (!opt.token.empty()) {
+            // --token / env supplied: explicit intent, use it and overwrite.
+            cerr << mismatchMsg;
+            resolvedId = true;
+        } else if (stdinIsTty()) {
+            if (!promptOnboard(opt, mismatchMsg)) {
+                cerr << "  cancelled — the identity for " << saved.serverUrl
+                     << " was kept." << endl;
+                return 1;
+            }
+            resolvedId = true;
+        } else {
+            cerr << mismatchMsg
+                 << "  non-interactive: pass --pair <code> or --token tc-... to re-pair,\n"
+                    "  or --no-server to run local-only." << endl;
+            return 1;
+        }
+    }
+
     if (!opt.serverUrl.empty()) {
         if (opt.token.empty()) {
             // Terminal attached: ask for a code/token instead of failing, and
@@ -1800,22 +1908,18 @@ int cmdStart(const vector<string>& args) {
                                          : fs::absolute(opt.logDir);
     fs::create_directories(logDir);
 
-    // Just paired (or resolved an id from a bare token): persist id + token so
-    // the next plain run reuses them and skips the server round-trip.
-    if (pairArg || resolvedId) {
+    // Persist id + token + server URL when we have a fleet identity to save
+    // and it differs from what's on disk. Covers three cases:
+    //   - fresh pair or bare-token onboarding (pairArg || resolvedId)
+    //   - migration: an old file lacks the server field, but we now have it
+    //   - server change: user re-paired against a new fleet (overwrite intent)
+    // Local-only runs (empty serverUrl) never touch the file — a --no-server
+    // detour must not delete a paired identity from earlier.
+    if (!opt.serverUrl.empty() && !opt.token.empty() &&
+        (opt.appId != saved.appId || opt.token != saved.token ||
+         opt.serverUrl != saved.serverUrl)) {
         fs::path pf = pairTokenFile(runPath);
-        error_code ec;
-        fs::create_directories(pf.parent_path(), ec);
-        { ofstream out(pf, ios::trunc);
-          if (out) out << Json({{"id", opt.appId}, {"token", opt.token},
-                                {"path", runPath.string()}}).dump(2) << "\n"; }
-        if (fs::exists(pf, ec)) {
-#ifndef _WIN32
-            // Owner read/write only — it holds a token. (Windows: %LOCALAPPDATA%
-            // is already a per-user directory, so ACL inheritance covers it.)
-            fs::permissions(pf, fs::perms::owner_read | fs::perms::owner_write,
-                            fs::perm_options::replace, ec);
-#endif
+        if (savePairTokenFile(pf, opt.appId, opt.token, opt.serverUrl, runPath)) {
             logNotice("anchorbolt") << "paired identity saved to " << pf.string();
         } else {
             logWarning("anchorbolt") << "could not write paired identity to " << pf.string();
