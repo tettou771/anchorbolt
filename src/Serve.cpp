@@ -1540,15 +1540,15 @@ R"HTML(
   /* Round delete: a filled bright-orange disc with a geometric cross drawn by
      the two pseudo-element bars (rotated ±45°) — pixel-centered and truly
      orthogonal, unlike a font's ×. */
-  .sXBtn { width: 20px; height: 20px; border-radius: 50%; background: #ff8a80;
+  .sXBtn { width: 17px; height: 17px; border-radius: 50%; background: #c9524a;
            border: none; cursor: pointer; padding: 0; flex: none;
            position: relative; vertical-align: middle; }
   .sXBtn::before, .sXBtn::after { content: ''; position: absolute;
-           top: 50%; left: 50%; width: 10px; height: 2px; border-radius: 1px;
+           top: 50%; left: 50%; width: 9px; height: 2px; border-radius: 1px;
            background: #1a1c22; }
   .sXBtn::before { transform: translate(-50%, -50%) rotate(45deg); }
   .sXBtn::after  { transform: translate(-50%, -50%) rotate(-45deg); }
-  .sXBtn:hover { background: #ffa39a; }
+  .sXBtn:hover { background: #de6157; }
   .sTable td.acts button + button { margin-left: 6px; }
   /* Footer row = the "create new" entry, aligned to the same columns. */
   .sTable tfoot td { padding: 10px 8px 4px; border-top: 1px solid #2a2e36; }
@@ -2979,6 +2979,8 @@ function sinkRowEl(cfg, idx) {
   const tr = document.createElement('tr');
   const presets = ['slack', 'discord', 'ntfy', 'uptime-kuma', ''];
   const sel = document.createElement('select');
+  sel.style.width = '100%';   // fit the cell: an overflowing select makes the
+                              // td paint its text-overflow ellipsis as a stray dot
   sel.replaceChildren(...presets.map(p =>
     new Option(p === '' ? 'generic' : p, p, false, (cfg.preset || '') === p)));
   sel.addEventListener('change', () => {
