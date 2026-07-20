@@ -1321,12 +1321,12 @@ const char* kDashboardHtml = R"HTML(<!DOCTYPE html>
   .stale .dot, .dot.bad { background: #f85149; }
   #empty { color: #4a4f59; text-align: center; padding: 80px 20px; }
   /* Header capsules share one box so their heights line up exactly. */
-  #shareBadge, #apprBtn, #gearBtn, #logoutBtn { background: none; border: 1px solid #2a2e36;
+  #addDevice, #shareBadge, #apprBtn, #gearBtn, #logoutBtn { background: none; border: 1px solid #2a2e36;
       color: #7d838e; border-radius: 5px; font-size: 11px; height: 24px;
       padding: 0 10px; box-sizing: border-box; display: inline-flex;
       align-items: center; gap: 5px; cursor: pointer; }
-  #shareBadge:hover, #apprBtn:hover, #gearBtn:hover, #logoutBtn:hover { color: #d4d7dd; }
-  #shareBadge[hidden], #apprBtn[hidden], #gearBtn[hidden], #logoutBtn[hidden] { display: none; }
+  #addDevice:hover, #shareBadge:hover, #apprBtn:hover, #gearBtn:hover, #logoutBtn:hover { color: #d4d7dd; }
+  #addDevice[hidden], #shareBadge[hidden], #apprBtn[hidden], #gearBtn[hidden], #logoutBtn[hidden] { display: none; }
   #shareBadge { color: #8fd0ff; border-color: #2c495f; }
   #apprBtn { color: #e3b341; border-color: #55482a; }
   #apprPanel { position: fixed; top: 52px; right: 16px; width: 440px;
@@ -1576,6 +1576,7 @@ R"HTML(
   <span class="sub" id="summary"></span>
   <span style="flex:1"></span>
   <span class="sub" id="who"></span>
+  <button id="addDevice" hidden title="get a 6-digit code to sign in as yourself on another device (valid 10 min, single use)">Add device</button>
   <button id="shareBadge" hidden title="you opened a share link — your own login is untouched; click to return to it">shared view &times;</button>
   <button id="apprBtn" hidden title="queued AI calls awaiting approval">approvals <b id="apprN"></b></button>
   <button id="gearBtn" hidden title="settings">&#9881;</button>
@@ -1774,6 +1775,18 @@ document.getElementById('loginBtn').addEventListener('click', doLogin);
 document.getElementById('loginTok').addEventListener('keydown', e => {
   if (e.key === 'Enter') doLogin();
 });
+document.getElementById('addDevice').addEventListener('click', async () => {
+  const btn = document.getElementById('addDevice');
+  try {
+    const j = await (await fetch('/api/my/login-code', { method: 'POST' })).json();
+    btn.textContent = 'code ' + j.code + ' · 10 min';
+    setTimeout(() => { btn.textContent = 'Add device'; }, 60000);
+  } catch {
+    btn.textContent = 'failed';
+    setTimeout(() => { btn.textContent = 'Add device'; }, 3000);
+  }
+});
+
 document.getElementById('shareBadge').addEventListener('click', async () => {
   await fetch('/api/share/exit', { method: 'POST' });
   location.reload();   // back to the login that was underneath
@@ -1804,6 +1817,8 @@ function applyRole(me) {
   if (me.open || me.role === 'admin') document.getElementById('gearBtn').hidden = false;
   // Share overlay with a real login underneath: offer the way back.
   if (me.share && me.hasLogin) document.getElementById('shareBadge').hidden = false;
+  // Self-service device add: any real login, but not through a share overlay.
+  if (!me.open && !me.share) document.getElementById('addDevice').hidden = false;
 }
 
 )HTML"
@@ -3560,6 +3575,19 @@ int cmdServe(const vector<string>& args) {
         }
         res.set_content(Json({{"name", op->name}, {"role", op->role}}).dump(),
                         "application/json");
+    });
+
+    // Self-service device add: a logged-in operator mints a login code for
+    // THEMSELVES (another session, same identity — no admin needed, no op-
+    // token ever travels through a chat). Share overlays can't: "share" is a
+    // pseudo-identity with no operator record to log into.
+    svr.Post("/api/my/login-code", [dataDir, cookieToken](const httplib::Request& req, httplib::Response& res) {
+        string d = dataDir.string();
+        auto op = token::verifyOperator(d, cookieToken(req));
+        if (!op) { res.status = 401; res.set_content("unauthorized", "text/plain"); return; }
+        if (op->name == "share") { res.status = 403; res.set_content("forbidden", "text/plain"); return; }
+        string code = token::mintCode(d, "login", op->name, 600);
+        res.set_content(Json({{"code", code}, {"expiresSec", 600}}).dump(), "application/json");
     });
 
     // Drop only the share overlay: back to whoever was logged in underneath.
