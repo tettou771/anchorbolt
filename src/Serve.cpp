@@ -1576,7 +1576,7 @@ R"HTML(
   <span class="sub" id="summary"></span>
   <span style="flex:1"></span>
   <span class="sub" id="who"></span>
-  <button id="addDevice" hidden title="get a 6-digit code to sign in as yourself on another device (valid 10 min, single use)">Add device</button>
+  <button id="addDevice" hidden title="get a 6-digit code to sign in as yourself on another device (valid 10 min, single use)">Login code</button>
   <button id="shareBadge" hidden title="you opened a share link — your own login is untouched; click to return to it">shared view &times;</button>
   <button id="apprBtn" hidden title="queued AI calls awaiting approval">approvals <b id="apprN"></b></button>
   <button id="gearBtn" hidden title="settings">&#9881;</button>
@@ -1780,10 +1780,10 @@ document.getElementById('addDevice').addEventListener('click', async () => {
   try {
     const j = await (await fetch('/api/my/login-code', { method: 'POST' })).json();
     btn.textContent = 'code ' + j.code + ' · 10 min';
-    setTimeout(() => { btn.textContent = 'Add device'; }, 60000);
+    setTimeout(() => { btn.textContent = 'Login code'; }, 60000);
   } catch {
     btn.textContent = 'failed';
-    setTimeout(() => { btn.textContent = 'Add device'; }, 3000);
+    setTimeout(() => { btn.textContent = 'Login code'; }, 3000);
   }
 });
 
@@ -2870,9 +2870,11 @@ async function refresh() {
   for (const el of [...grid.children]) {
     if (!alive.has(el.id)) el.remove();
   }
-  const ok = apps.filter(a => a.reported && a.ageSec <= STALE_SEC).length;
+  // Hidden apps are off the wall, so they don't count toward the summary either.
+  const counted = apps.filter(a => !a.hidden);
+  const ok = counted.filter(a => a.reported && a.ageSec <= STALE_SEC).length;
   document.getElementById('summary').textContent =
-    apps.length === 0 ? '' : `${ok}/${apps.length} healthy`;
+    counted.length === 0 ? '' : `${ok}/${counted.length} healthy`;
 
   renderTabs(apps);
   applyTabFilter();
