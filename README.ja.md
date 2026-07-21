@@ -2,7 +2,7 @@
 
 **どこか別の場所で動かしっぱなしのアプリを、しっかり見守る。**
 
-[English](README.md) ・ [Get started](docs/GET_STARTED.ja.md) ・ [Architecture](docs/ARCHITECTURE.ja.md)
+[English](README.md) ・ [Get started](docs/GET_STARTED.ja.md) ・ [Architecture](docs/ARCHITECTURE.ja.md) ・ [App protocol](docs/APP_PROTOCOL.ja.md)
 
 ![フリートのウォール — すべてのアプリをひと目で](docs/images/wall.png)
 

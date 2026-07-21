@@ -63,7 +63,9 @@ HTTP timeouts don't stretch the effective window. A boot grace period
 (`--grace`, default 120s) keeps a slow-starting app from being killed before it
 first reports healthy. `--watchdog-timeout 0` supervises process exit only,
 which is what makes AnchorBolt useful for **any** binary, not just TrussC apps
-with an MCP endpoint.
+with an MCP endpoint. (A non-TrussC app can implement the endpoint itself and
+get the full feature set — the contract is specified in
+[App protocol](APP_PROTOCOL.md).)
 
 Termination is graceful-then-forceful: SIGTERM → 5s → SIGKILL on POSIX; WM_CLOSE
 to the app's windows → 5s → TerminateProcess on Windows. A restart waits a

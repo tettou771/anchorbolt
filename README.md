@@ -2,7 +2,7 @@
 
 **Keep an eye on the apps you left running somewhere else.**
 
-[日本語](README.ja.md) ・ [Get started](docs/GET_STARTED.md) ・ [Architecture](docs/ARCHITECTURE.md)
+[日本語](README.ja.md) ・ [Get started](docs/GET_STARTED.md) ・ [Architecture](docs/ARCHITECTURE.md) ・ [App protocol](docs/APP_PROTOCOL.md)
 
 ![The fleet wall — every app at a glance](docs/images/wall.png)
 
