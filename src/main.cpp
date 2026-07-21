@@ -111,7 +111,7 @@ static void printHelp(bool verbose) {
         "                     routing a path to the hub (e.g. wss://host/ws). Enables the\n"
         "                     Restart/Update buttons, live view and remote control there.\n"
         "                     Remote control (input injection) needs no flag — it works\n"
-        "                     only if the app registered debugger tools. Restart and\n"
+        "                     only if the app registered control tools. Restart and\n"
         "                     update are operator-gated on the server; viewers get neither.\n"
         "  --deny-update      refuse remote update/rollback for this app. Update is allowed\n"
         "                     by default (operators trigger the pipeline: git pull --ff-only,\n"

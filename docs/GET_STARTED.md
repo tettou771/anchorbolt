@@ -232,7 +232,7 @@ Now the detail view has a **Live** button. Click it to watch the screen; toggle
 ![Live view with remote control](images/live.png)
 
 Remote control needs the operator role (server side) and an app that opted in
-with `mcp::registerDebuggerTools()` — that's the whole gate, no venue-side
+with `mcp::registerControlTools()` — that's the whole gate, no venue-side
 flag. The control toggle only appears when the app exposes input tools.
 Monitoring alone needs only the HTTP route.
 

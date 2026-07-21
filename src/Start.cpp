@@ -93,7 +93,7 @@ struct StartOptions {
     bool   denyUpdate = false;   // opt out of remote update/rollback for this app
                                  // (default: allowed for operators). Control needs
                                  // no flag — a tool exists only if the app
-                                 // registered it (registerDebuggerTools).
+                                 // registered it (registerControlTools).
     bool   updateCustom = false; // config overrode the pipeline (no smart skip)
     vector<SinkConfig> sinks;    // outbound notifications (config "sinks" array)
     vector<string> updateCmds = {// remote-update pipeline, run in projectDir;
@@ -955,7 +955,7 @@ private:
                 string tool = m.value("tool", "");
                 // No supervisor gate on the tool surface: a mutating tool exists
                 // only if the app registered it (input injection comes from
-                // registerDebuggerTools), so the app's own MCP surface IS the
+                // registerControlTools), so the app's own MCP surface IS the
                 // control opt-in. The server side already restricts this to the
                 // operator role.
                 if (auto r = callTool(cli, tool, m.value("args", Json::object()))) {
@@ -1727,7 +1727,7 @@ static void printConfigTemplate() {
         "  // \"wsUrl\": \"wss://ops.example.com/ws\",\n"
         "\n"
         "  // Remote control (input injection) needs no flag: it works only if the app\n"
-        "  // registered debugger tools (mcp::registerDebuggerTools). Remote update\n"
+        "  // registered control tools (mcp::registerControlTools). Remote update\n"
         "  // (git pull + rebuild) is allowed by default for operators; set denyUpdate\n"
         "  // true to refuse it for this app.\n"
         "  // \"denyUpdate\": false,\n"

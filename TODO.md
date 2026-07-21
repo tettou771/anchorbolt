@@ -72,7 +72,7 @@ interactive onboarding (TTY prompt for a pairing code / token); short `--help`
 detail header, plain health dot, Clear empties the event list, no bogus
 last-seen for unreported apps); default boot grace 120s; pair-token file keyed
 by binary *path* (not just name) + path recorded inside it; **`--allow-control` /
-`--allow-update` removed** — control auto-detected from `registerDebuggerTools`,
+`--allow-update` removed** — control auto-detected from `registerControlTools`,
 update operator-gated with `--deny-update` opt-out, capability-gated dashboard
 buttons; log-panel preload from disk after a serve restart; log date picker +
 zip export (logs + images, today / 30d / all); screenshot scrubber (today +

@@ -249,7 +249,7 @@ installations respond without flooding the channel. Coordinates scale by the
 app's real window size (from health), not the downscaled frame.
 
 Control requires the operator role (server side) and an app that opted into
-input injection with `mcp::registerDebuggerTools()` — that is the whole gate,
+input injection with `mcp::registerControlTools()` — that is the whole gate,
 no venue-side flag. A mutating tool exists only if the app registered it, so the
 app's own MCP surface *is* the control opt-in; the agent advertises this
 (`caps.control`) so the dashboard shows the control toggle only when it applies.

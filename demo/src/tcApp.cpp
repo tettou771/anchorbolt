@@ -11,7 +11,7 @@ void tcApp::setup() {
     // Opt in to input injection (tc_mouse_click/press/move/release, tc_key_press)
     // so the fleet dashboard's live-view remote control has something to drive.
     // A real venue app enables this only when it wants to be remotely operated.
-    mcp::registerDebuggerTools();
+    mcp::registerControlTools();
 
     // App-specific tool (unprefixed by convention — tc_/tcx_ belong to the
     // framework). Hangs the main loop so supervisor hang-detection can be
