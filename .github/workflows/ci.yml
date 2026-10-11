@@ -1,6 +1,6 @@
-# Compile check on the platforms the author can't build locally.
+# Build check on the platforms the author can't build locally, plus a Linux smoke test.
 # macOS is verified on the dev machine; Windows/Linux build here against
-# TrussC dev. CMakeLists.txt is gitignored (trusscli regenerates it), so the
+# TrussC main. CMakeLists.txt is gitignored (trusscli regenerates it), so the
 # job writes the same 5 lines trusscli would.
 name: ci
 
@@ -23,7 +23,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: TrussC-org/TrussC
-          ref: dev
+          ref: main
           path: trussc
 
       - name: Linux dependencies
@@ -55,3 +55,81 @@ jobs:
       - name: Build
         shell: bash
         run: cmake --build build-ci --config Release --parallel 4
+
+      - name: Linux supervisor smoke
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          timeout --kill-after=10s 120s bash -s -- "$PWD/bin/anchorbolt" <<'SMOKE'
+          set -euo pipefail
+          binary=$1
+          work=$(mktemp -d "$PWD/build-ci/smoke.XXXXXX")
+          export TMPDIR="$work"
+          supervisor=
+          touch "$work/help.log" "$work/supervisor.log"
+          cleanup() {
+            status=$?
+            trap - EXIT
+            set +e
+            # Print before waiting for cleanup, including on assertion failure/timeout.
+            cat "$work/help.log" "$work/supervisor.log"
+            if [[ -n "$supervisor" ]]; then
+              # The launch log also covers an orphan if the supervisor crashed.
+              children=$(pgrep -P "$supervisor" ||
+                sed -n 's/.*app launched (pid \([0-9]*\)).*/\1/p' "$work/supervisor.log" | tail -n 1)
+              kill -TERM "$supervisor" 2>/dev/null
+              for pid in $children; do kill -TERM "$pid" 2>/dev/null; done
+              wait "$supervisor"
+            fi
+            exit "$status"
+          }
+          trap cleanup EXIT
+          trap 'exit 143' TERM
+          trap 'exit 130' INT
+          wait_log() {
+            for ((i=0; i<15; i++)); do
+              if grep -Fq "$1" "$work/supervisor.log"; then return 0; fi
+              kill -0 "$supervisor"
+              sleep 1
+            done
+            echo "Missing log line: $1" >&2
+            return 1
+          }
+
+          "$binary" --help > "$work/help.log" 2>&1
+          grep -Fxq 'USAGE' "$work/help.log"
+          echo '--help: exit 0, usage found'
+          "$binary" start -p "$(command -v sleep)" --grace 3 \
+            --log-dir "$work/logs" --no-server -- 600 > "$work/supervisor.log" 2>&1 &
+          supervisor=$!
+          wait_log 'no health endpoint: supervising by process exit only'
+          # Observe beyond the default 10s watchdog window as well as the grace.
+          sleep 12
+          if grep -Eq 'app unresponsive; restarting|restarting app' "$work/supervisor.log"; then
+            echo 'Unexpected restart without a health endpoint' >&2
+            exit 1
+          fi
+          child=$(pgrep -P "$supervisor" -x sleep)
+          [[ "$child" =~ ^[0-9]+$ ]]
+          echo "No-health Notice found; no watchdog restart; terminating child $child"
+          kill -TERM "$child"
+          wait_log 'restarting app (#1)'
+          # Require an actual replacement process, not just a scheduled restart.
+          for ((i=0; i<15; i++)); do
+            replacement=$(pgrep -P "$supervisor" -x sleep || true)
+            if [[ "$replacement" =~ ^[0-9]+$ && "$replacement" != "$child" ]]; then break; fi
+            sleep 1
+          done
+          [[ "$replacement" =~ ^[0-9]+$ && "$replacement" != "$child" ]]
+          echo "Process-exit restart found; replacement child $replacement"
+          kill -TERM "$supervisor"
+          wait "$supervisor"
+          supervisor=
+          if kill -0 "$replacement" 2>/dev/null; then
+            kill -TERM "$replacement"
+            echo 'Supervised child survived shutdown' >&2
+            exit 1
+          fi
+          if grep -Fq 'app unresponsive; restarting' "$work/supervisor.log"; then exit 1; fi
+          echo 'SIGTERM: anchorbolt exited 0; supervised child stopped'
+          SMOKE
