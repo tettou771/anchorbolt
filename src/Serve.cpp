@@ -1701,7 +1701,7 @@ R"HTML(
       </div>
       <div class="dStatusRow"><span class="stats" id="dStats"></span></div>
       <div class="dStatusRow"><span class="stats" id="dMcp"></span></div>
-      <div class="dStatusRow" id="dMcpHint" hidden><span class="stats">logs and restart only — the app grants no MCP tools; add <code>mcp::setToolLevel(ReadOnly)</code> in setup() for health and screenshots</span></div>
+      <div class="dStatusRow" id="dMcpHint" hidden><span class="stats">no health reply; logs and restart only. A TrussC ≥ 0.8 app answers health when <code>TRUSSC_MCP_PORT</code> is set; for screenshots and status add <code>mcp::setToolLevel(ReadOnly)</code> in setup()</span></div>
     </div>
     <div class="dbody">
       <div id="dLiveWrap" hidden>

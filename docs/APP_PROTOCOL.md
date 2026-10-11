@@ -55,9 +55,9 @@ environment variables set:
 For TrussC ≥ 0.8, environment variables configure or close MCP, or open a
 loopback health-only endpoint (`tc_get_health` only; see the final addendum to
 [TrussC-org/TrussC#242](https://github.com/TrussC-org/TrussC/issues/242)).
-All other MCP access requires an app grant or a dev build. Levels 0–1 need
-no MCP grant. For health and screenshots (level 2 and up), add this line in
-`setup()`:
+All other MCP access requires an app grant or a dev build. Levels 0–2 need
+no code change: with `TRUSSC_MCP_PORT` set, a TrussC ≥ 0.8 app answers health
+there. For screenshots and up (level 3+), add this line in `setup()`:
 
 ```cpp
 mcp::setToolLevel(mcp::ToolLevel::ReadOnly);
@@ -157,9 +157,8 @@ uses it for the per-run MCP state beside the dashboard's control capability
 and forwards the state as heartbeat `caps.mcp`. Without it, a healthy reply
 means ReadOnly, or Control if `tools/list` includes input tools. Public is
 health-only when the framework permits that reply. A live process that has
-never replied shows `closed`, with the hint: "logs and restart only — the
-app grants no MCP tools; add `mcp::setToolLevel(ReadOnly)` in setup() for
-health and screenshots". The fully qualified C++ line is shown above.
+never replied shows `closed` (an older TrussC or a non-TrussC app), with the
+hint: "no health reply; logs and restart only. A TrussC ≥ 0.8 app answers health when `TRUSSC_MCP_PORT` is set; for screenshots and status add `mcp::setToolLevel(ReadOnly)` in setup()". The fully qualified C++ line is shown above.
 
 Answer it from a thread that proves your app is *alive*, not just that a
 socket is open — if your render loop can hang while an HTTP thread keeps

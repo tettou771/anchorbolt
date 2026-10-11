@@ -49,7 +49,8 @@ TrussC ≥ 0.8 では環境変数で MCP の設定・閉鎖、またはループ
 health 専用エンドポイント（`tc_get_health` のみ）を開くことができます
 （[TrussC-org/TrussC#242](https://github.com/TrussC-org/TrussC/issues/242) の最終追記を参照）。
 それ以外の MCP アクセスにはアプリ側の許可、または開発ビルドが必要です。
-レベル 0–1 に MCP の許可は不要です。health とスクリーンショット（レベル 2 以上）には
+レベル 0–2 にコード変更は不要です（`TRUSSC_MCP_PORT` があれば TrussC ≥ 0.8 のアプリは
+そこで health に応答します）。スクリーンショット以上（レベル 3 以上）には
 `setup()` に次の1行を追加します:
 
 ```cpp
@@ -148,10 +149,9 @@ AnchorBolt は実行ごとの MCP 状態として、ダッシュボードの con
 ハートビートの `caps.mcp` に載せます。フィールドがなければ healthy な応答は
 ReadOnly、`tools/list` に入力ツールがあれば Control と判定します。Public は
 フレームワークが応答を許可している場合の health のみです。プロセスは生きているが
-一度も応答していない場合は `closed` と表示し、次のヒントを添えます:
-"logs and restart only — the app grants no MCP tools; add
-`mcp::setToolLevel(ReadOnly)` in setup() for health and screenshots"
-（ログと再起動のみ。health とスクリーンショットには上記の完全修飾した C++ の1行を追加）。
+一度も応答していない場合（旧 TrussC か TrussC 以外のアプリ）は `closed` と表示し、次のヒントを添えます:
+"no health reply; logs and restart only. A TrussC ≥ 0.8 app answers health when `TRUSSC_MCP_PORT` is set; for screenshots and status add `mcp::setToolLevel(ReadOnly)` in setup()"
+（health 応答なし。ログと再起動のみ。TrussC ≥ 0.8 のアプリは `TRUSSC_MCP_PORT` があれば health に応答する。スクリーンショットとステータスには上記の完全修飾した C++ の1行を追加）。
 
 アプリが*生きている*ことを証明するスレッドから応答してください。ソケットが
 開いているだけでは駄目です — レンダーループがハングしても HTTP スレッドが
