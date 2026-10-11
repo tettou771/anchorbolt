@@ -2,11 +2,11 @@
 
 [日本語](APP_PROTOCOL.ja.md) ・ [← README](../README.md) ・ [Architecture](ARCHITECTURE.md)
 
-TrussC apps get everything on the box for free — health, thumbnails, status,
-remote control — because the framework ships the MCP endpoint AnchorBolt
-expects. But nothing in that contract actually requires TrussC. This page is
-the contract itself: what a Unity, Electron, Processing, openFrameworks or
-plain-anything app must implement to be supervised like a native.
+TrussC ships the MCP endpoint AnchorBolt expects for health, thumbnails,
+status and remote control. The app decides which tools it grants. But nothing
+in that contract actually requires TrussC. This page is the contract itself:
+what a Unity, Electron, Processing, openFrameworks or plain-anything app must
+implement to be supervised like a native.
 
 > **About the `tc_` prefix:** the protocol originated in
 > [TrussC](https://github.com/TrussC-org/TrussC), and the tool names keep its
@@ -29,13 +29,13 @@ being worth it. Level 0 costs nothing and is already useful.
 
 | level | you implement | you get |
 |---|---|---|
-| **0 — launchable** | nothing (run with `--watchdog-timeout 0`) | crash detection + auto-restart, supervisor events on the dashboard, remote restart/update |
+| **0 — launchable** | nothing | crash detection + auto-restart, supervisor events on the dashboard, remote restart/update |
 | **1 — logs** | append your log lines to the file named by `TRUSSC_LOG_FILE` | log collection, shipping to the server, `search_logs` / dashboard log view |
 | **2 — health** | an HTTP JSON-RPC endpoint with `tc_get_health` | hang detection (not just crash), fps/memory graphs, green/red on the wall |
 | **3 — screenshots** | `tc_get_screenshot` | live thumbnails on the wall, the live view |
 | **4 — extras** | any of `tc_get_status`, `tc_get_alerts`, input tools | custom graphs & status values, phone-reaching alerts, remote control from the browser |
 
-Level 0 deserves emphasis: `anchorbolt start -p anything --watchdog-timeout 0`
+Level 0 deserves emphasis: `anchorbolt start -p anything`
 already restarts a crashed binary and records the events. Everything below is
 about the levels above it.
 
@@ -48,9 +48,23 @@ environment variables set:
 
 | variable | meaning |
 |---|---|
-| `TRUSSC_MCP=1` | "you are being supervised — bring up your MCP endpoint" |
+| `TRUSSC_MCP=1` | request to open MCP for older apps; in TrussC ≥ 0.8, may open only a loopback health-only endpoint (`tc_get_health` only) without an app grant or dev build |
 | `TRUSSC_MCP_PORT` | the local TCP port to serve it on (default 47777, scanned upward so several supervisors coexist) |
 | `TRUSSC_LOG_FILE` | the file to **append** your log lines to |
+
+For TrussC ≥ 0.8, environment variables configure or close MCP, or open a
+loopback health-only endpoint (`tc_get_health` only; see the final addendum to
+[TrussC-org/TrussC#242](https://github.com/TrussC-org/TrussC/issues/242)).
+All other MCP access requires an app grant or a dev build. Levels 0–2 need
+no code change: with `TRUSSC_MCP_PORT` set, a TrussC ≥ 0.8 app answers health
+there. For screenshots and up (level 3+), add this line in `setup()`:
+
+```cpp
+mcp::setToolLevel(mcp::ToolLevel::ReadOnly);
+```
+
+Remote input requires Control. `TRUSSC_MCP=1` remains set for older apps that
+rely on it to open their endpoint.
 
 Two things people trip over:
 
@@ -138,6 +152,14 @@ No arguments. Return a JSON object; two rules and the rest is yours:
  "rssBytes": 268435456}
 ```
 
+Optional **`toolLevel`** is `"Public"`, `"ReadOnly"`, or `"Control"`. AnchorBolt
+uses it for the per-run MCP state beside the dashboard's control capability
+and forwards the state as heartbeat `caps.mcp`. Without it, a healthy reply
+means ReadOnly, or Control if `tools/list` includes input tools. Public is
+health-only when the framework permits that reply. A live process that has
+never replied shows `closed` (an older TrussC or a non-TrussC app), with the
+hint: "no health reply; logs and restart only. A TrussC ≥ 0.8 app answers health when `TRUSSC_MCP_PORT` is set; for screenshots and status add `mcp::setToolLevel(ReadOnly)` in setup()". The fully qualified C++ line is shown above.
+
 Answer it from a thread that proves your app is *alive*, not just that a
 socket is open — if your render loop can hang while an HTTP thread keeps
 answering, you've built a watchdog that watches nothing. (Have the main loop
@@ -223,10 +245,18 @@ reasoning):
 | what | default | contract for your app |
 |---|---|---|
 | health poll | `--watchdog-timeout` / 3 ≈ every 3 s | answer fast and cheap, every time |
-| hang watchdog | 10 s wall-clock without a healthy reply → restart | ~3 misses and you're gone; make health reflect real liveness |
-| boot grace | 120 s | your first healthy reply must land within this; heavy startups are fine |
+| hang watchdog | after the first healthy reply, 10 s wall-clock without another → restart | never-healthy runs use process-exit supervision only |
+| boot grace | 120 s (`--grace`) | no reply by then logs one Notice; a never-healthy update passes if still alive |
 | thumbnail poll | every 30 s | plus 1–15 fps bursts during live view |
 | termination | SIGTERM / WM_CLOSE, then 5 s, then force kill | exit cleanly within 5 s |
+
+The watchdog arms only after a run's first healthy reply (even if it arrives
+after the grace). Until then, no hang restart occurs. When the grace ends
+without a reply, AnchorBolt logs once:
+`no health endpoint: supervising by process exit only`.
+An update passes its audition on the first healthy reply or by surviving the
+boot grace without health. Exiting before either rolls back to the previous
+binary. `--watchdog-timeout 0` disables hang restarts even after health replies.
 
 ---
 
@@ -256,7 +286,7 @@ Then the real thing:
 anchorbolt start -p ./myapp
 ```
 
-Within the grace window you should see `app healthy (fps ...)` in the
+For a health-enabled app you should see `app healthy (fps ...)` in the
 supervisor output. Kill your render loop (keep the process alive) and the
 watchdog should restart it — that's the test that matters. Add `--server` and
 the app appears on the wall, thumbnail and all.

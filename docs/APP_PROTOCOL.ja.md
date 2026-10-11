@@ -2,7 +2,7 @@
 
 [English](APP_PROTOCOL.md) ・ [← README](../README.ja.md) ・ [Architecture](ARCHITECTURE.ja.md)
 
-TrussC アプリは何もしなくても全部入り — health、サムネイル、ステータス、リモート操作 — が手に入ります。フレームワークが AnchorBolt の期待する MCP エンドポイントを標準搭載しているからです。しかしこの契約自体は TrussC を一切要求しません。このページはその契約そのものです: Unity でも Electron でも Processing でも openFrameworks でも、何であれアプリが何を実装すればネイティブ同様に監視されるかを定めます。
+TrussC は health、サムネイル、ステータス、リモート操作用に AnchorBolt が期待する MCP エンドポイントを標準搭載しています。どのツールを許可するかはアプリが決めます。しかしこの契約自体は TrussC を一切要求しません。このページはその契約そのものです: Unity でも Electron でも Processing でも openFrameworks でも、何であれアプリが何を実装すればネイティブ同様に監視されるかを定めます。
 
 > **`tc_` プレフィックスについて:** このプロトコルは
 > [TrussC](https://github.com/TrussC-org/TrussC) 発祥で、LSP のメソッドが
@@ -24,13 +24,13 @@ TrussC アプリは何もしなくても全部入り — health、サムネイ�
 
 | level | 実装するもの | 得られるもの |
 |---|---|---|
-| **0 — 起動できる** | 何も（`--watchdog-timeout 0` で実行） | クラッシュ検知 + 自動再起動、ダッシュボードの supervisor イベント、リモート再起動/更新 |
+| **0 — 起動できる** | 何も | クラッシュ検知 + 自動再起動、ダッシュボードの supervisor イベント、リモート再起動/更新 |
 | **1 — ログ** | `TRUSSC_LOG_FILE` が指すファイルへログを追記 | ログ収集、サーバーへの送信、`search_logs` / ダッシュボードのログビュー |
 | **2 — health** | HTTP JSON-RPC エンドポイント + `tc_get_health` | ハング検知（クラッシュだけでなく）、fps/メモリのグラフ、wall の緑/赤 |
 | **3 — スクリーンショット** | `tc_get_screenshot` | wall のライブサムネイル、ライブビュー |
 | **4 — 拡張** | `tc_get_status`、`tc_get_alerts`、入力系ツールの任意の組み合わせ | カスタムグラフとステータス値、スマホまで届くアラート、ブラウザからのリモート操作 |
 
-Level 0 は強調しておく価値があります: `anchorbolt start -p anything --watchdog-timeout 0`
+Level 0 は強調しておく価値があります: `anchorbolt start -p anything`
 だけで、クラッシュしたバイナリの再起動とイベント記録は既に動きます。以下はすべてその上のレベルの話です。
 
 ---
@@ -41,9 +41,24 @@ Level 0 は強調しておく価値があります: `anchorbolt start -p anythin
 
 | 変数 | 意味 |
 |---|---|
-| `TRUSSC_MCP=1` | 「監視されている — MCP エンドポイントを立てよ」 |
+| `TRUSSC_MCP=1` | 旧アプリ向けの MCP 起動要求。TrussC ≥ 0.8 では、アプリ側の許可や開発ビルドなしでもループバック限定の health 専用エンドポイント（`tc_get_health` のみ）を開ける |
 | `TRUSSC_MCP_PORT` | それを提供するローカル TCP ポート（デフォルト 47777、複数の supervisor が同居できるよう上方向にスキャン） |
 | `TRUSSC_LOG_FILE` | ログ行を**追記**するファイル |
+
+TrussC ≥ 0.8 では環境変数で MCP の設定・閉鎖、またはループバック限定の
+health 専用エンドポイント（`tc_get_health` のみ）を開くことができます
+（[TrussC-org/TrussC#242](https://github.com/TrussC-org/TrussC/issues/242) の最終追記を参照）。
+それ以外の MCP アクセスにはアプリ側の許可、または開発ビルドが必要です。
+レベル 0–2 にコード変更は不要です（`TRUSSC_MCP_PORT` があれば TrussC ≥ 0.8 のアプリは
+そこで health に応答します）。スクリーンショット以上（レベル 3 以上）には
+`setup()` に次の1行を追加します:
+
+```cpp
+mcp::setToolLevel(mcp::ToolLevel::ReadOnly);
+```
+
+遠隔入力には Control の許可が必要です。環境変数で MCP を開く旧アプリのため、
+`TRUSSC_MCP=1` は引き続き設定します。
 
 つまずきやすい点が2つ:
 
@@ -129,6 +144,15 @@ health のポーリング周期（[タイミング](#タイミング)参照）�
  "rssBytes": 268435456}
 ```
 
+任意の **`toolLevel`** は `"Public"`、`"ReadOnly"`、`"Control"` です。
+AnchorBolt は実行ごとの MCP 状態として、ダッシュボードの control 機能の隣に表示し、
+ハートビートの `caps.mcp` に載せます。フィールドがなければ healthy な応答は
+ReadOnly、`tools/list` に入力ツールがあれば Control と判定します。Public は
+フレームワークが応答を許可している場合の health のみです。プロセスは生きているが
+一度も応答していない場合（旧 TrussC か TrussC 以外のアプリ）は `closed` と表示し、次のヒントを添えます:
+"no health reply; logs and restart only. A TrussC ≥ 0.8 app answers health when `TRUSSC_MCP_PORT` is set; for screenshots and status add `mcp::setToolLevel(ReadOnly)` in setup()"
+（health 応答なし。ログと再起動のみ。TrussC ≥ 0.8 のアプリは `TRUSSC_MCP_PORT` があれば health に応答する。スクリーンショットとステータスには上記の完全修飾した C++ の1行を追加）。
+
 アプリが*生きている*ことを証明するスレッドから応答してください。ソケットが
 開いているだけでは駄目です — レンダーループがハングしても HTTP スレッドが
 応答し続けるなら、それは何も見ていない watchdog です。（メインループに
@@ -211,10 +235,17 @@ operator ロールが必要）。慣例のセット:
 | 項目 | デフォルト | アプリ側の契約 |
 |---|---|---|
 | health ポーリング | `--watchdog-timeout` / 3 ≈ 3 秒ごと | 毎回、速く安価に応答する |
-| ハング watchdog | healthy な応答なしが実時間 10 秒 → 再起動 | miss ~3 回で終わり。health が本当の生存を反映するように |
-| 起動猶予 | 120 秒 | 最初の healthy 応答はこの中に。重い起動でも大丈夫 |
+| ハング watchdog | 最初の healthy 応答後、次の応答なしが実時間 10 秒 → 再起動 | 一度も healthy でない実行はプロセス終了のみで監視 |
+| 起動猶予 | 120 秒（`--grace`） | 応答がなければ Notice を1回。health なしの更新は生存していれば合格 |
 | サムネイルポーリング | 30 秒ごと | ライブビュー中は 1–15 fps のバーストが加わる |
 | 終了 | SIGTERM / WM_CLOSE → 5 秒 → 強制終了 | 5 秒以内にクリーンに終了 |
+
+ハング監視は実行ごとの最初の healthy 応答で有効になります（猶予後の応答も含む）。
+それまではハングによる再起動は行いません。応答なしで猶予が終了すると、1回だけ
+`no health endpoint: supervising by process exit only` をログに出します。
+更新後の試運転は最初の healthy 応答、または health なしで起動猶予を生き延びれば合格です。
+どちらよりも前に終了すれば旧バイナリにロールバックします。
+`--watchdog-timeout 0` は health 応答後もハングによる再起動を無効にします。
 
 ---
 
@@ -244,7 +275,7 @@ curl -s localhost:47777/mcp -H 'Content-Type: application/json' \
 anchorbolt start -p ./myapp
 ```
 
-猶予時間内に supervisor の出力へ `app healthy (fps ...)` が出るはずです。
+health を許可したアプリでは supervisor の出力へ `app healthy (fps ...)` が出るはずです。
 レンダーループだけ殺して（プロセスは生かしたまま）、watchdog が再起動させる
 ことを確認してください — それが本当に意味のあるテストです。`--server` を
 足せばアプリは wall に、サムネイル付きで現れます。

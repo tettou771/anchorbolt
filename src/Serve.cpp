@@ -1700,6 +1700,8 @@ R"HTML(
         <button id="dRestart">Restart</button>
       </div>
       <div class="dStatusRow"><span class="stats" id="dStats"></span></div>
+      <div class="dStatusRow"><span class="stats" id="dMcp"></span></div>
+      <div class="dStatusRow" id="dMcpHint" hidden><span class="stats">no health reply; logs and restart only. A TrussC ≥ 0.8 app answers health when <code>TRUSSC_MCP_PORT</code> is set; for screenshots and status add <code>mcp::setToolLevel(ReadOnly)</code> in setup()</span></div>
     </div>
     <div class="dbody">
       <div id="dLiveWrap" hidden>
@@ -2254,6 +2256,9 @@ async function renderDetail() {
   // only if the app allows update (it advertises this); Restart is always
   // there for an operator. Viewers get no action row.
   const caps = (app.health && app.health.caps) || {};
+  document.getElementById('dMcp').textContent = caps.mcp
+    ? 'MCP: ' + caps.mcp + ' · control: ' + (caps.control ? 'yes' : 'no') : '';
+  document.getElementById('dMcpHint').hidden = !(app.live && caps.mcp === 'closed');
   const canOperate = myRole !== 'viewer';   // null (open mode) / operator / admin
   document.getElementById('dBtns').hidden = !app.live || !canOperate;
   document.getElementById('dUpdate').hidden = !caps.update;

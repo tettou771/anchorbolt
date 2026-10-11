@@ -19,8 +19,14 @@ be sure".
 on the venue machine — restarts it when it dies or hangs, collects the logs,
 and phones home with a live thumbnail so you can see every app at a glance
 from your desk. When something needs a human, it can restart, update, or even
-let you drive the app remotely from the browser. Your app needs **zero code
-changes** to get the core of this.
+let you drive the app remotely from the browser. **Zero code changes** for
+levels 0–2: restart on exit, log collection/rotation, supervisor events, and
+health (with TrussC ≥ 0.8 the supervisor passes `TRUSSC_MCP_PORT`, and the app
+answers health on a loopback health-only endpoint; see the final addendum to
+[TrussC-org/TrussC#242](https://github.com/TrussC-org/TrussC/issues/242)).
+Screenshots and up (level 3+) need **one line** in `setup()`:
+`mcp::setToolLevel(mcp::ToolLevel::ReadOnly);`.
+Remote input requires the app to grant Control.
 
 It's built for [TrussC](https://github.com/TrussC-org/TrussC) apps (it uses
 their MCP endpoint for health and screenshots), but the supervision, logging,
@@ -29,7 +35,8 @@ and notification parts work for any program you can launch.
 ## What it does
 
 - **Auto-restart** — watches the app two ways (it exited / it went silent) and
-  brings it back. No app code needed.
+  brings it back. Exit supervision needs no app code; hang detection arms
+  after the first healthy MCP reply.
 - **The wall** — a live thumbnail of every app in one browser page, green/red
   at a glance, grouped into tabs.
 - **Logs, always** — the app's logs are collected locally and shipped to your
