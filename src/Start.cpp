@@ -69,11 +69,8 @@ struct StartOptions {
     int    port        = 47777;  // TRUSSC_MCP_PORT
     bool   portExplicit = false; // --port / config given -> exact, no scanning
     int    watchdogTimeoutSec = 10;  // unresponsive this long -> restart (0 = process-exit only)
-    int    graceSec    = 120;    // boot grace before the hang-watchdog arms —
-                                 // generous by default: venue apps often boot
-                                 // slowly (model load, external-API handshake).
-                                 // Only defers the hang kill; a crash/exit still
-                                 // restarts instantly.
+    int    graceSec    = 120;    // boot grace for endpoint notice and update audition;
+                                 // a crash/exit still restarts immediately.
     string serverUrl;            // fleet server base URL (empty = no push; may be
                                  // filled from the saved identity if neither
                                  // --server nor --no-server is passed)
@@ -2065,7 +2062,9 @@ int cmdStart(const vector<string>& args) {
 
         auto bootAt = chrono::steady_clock::now();
         auto lastOkAt = bootAt;  // last healthy reply (watchdog reference point)
-        bool healthy = false;    // first successful poll seen
+        bool healthy = false;    // first successful poll seen: arms the hang watchdog
+        bool noHealthNoticed = false;
+        string mcpState = "closed";  // reset for each child run
         bool childAlive = true;
         bool pidWarned = false;  // one-shot port-collision warning
         chrono::steady_clock::time_point lastThumb{};  // epoch -> push right away
@@ -2079,6 +2078,29 @@ int cmdStart(const vector<string>& args) {
         // is recorded — a normal power-off leaves only a quiet "stop".
         string restartReason;
         vector<string> imageNames;    // statusImage names from the last status
+        auto sendHeartbeat = [&](Json hb) {
+            if (!push) return;
+            MachineMem mm = machineMem();
+            hb["machine"] = {{"memTotalBytes", mm.totalBytes},
+                             {"memAvailBytes", mm.availBytes}};
+            // Capabilities the dashboard uses to show only live controls:
+            // control iff the app exposes input tools, update iff not denied.
+            hb["caps"] = {{"control", hasControlTools}, {"update", !opt.denyUpdate},
+                          {"mcp", mcpState}};
+            if (!appGit.empty()) hb["git"] = appGit;
+            optional<bool> serverSeesWs = push->heartbeat(hb);
+            // Heartbeat reached the server but it holds no command-channel
+            // WS for us, while we still think ours is Open: it's half-open
+            // (serve restart / dropped tunnel). Force a reconnect so the
+            // live/control features come back without waiting for a TCP FIN
+            // that may never arrive.
+            if (channel && serverSeesWs.has_value() && !*serverSeesWs &&
+                channel->staleOpen()) {
+                logWarning("anchorbolt")
+                    << "server has no command channel for us; reconnecting";
+                channel->forceReconnect();
+            }
+        };
 
         while (!g_stop) {
             // Process exit?
@@ -2123,10 +2145,6 @@ int cmdStart(const vector<string>& args) {
                 childAlive = false;
                 break;
             }
-
-            // Watchdog off: supervise process exit only (works for apps
-            // without an MCP endpoint); logs and the channel still flow.
-            if (opt.watchdogTimeoutSec <= 0 && !push) continue;
 
             // Hang detection via tc_get_health.
             auto h = callTool(cli, "tc_get_health");
@@ -2182,6 +2200,8 @@ int cmdStart(const vector<string>& args) {
                         }
                     }
                 }
+                // New TrussC reports its grant directly; older apps expose tools.
+                mcpState = h->value("toolLevel", hasControlTools ? "Control" : "ReadOnly");
                 // App-raised operator alerts (mcp::alert) -> sinks. Drain on
                 // the health cadence; the tool clears what it returns.
                 if ((notifier || push) && hasAlerts) {
@@ -2194,13 +2214,6 @@ int cmdStart(const vector<string>& args) {
                 }
                 if (push) {
                     Json hb = *h;
-                    MachineMem mm = machineMem();
-                    hb["machine"] = {{"memTotalBytes", mm.totalBytes},
-                                     {"memAvailBytes", mm.availBytes}};
-                    // Capabilities the dashboard uses to show only live controls:
-                    // control iff the app exposes input tools, update iff not denied.
-                    hb["caps"] = {{"control", hasControlTools}, {"update", !opt.denyUpdate}};
-                    if (!appGit.empty()) hb["git"] = appGit;
                     if (hasStatus) {
                         if (auto s = callTool(cli, "tc_get_status")) {
                             imageNames.clear();
@@ -2210,18 +2223,7 @@ int cmdStart(const vector<string>& args) {
                                 hb["custom"] = *s;
                         }
                     }
-                    optional<bool> serverSeesWs = push->heartbeat(hb);
-                    // Heartbeat reached the server but it holds no command-channel
-                    // WS for us, while we still think ours is Open: it's half-open
-                    // (serve restart / dropped tunnel). Force a reconnect so the
-                    // live/control features come back without waiting for a TCP FIN
-                    // that may never arrive.
-                    if (channel && serverSeesWs.has_value() && !*serverSeesWs &&
-                        channel->staleOpen()) {
-                        logWarning("anchorbolt")
-                            << "server has no command channel for us; reconnecting";
-                        channel->forceReconnect();
-                    }
+                    sendHeartbeat(hb);
 
                     auto now = chrono::steady_clock::now();
                     if (opt.thumbIntervalSec > 0 &&
@@ -2246,10 +2248,9 @@ int cmdStart(const vector<string>& args) {
                         }
                     }
                 }
-            } else if (opt.watchdogTimeoutSec > 0) {
+            } else {
                 auto now = chrono::steady_clock::now();
-                bool inGrace = !healthy && now - bootAt < chrono::seconds(opt.graceSec);
-                if (!inGrace) {
+                if (healthy && opt.watchdogTimeoutSec > 0) {
                     int silentSec = (int)chrono::duration_cast<chrono::seconds>(now - lastOkAt).count();
                     logWarning("anchorbolt") << "health poll miss (silent " << silentSec
                                              << "s / " << opt.watchdogTimeoutSec << "s)";
@@ -2264,6 +2265,41 @@ int cmdStart(const vector<string>& args) {
                         break;
                     }
                 }
+                // A missing endpoint still permits logs, events and remote restart.
+                // Keep this run's last observed grant when an armed app goes silent.
+                sendHeartbeat({{"pid", proc.pid}});
+            }
+
+            // Recheck exit after polling: a child that died during the grace must
+            // not pass its audition just because a blocking request took us past it.
+            if (!healthy && !noHealthNoticed &&
+                chrono::steady_clock::now() - bootAt >= chrono::seconds(opt.graceSec)) {
+                if (pollExit(proc, how, giveUp)) {
+                    childAlive = false;
+                    if (giveUp) {
+                        logError("anchorbolt") << how << "; giving up";
+                        eventLog(logDir, how + "; giving up");
+                        fireEvent("down", how + "; giving up");
+                        if (notifier) notifier->flushAndStop();
+                        closeProc(proc);
+                        return 1;
+                    }
+                    logWarning("anchorbolt") << how;
+                    eventLog(logDir, how + " (" + machineMemNote() + ")");
+                    restartReason = how;
+                    break;
+                }
+                noHealthNoticed = true;
+                string msg = "no health endpoint: supervising by process exit only";
+                logNotice("anchorbolt") << msg;
+                eventLog(logDir, msg);
+                if (audit) {
+                    audit = false;
+                    string vmsg = "update verified: app survived the boot grace without a health endpoint" +
+                                  (appGit.empty() ? "" : " (" + appGit + ")");
+                    eventLog(logDir, "[update] " + vmsg);
+                    fireEvent("update", vmsg);
+                }
             }
         }
 
@@ -2274,22 +2310,17 @@ int cmdStart(const vector<string>& args) {
         }
         closeProc(proc);
 
-        // First run after an update must prove itself: with the watchdog on,
-        // "never became healthy" fails the audition; without MCP, dying
-        // within 30s does. Failure restores the pre-update binary — the
-        // respawn below then relaunches the old, known-good version.
+        // An update passes on health or surviving the boot grace. An audition
+        // still pending when the run ends restores the previous binary.
         if (audit) {
-            bool bootFailed = opt.watchdogTimeoutSec > 0
-                ? !healthy
-                : chrono::steady_clock::now() - bootAt < chrono::seconds(30);
-            if (bootFailed) {
+            if (!healthy) {
                 fs::path prev = opt.runPath + ".prev";
                 error_code ec;
                 if (fs::exists(prev, ec)) {
                     fs::copy_file(prev, opt.runPath, fs::copy_options::overwrite_existing, ec);
                     string rmsg = ec
                         ? "rollback FAILED: " + ec.message()
-                        : "rolling back: the new binary never became healthy; previous binary restored";
+                        : "rolling back: the new binary exited before passing the boot grace; previous binary restored";
                     eventLog(logDir, "[update] " + rmsg);
                     fireEvent("update", rmsg);
                 } else {
