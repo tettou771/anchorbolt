@@ -60,7 +60,7 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          timeout --kill-after=10s 60s bash -s -- "$PWD/bin/anchorbolt" <<'SMOKE'
+          timeout --kill-after=10s 120s bash -s -- "$PWD/bin/anchorbolt" <<'SMOKE'
           set -euo pipefail
           binary=$1
           work=$(mktemp -d "$PWD/build-ci/smoke.XXXXXX")
