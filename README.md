@@ -21,8 +21,12 @@ and phones home with a live thumbnail so you can see every app at a glance
 from your desk. When something needs a human, it can restart, update, or even
 let you drive the app remotely from the browser. **Zero code changes** for
 levels 0–1: restart on exit, log collection/rotation, and supervisor events.
-With TrussC ≥ 0.8, level 2 and up need **one line** in `setup()`:
-`mcp::setToolLevel(mcp::ToolLevel::ReadOnly);` for health and screenshots.
+With TrussC ≥ 0.8, environment variables configure or close MCP, or open a
+loopback health-only endpoint (`tc_get_health` only; see the final addendum to
+[TrussC-org/TrussC#242](https://github.com/TrussC-org/TrussC/issues/242)).
+All other MCP access requires an app grant or a dev build. For health and
+screenshots (level 2 and up), add **one line** in `setup()`:
+`mcp::setToolLevel(mcp::ToolLevel::ReadOnly);`.
 Remote input requires the app to grant Control.
 
 It's built for [TrussC](https://github.com/TrussC-org/TrussC) apps (it uses

@@ -2258,7 +2258,7 @@ async function renderDetail() {
   const caps = (app.health && app.health.caps) || {};
   document.getElementById('dMcp').textContent = caps.mcp
     ? 'MCP: ' + caps.mcp + ' · control: ' + (caps.control ? 'yes' : 'no') : '';
-  document.getElementById('dMcpHint').hidden = caps.mcp !== 'closed';
+  document.getElementById('dMcpHint').hidden = !(app.live && caps.mcp === 'closed');
   const canOperate = myRole !== 'viewer';   // null (open mode) / operator / admin
   document.getElementById('dBtns').hidden = !app.live || !canOperate;
   document.getElementById('dUpdate').hidden = !caps.update;

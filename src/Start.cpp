@@ -2266,8 +2266,8 @@ int cmdStart(const vector<string>& args) {
                     }
                 }
                 // A missing endpoint still permits logs, events and remote restart.
-                // Keep this run's last observed grant when an armed app goes silent.
-                sendHeartbeat({{"pid", proc.pid}});
+                // After health has answered, silence must age out at the fleet server.
+                if (!healthy) sendHeartbeat({{"pid", proc.pid}});
             }
 
             // Recheck exit after polling: a child that died during the grace must

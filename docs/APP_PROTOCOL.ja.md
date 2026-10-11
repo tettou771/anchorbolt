@@ -41,13 +41,16 @@ Level 0 は強調しておく価値があります: `anchorbolt start -p anythin
 
 | 変数 | 意味 |
 |---|---|
-| `TRUSSC_MCP=1` | 旧アプリ向けの MCP 起動要求。互換性のため引き続き渡すが、TrussC ≥ 0.8 では MCP を開かない |
+| `TRUSSC_MCP=1` | 旧アプリ向けの MCP 起動要求。TrussC ≥ 0.8 では、アプリ側の許可や開発ビルドなしでもループバック限定の health 専用エンドポイント（`tc_get_health` のみ）を開ける |
 | `TRUSSC_MCP_PORT` | それを提供するローカル TCP ポート（デフォルト 47777、複数の supervisor が同居できるよう上方向にスキャン） |
 | `TRUSSC_LOG_FILE` | ログ行を**追記**するファイル |
 
-TrussC ≥ 0.8 では環境変数は MCP の設定・閉鎖のみを行い、開くのはアプリ
-（または開発ビルド）です。レベル 0–1 に MCP の許可は不要です。レベル 2 以上で
-health とスクリーンショットを利用するには `setup()` に次の1行を追加します:
+TrussC ≥ 0.8 では環境変数で MCP の設定・閉鎖、またはループバック限定の
+health 専用エンドポイント（`tc_get_health` のみ）を開くことができます
+（[TrussC-org/TrussC#242](https://github.com/TrussC-org/TrussC/issues/242) の最終追記を参照）。
+それ以外の MCP アクセスにはアプリ側の許可、または開発ビルドが必要です。
+レベル 0–1 に MCP の許可は不要です。health とスクリーンショット（レベル 2 以上）には
+`setup()` に次の1行を追加します:
 
 ```cpp
 mcp::setToolLevel(mcp::ToolLevel::ReadOnly);

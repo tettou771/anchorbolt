@@ -48,13 +48,16 @@ environment variables set:
 
 | variable | meaning |
 |---|---|
-| `TRUSSC_MCP=1` | legacy request to open MCP; still sent for older apps, but does not open MCP in TrussC ≥ 0.8 |
+| `TRUSSC_MCP=1` | request to open MCP for older apps; in TrussC ≥ 0.8, may open only a loopback health-only endpoint (`tc_get_health` only) without an app grant or dev build |
 | `TRUSSC_MCP_PORT` | the local TCP port to serve it on (default 47777, scanned upward so several supervisors coexist) |
 | `TRUSSC_LOG_FILE` | the file to **append** your log lines to |
 
-For TrussC ≥ 0.8, environment variables only configure or close MCP; the app
-(or a dev build) must open it. Levels 0–1 need no MCP grant. For level 2 and
-up, add this line in `setup()` for health and screenshots:
+For TrussC ≥ 0.8, environment variables configure or close MCP, or open a
+loopback health-only endpoint (`tc_get_health` only; see the final addendum to
+[TrussC-org/TrussC#242](https://github.com/TrussC-org/TrussC/issues/242)).
+All other MCP access requires an app grant or a dev build. Levels 0–1 need
+no MCP grant. For health and screenshots (level 2 and up), add this line in
+`setup()`:
 
 ```cpp
 mcp::setToolLevel(mcp::ToolLevel::ReadOnly);
