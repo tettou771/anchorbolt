@@ -220,8 +220,12 @@ operator ロールが必要）。慣例のセット:
 | ツール | 引数 |
 |---|---|
 | `tc_mouse_move` | `x`, `y`（ピクセル、ウィンドウ座標） |
-| `tc_mouse_click` | `x`, `y`, `button`（`"left"`/`"right"`/`"middle"`） |
-| `tc_key_press` | `key`（文字、または `"enter"`, `"space"`, `"left"` などの名前） |
+| `tc_mouse_click` | `x`, `y`, `button`（整数: `0` 左、`1` 右、`2` 中央） |
+| `tc_key_press` | `key`（整数の sokol キーコード: `65` = A、`257` = Enter、`32` = Space、`263` = Left） |
+| `tc_key_release` | `key`（対応する press と同じコード） |
+
+ダッシュボードは keydown で press、keyup で release を送り、キーの保持状態を
+オペレーターのキーボードに合わせます。
 
 本気でないなら公開しないこと: 列挙すること自体が同意スイッチです。
 

@@ -229,8 +229,12 @@ The conventional set:
 | tool | arguments |
 |---|---|
 | `tc_mouse_move` | `x`, `y` (pixels, window coordinates) |
-| `tc_mouse_click` | `x`, `y`, `button` (`"left"`/`"right"`/`"middle"`) |
-| `tc_key_press` | `key` (a character or a name like `"enter"`, `"space"`, `"left"`) |
+| `tc_mouse_click` | `x`, `y`, `button` (integer: `0` left, `1` right, `2` middle) |
+| `tc_key_press` | `key` (integer sokol keycode: `65` = A, `257` = Enter, `32` = Space, `263` = Left) |
+| `tc_key_release` | `key` (same code as the corresponding press) |
+
+The dashboard sends a press on keydown and a release on keyup, so held-key
+state follows the operator's keyboard.
 
 Don't expose these unless you mean it: listing them *is* the consent switch.
 
