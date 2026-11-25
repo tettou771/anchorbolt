@@ -14,6 +14,10 @@
 
 #include <TrussC.h>
 #include <impl/httplib.h>   // localhost MCP calls only (plain http)
+
+// The app's MCP server binds 127.0.0.1 (TrussC's default). "localhost" can
+// resolve to ::1 first on Windows and then never reaches it.
+static const char* const kAppMcpHost = "127.0.0.1";
 #include <tcxCurl.h>        // fleet-server push (needs https over the tunnel)
 #include <tcWebSocketClient.h>
 
@@ -831,7 +835,7 @@ private:
     // (app restarting/dead) just skip a frame; this never touches the
     // supervision loop's client.
     void liveLoop() {
-        httplib::Client cli("localhost", opt_.port);
+        httplib::Client cli(kAppMcpHost, opt_.port);
         cli.set_connection_timeout(2, 0);
         cli.set_read_timeout(3, 0);
         bool idle = false;
@@ -937,7 +941,7 @@ private:
         } else if (action == "list_tools" || action == "call") {
             // Fresh client per command: this runs on the WS thread, never
             // share the supervision loop's connection.
-            httplib::Client cli("localhost", opt_.port);
+            httplib::Client cli(kAppMcpHost, opt_.port);
             cli.set_connection_timeout(2, 0);
             cli.set_read_timeout(10, 0);
             if (action == "list_tools") {
@@ -1405,8 +1409,8 @@ void pruneLogs(const fs::path& logDir, int keepDays,
     }
 }
 
-// Can we bind this port right now? Checks BOTH loopback stacks: the app's
-// server binds "localhost", which resolves to ::1 on some systems and
+// Can we bind this port right now? Checks BOTH loopback stacks: older TrussC
+// apps bound "localhost", which resolves to ::1 on some systems and
 // 127.0.0.1 on others — two apps once coexisted on one port by taking one
 // stack each, and health polls then reached a random one of them.
 // (POSIX: SO_REUSEADDR matches how the app's own HTTP server binds, so
@@ -2056,7 +2060,7 @@ int cmdStart(const vector<string>& args) {
         logNotice("anchorbolt") << "app launched (pid " << proc.pid << ")";
         eventLog(logDir, "app launched (pid " + to_string(proc.pid) + ")");
 
-        httplib::Client cli("localhost", opt.port);
+        httplib::Client cli(kAppMcpHost, opt.port);
         cli.set_connection_timeout(2, 0);
         cli.set_read_timeout(2, 0);
 
