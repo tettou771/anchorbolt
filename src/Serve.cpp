@@ -2651,6 +2651,14 @@ liveImg.addEventListener('keydown', e => {
   e.stopPropagation();
   sendCommand(detailId, { action: 'call', tool: 'tc_key_press', args: { key: code } });
 });
+liveImg.addEventListener('keyup', e => {
+  if (!ctlOn()) return;
+  const code = sokolKey(e);
+  if (code == null) return;
+  e.preventDefault();
+  e.stopPropagation();
+  sendCommand(detailId, { action: 'call', tool: 'tc_key_release', args: { key: code } });
+});
 
 )HTML"
 R"HTML(// ---- event list (supervisor + app alerts) ----
