@@ -135,13 +135,15 @@ health のポーリング周期（[タイミング](#タイミング)参照）�
   死んだ子プロセスを覆い隠すのを防ぐ仕組みです。
 - オブジェクト全体がハートビートとしてフリートサーバーへ転送されます。
   ダッシュボードが既にグラフ化を知っているフィールド: `fps`、`rssBytes`
-  （プロセスメモリ。リーク監視で見るべき数値）、`uptimeSec`。`version`、
+  （プロセスの RSS）、任意の `privateBytes`（プライベートメモリのバイト数。
+  存在する場合のみ **private MB** としてグラフ化）、`uptimeSec`。
+  取得できない場合は `privateBytes` を省略します。`version`、
   `width`、`height` は関連箇所に表示されます。余分なフィールドは無害です。
 
 ```json
 {"status": "ok", "fps": 60.0, "frameCount": 86400, "uptimeSec": 1440.5,
  "width": 1920, "height": 1080, "version": "myapp 2.1", "pid": 4242,
- "rssBytes": 268435456}
+ "rssBytes": 268435456, "privateBytes": 201326592}
 ```
 
 任意の **`toolLevel`** は `"Public"`、`"ReadOnly"`、`"Control"` です。

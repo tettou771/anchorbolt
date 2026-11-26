@@ -1064,7 +1064,7 @@ Json fleetToolCall(const fs::path& dataDir, const string& name, const Json& args
                       {"live", g_agents.live(id)},
                       {"lastSeenSec", (int)chrono::duration<double>(now - st.lastSeen).count()},
                       {"unackedAlerts", st.unackedAlerts}};
-            for (auto key : {"fps", "uptimeSec", "rssBytes", "git", "version"}) {
+            for (auto key : {"fps", "uptimeSec", "rssBytes", "privateBytes", "git", "version"}) {
                 if (h.contains(key)) e[key] = h[key];
             }
             list.push_back(e);
@@ -2306,14 +2306,18 @@ async function renderDetail() {
   } catch { return; }
   if (detailId !== app.id) return;   // closed/switched while fetching
 
-  // Memory graphs: process RSS (the leak-hunting number) and machine-wide
-  // available (the OOM-exoneration number). Sokol-tracked bytes stay in the
-  // JSONL for deep dives but aren't graphed.
+  // Memory graphs: process RSS, optional private memory, and machine-wide
+  // available memory. Sokol-tracked bytes stay in the JSONL for deep dives
+  // but aren't graphed.
   const graphs = [
     { label: 'fps',        color: '#58a6ff', get: e => e.health && e.health.fps },
     { label: 'process MB', color: '#d29922',
       get: e => e.health ? (e.health.rssBytes ?? e.health.memoryBytes) / 1048576 : null },
   ];
+  if (h.privateBytes != null) {
+    graphs.push({ label: 'private MB', color: '#a371f7',
+      get: e => e.health && e.health.privateBytes != null ? e.health.privateBytes / 1048576 : null });
+  }
   if (h.machine && h.machine.memAvailBytes) {
     graphs.push({ label: 'machine free MB', color: '#8b949e',
       get: e => e.health && e.health.machine ? e.health.machine.memAvailBytes / 1048576 : null });
