@@ -142,14 +142,16 @@ No arguments. Return a JSON object; two rules and the rest is yours:
   what keeps a stale or foreign app on a shared port from masking a dead
   child.
 - The whole object is forwarded to the fleet server as the heartbeat. Fields
-  the dashboard already knows how to graph: `fps`, `rssBytes` (process memory,
-  the number to watch for leaks), `uptimeSec`. `version`, `width`, `height`
+  the dashboard already knows how to graph: `fps`, `rssBytes` (process RSS),
+  optional `privateBytes` (private memory in bytes, graphed as **private MB**
+  only when present), `uptimeSec`. Omit `privateBytes` when unavailable.
+  `version`, `width`, `height`
   are displayed where relevant. Extra fields are harmless.
 
 ```json
 {"status": "ok", "fps": 60.0, "frameCount": 86400, "uptimeSec": 1440.5,
  "width": 1920, "height": 1080, "version": "myapp 2.1", "pid": 4242,
- "rssBytes": 268435456}
+ "rssBytes": 268435456, "privateBytes": 201326592}
 ```
 
 Optional **`toolLevel`** is `"Public"`, `"ReadOnly"`, or `"Control"`. AnchorBolt
